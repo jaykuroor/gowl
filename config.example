@@ -1,0 +1,34 @@
+# gowl config — copy to ~/.config/gowl/config
+# key = value, '#' comments. Every key is optional.
+
+# Default device for commands without DEV: alias, IP, or MAC.
+device = desk
+
+# ---- screen sync ----
+output = DP-1            # niri output name (`niri msg outputs`); default: first output
+fps = 30                 # capture/send cap; frames are only taken when the screen changes
+depth = 0.28             # how far edge zones reach into the screen (0.10-0.50)
+saturation = 1.15
+screen_brightness = 0.75 # channel multiplier, 0-1
+smoothing = 0.55         # EMA alpha, higher = snappier
+threshold = 3            # min channel change that triggers a send
+keepalive_ms = 500       # resend interval on a static screen (tune per device in Phase 4)
+
+# ---- music sync ----
+reaction = flow          # flow | pulse | energy_fill | band_split | center_burst | wave | bass_bounce | chase | twinkle
+palette = rgb            # rgb | rainbow | aurora | sunset | ocean | neon | jewel | fire | spectrum | warm | cool | mono
+music_fps = 60
+music_gain = 1.7
+music_brightness = 0.85
+music_smoothing = 0.6
+
+# ---- network ----
+# multicast_if = 192.168.1.10   # pin the interface used for discovery
+
+# ---- devices ----
+[device desk]
+mac = AA:BB:CC:DD:EE:FF:00:11
+ip = 192.168.1.50        # optional; refreshed by `gowl scan`
+segments = 10            # overrides the SKU table
+reverse = 0              # 1 = strip runs the other way
+offset = 0               # rotate zone 0 to this segment
