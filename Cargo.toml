@@ -6,6 +6,11 @@ edition = "2024"
 [dependencies]
 libc = { version = "0.2.191", default-features = false }
 
+[features]
+# Count heap allocations in the binary and print them in the GOWL_LOG=debug
+# once-per-second line (proof of CLAUDE.md rule 4 on the live compositor).
+count-alloc = []
+
 [profile.release]
 opt-level = 3
 lto = "fat"

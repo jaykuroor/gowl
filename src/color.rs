@@ -357,6 +357,18 @@ impl Smoother {
         self.state.resize(count, [0u16; 3]);
     }
 
+    /// True once another `update` with the same `target` would change nothing (the
+    /// EMA reached its fixed point), so a sync loop can stop stepping.
+    pub fn settled(&self, target: &[Rgb]) -> bool {
+        self.state.len() == target.len()
+            && self.state.iter().zip(target).all(|(s, t)| {
+                (0..3).all(|k| {
+                    let d = (i64::from(t[k]) << 8) - i64::from(s[k]);
+                    (d * self.alpha_q16 + 32768) >> 16 == 0
+                })
+            })
+    }
+
     /// `out.len() == target.len()`. Allocation-free once `target.len() <= 255`.
     #[inline]
     pub fn update(&mut self, target: &[Rgb], out: &mut [Rgb]) {

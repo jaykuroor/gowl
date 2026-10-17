@@ -5,6 +5,7 @@
 
 #[macro_use]
 pub mod log;
+pub mod capture;
 pub mod color;
 pub mod config;
 pub mod devices;
@@ -12,5 +13,6 @@ pub mod doctor;
 pub mod error;
 pub mod net;
 pub mod proto;
+pub mod runtime;
 
 pub use error::Error;
