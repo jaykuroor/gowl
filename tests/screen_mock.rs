@@ -315,3 +315,32 @@ fn toggle_starts_then_stops() {
     h.exited();
     h.tail_is_double_off();
 }
+
+fn ctx_switches(pid: u32) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains("ctxt_switches"))
+        .map(|l| l.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap())
+        .sum()
+}
+
+/// BUDGETS.md S2 on the gowl side: a static screen (the compositor never completes
+/// the damage copy) costs only keepalive wakeups, ≤ 1 + 1000/keepalive_ms per second
+/// (default keepalive 500 ms → ≤ 3/s). `cargo test --release --test screen_mock -- --ignored s2`
+#[test]
+#[ignore]
+fn s2_static_screen_wakeups() {
+    let mut h = Harness::start("screen-s2", 16400, 10);
+    h.collect(1.5); // 10 changing frames, then static; smoothing settles
+    let pid = h.child.id();
+    let c0 = ctx_switches(pid);
+    let t0 = h.now();
+    h.collect(t0 + 10.0);
+    let rate = (ctx_switches(pid) - c0) as f64 / (h.now() - t0);
+    let ka = h.frames(t0, t0 + 10.0);
+    h.stop();
+    println!("S2 (mock, static): {rate:.2} context switches/s, {ka} keepalives in 10 s");
+    assert!(rate <= 3.0, "{rate:.2}/s over the S2 budget");
+    assert!((15..=25).contains(&ka), "{ka} keepalives in 10 s at 500 ms");
+}
