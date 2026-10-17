@@ -24,6 +24,7 @@ Revisit-if: profiles show pulse overhead > 0.2% CPU.
 Context: EMA smoothing makes 30 fps visually equivalent for ambient light; fewer copies,
 fewer packets. Device cap is ~40 Hz anyway.
 Decision: default 30, configurable. Phase 4 asks the human to compare 30 vs 45 by eye.
+Result (human, 2026-10-17): 30 vs 40 fps on the H6609 "not too distinguishable" → keep 30.
 
 ## D-005 — legacy/ path and git handling (2026-10-17, phase 0, orchestrator)
 Context: the LumiSync clone sits directly in `legacy/` (has its own `.git`), not `legacy/LumiSync/`.
@@ -428,6 +429,10 @@ place, else inserted after the last global line, before the first section; every
 kept; tests in config.rs and tests/calibrate_cli.rs). Runs on the same `line_loop` as the
 segment walk (stdin + timerfd + signalfd + netlink + verify). **Pending hardware:** the
 H6609's value goes here once the human has run it (it also unblocks D-034's passive stream).
+**Result (human, 2026-10-17):** the H6609 held stream mode at every step up to 8 s (no
+drop seen), so `keepalive_ms = 5600` was saved. 8 s is only the longest step tested; the true
+limit may be higher. A keepalive every 5.6 s on a static scene is already ≈ 0.18 packets/s,
+so longer steps were not added.
 
 ## D-047 — Phase 1 review leftovers fixed in Phase 4 (2026-10-17, phase 4, runtime agent)
 - `GOWL_PORT_BASE` now only applies to loopback targets (`Ports::for_ip`/`for_iface`): a
