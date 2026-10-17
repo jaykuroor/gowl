@@ -93,8 +93,9 @@ fn one_frame(cap: &mut Screencopy, pipe: &mut Pipeline, now: u64) {
     }
 }
 
-#[test]
-fn capture_to_send_allocates_nothing() {
+/// Warm up for `warm` frames, then count allocations over `frames` more.
+/// Returns (allocations, datagrams received, frames served).
+fn run(warm: usize, frames: usize) -> (usize, usize, usize) {
     let (client, server) = socketpair();
     let served = Arc::new(AtomicUsize::new(0));
     let opts = mock_wl::Opts {
@@ -134,7 +135,7 @@ fn capture_to_send_allocates_nothing() {
     assert_eq!(g.outputs[0].name, "MOCK-1");
     let mut cap = Screencopy::new(g, Some("MOCK-1")).unwrap();
     let mut now = 1_000_000_000u64;
-    for _ in 0..5 {
+    for _ in 0..warm {
         one_frame(&mut cap, &mut pipe, now); // warm-up: buffer + zone tables
         now += 34_000_000;
     }
@@ -142,7 +143,7 @@ fn capture_to_send_allocates_nothing() {
     // ---- steady state
     COUNT.with(|c| c.set(true));
     let before = ALLOCS.load(Ordering::Relaxed);
-    for _ in 0..200 {
+    for _ in 0..frames {
         one_frame(&mut cap, &mut pipe, now);
         now += 34_000_000;
     }
@@ -156,12 +157,28 @@ fn capture_to_send_allocates_nothing() {
     }
     drop(cap);
     srv.join().unwrap();
-    assert_eq!(served.load(Ordering::SeqCst), 205);
+    (after - before, got, served.load(Ordering::SeqCst))
+}
+
+#[test]
+fn capture_to_send_allocates_nothing() {
+    let (allocs, got, served) = run(5, 200);
+    assert_eq!(served, 205);
     assert!(got > 150, "only {got} datagrams reached the receiver");
     assert_eq!(
-        after - before,
-        0,
-        "capture→send allocated {} times in 200 frames",
-        after - before
+        allocs, 0,
+        "capture→send allocated {allocs} times in 200 frames"
     );
+}
+
+/// BUDGETS.md "Allocation count": 300 synthetic frames through capture → sample →
+/// process → encode → send, counted from frame 10.
+/// `cargo test --release --features count-alloc -- --ignored alloc_steady_state`
+#[test]
+#[ignore]
+fn alloc_steady_state() {
+    let (allocs, got, served) = run(10, 290);
+    assert_eq!(served, 300);
+    assert!(got > 200, "only {got} datagrams reached the receiver");
+    assert_eq!(allocs, 0, "{allocs} allocations after frame 10");
 }
