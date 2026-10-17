@@ -93,6 +93,81 @@ fn one_frame(cap: &mut Screencopy, pipe: &mut Pipeline, now: u64) {
     }
 }
 
+fn wait_readable(cap: &Screencopy) {
+    let mut p = libc::pollfd {
+        fd: cap.fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd.
+    assert_eq!(
+        unsafe { libc::poll(&mut p, 1, 5000) },
+        1,
+        "mock never answered"
+    );
+}
+
+/// D-051: `prepare` negotiates the next frame without copying; the last frame's
+/// pixels and damage stay readable until `request_next`, which copies at once.
+#[test]
+fn prepare_holds_the_copy_and_keeps_the_last_frame() {
+    let (client, server) = socketpair();
+    let served = Arc::new(AtomicUsize::new(0));
+    let opts = mock_wl::Opts {
+        width: 64,
+        height: 32,
+        transform: 0,
+        changing: usize::MAX,
+    };
+    let s2 = served.clone();
+    let srv = std::thread::spawn(move || mock_wl::serve(server, opts, s2));
+    let g = Globals::with_conn(Conn::from_fd(client)).unwrap();
+    let mut cap = Screencopy::new(g, None).unwrap();
+    let px = |cap: &Screencopy| {
+        let f = cap.frame().expect("frame readable");
+        assert!(!f.damage.is_empty() || f.full_damage);
+        [f.data[2], f.data[1], f.data[0]]
+    };
+    // Frame 0 the ordinary way.
+    assert!(cap.request_next().unwrap());
+    loop {
+        cap.flush().unwrap();
+        wait_readable(&cap);
+        if cap.dispatch().unwrap().ready {
+            break;
+        }
+    }
+    assert_eq!(px(&cap), mock_wl::color_of(0));
+    for k in 1..4 {
+        assert!(cap.prepare().unwrap());
+        assert!(cap.held());
+        cap.flush().unwrap();
+        wait_readable(&cap); // offers (buffer, buffer_done) arrive …
+        let st = cap.dispatch().unwrap();
+        assert!(!st.ready && !st.failed, "no copy before request_next");
+        assert!(cap.held());
+        assert_eq!(px(&cap), mock_wl::color_of(k - 1), "last frame intact");
+        assert_eq!(served.load(Ordering::SeqCst), k);
+        assert!(cap.request_next().unwrap()); // … and the copy goes out right away
+        assert!(!cap.held());
+        loop {
+            cap.flush().unwrap();
+            wait_readable(&cap);
+            if cap.dispatch().unwrap().ready {
+                break;
+            }
+        }
+        assert_eq!(px(&cap), mock_wl::color_of(k));
+    }
+    // Cancel while held: the frame is dropped, nothing is copied.
+    assert!(cap.prepare().unwrap());
+    cap.cancel().unwrap();
+    assert!(!cap.held());
+    drop(cap);
+    srv.join().unwrap();
+    assert_eq!(served.load(Ordering::SeqCst), 4);
+}
+
 /// Warm up for `warm` frames, then count allocations over `frames` more.
 /// Returns (allocations, datagrams received, frames served).
 fn run(warm: usize, frames: usize) -> (usize, usize, usize) {

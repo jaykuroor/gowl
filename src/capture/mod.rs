@@ -141,7 +141,18 @@ pub trait Capture {
     /// Read and handle everything the compositor sent.
     fn dispatch(&mut self) -> Result<Status, Error>;
     /// Ask for the next frame. `Ok(false)` if one is in flight or no output is selected.
+    /// Completes a frame started with `prepare` (copy only, no new negotiation).
     fn request_next(&mut self) -> Result<bool, Error>;
+    /// Start negotiating the next frame now but hold the copy until `request_next`
+    /// (D-051: the offers arrive while the caller is still busy with the last frame,
+    /// so the frame costs two wakeups instead of three). Default: not supported.
+    fn prepare(&mut self) -> Result<bool, Error> {
+        Ok(false)
+    }
+    /// A `prepare`d frame is waiting for `request_next`.
+    fn held(&self) -> bool {
+        false
+    }
     /// Abandon the in-flight frame (pause). No-op if none.
     fn cancel(&mut self) -> Result<(), Error>;
     /// The last ready frame.

@@ -508,3 +508,24 @@ netwatch re-verify devStatus (`Pending.port`). Discovery stays on 4001/4002 (leg
 control port). Legacy's "repair a stale auto-discovered 4001" quirk is not needed: gowl never stores a
 port from discovery. **Tests:** config parse (valid / 0 / 70000 → warning), tests/net_e2e.rs
 `device_port_override_is_used_by_one_shots` (gowl binary, temp config, receiver on 127.0.0.4).
+
+## D-051 — Screen capture: two wakeups per frame (prepare + held fd) (2026-10-17, phase 5, perf agent)
+Supersedes D-018. **Context.** S1 measured 90.7 wakeups/s at 30 fps (3/frame: timer → `capture_output`;
+offers → `copy_with_damage`; `ready`), budget ≤ 2·fps. D-018 rejected sending the copy speculatively
+(a buffer that no longer matches is the fatal `invalid_buffer` error). **Decision.** On `ready`, if the
+next slot is in the future, gowl sends `capture_output` for the *next* frame at once (`Capture::prepare`)
+but holds the copy; while a prepared frame waits for its slot the Wayland fd is left out of the poll set
+(`Capture::held`), so niri's offers sit in the socket instead of waking us. The timer wakeup then
+dispatches everything pending (offers, output events) and sends `copy_with_damage` immediately — the copy
+still follows its own `buffer_done`, so no protocol risk. The last frame's damage/flags are reset only
+when the next copy is sent, so it stays fully readable while the next frame is negotiated. Output
+events are seen up to one frame interval (33 ms) later while held; pause cancels the held frame; a
+`failed`/lost output for it is handled at the timer like before. If the offers are not in yet at the
+timer (slow compositor), the copy goes out on `buffer_done` as before (3 wakeups that frame).
+**Evidence** (same desktop, fake device, 30 s, `measure.py screen 30 --fake`): wakeups 90.7 → **60.5/s**
+(debug line: wayland 30 + timer 30 per second); `perf stat` task-clock 107.2 → **90.2 ms per 30 s**
+(0.357 → 0.301 % of a core); niri Δ unchanged (≈ 21 %, see D-050). Test: tests/capture_alloc.rs
+`prepare_holds_the_copy_and_keeps_the_last_frame` (offers arrive, no copy until `request_next`, last
+frame's pixels and damage intact, cancel while held).
+**Revisit-if.** A compositor sends something time-critical on the Wayland socket (none of the
+interfaces gowl binds has a ping).

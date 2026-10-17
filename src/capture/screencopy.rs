@@ -279,6 +279,10 @@ pub struct Screencopy {
     have_frame: bool,
     frame_transform: u32,
     frame_full: bool,
+    /// `prepare`d: don't copy on `buffer_done`, wait for `request_next`.
+    hold: bool,
+    /// All offers of the current frame are in (`buffer_done`, or v1/v2 `buffer`).
+    offers_done: bool,
 }
 
 impl Screencopy {
@@ -334,6 +338,8 @@ impl Screencopy {
             have_frame: false,
             frame_transform: 0,
             frame_full: true,
+            hold: false,
+            offers_done: false,
         };
         if let Some(o) = s.selected() {
             debug!(
@@ -357,6 +363,7 @@ impl Screencopy {
             self.g.conn.request(self.frame, FRAME_DESTROY, &[])?;
             self.phase = Phase::Idle;
         }
+        self.hold = false;
         Ok(())
     }
 
@@ -409,6 +416,11 @@ impl Screencopy {
             );
         }
         let buffer = self.buf.as_ref().map_or(0, |b| b.buffer);
+        // The previous frame's damage/flags stay valid until here (`prepare`).
+        self.ndamage = 0;
+        self.damage_all = false;
+        self.y_invert = false;
+        self.have_frame = false;
         let op = if self.mgr_version >= 2 {
             FRAME_COPY_WITH_DAMAGE
         } else {
@@ -416,6 +428,31 @@ impl Screencopy {
         };
         self.g.conn.request(self.frame, op, &[Arg::Obj(buffer)])?;
         self.phase = Phase::Copying;
+        Ok(())
+    }
+
+    /// All offers are in: copy now, or later if the frame was only `prepare`d.
+    fn offers_ready(&mut self) -> Result<(), Error> {
+        if self.phase == Phase::Negotiating && !self.offers_done {
+            self.offers_done = true;
+            if !self.hold {
+                self.start_copy()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Send `capture_output` for a new frame object.
+    fn negotiate(&mut self, out: u32) -> Result<(), Error> {
+        self.frame = self.g.conn.new_id();
+        self.g.conn.request(
+            self.mgr,
+            MGR_CAPTURE_OUTPUT,
+            &[Arg::Obj(self.frame), Arg::Int(0), Arg::Obj(out)],
+        )?;
+        self.phase = Phase::Negotiating;
+        self.noffers = 0;
+        self.offers_done = false;
         Ok(())
     }
 
@@ -434,16 +471,12 @@ impl Screencopy {
                     self.noffers += 1;
                 }
                 // v1/v2 send no buffer_done: one buffer event is the whole offer.
-                if self.mgr_version < 3 && self.phase == Phase::Negotiating {
-                    self.start_copy()?;
+                if self.mgr_version < 3 {
+                    self.offers_ready()?;
                 }
             }
             EV_FRAME_LINUX_DMABUF => {}
-            EV_FRAME_BUFFER_DONE => {
-                if self.phase == Phase::Negotiating {
-                    self.start_copy()?;
-                }
-            }
+            EV_FRAME_BUFFER_DONE => self.offers_ready()?,
             EV_FRAME_FLAGS => self.y_invert = a.uint() & FLAG_Y_INVERT != 0,
             EV_FRAME_DAMAGE => {
                 let r = DamageRect {
@@ -542,24 +575,40 @@ impl Capture for Screencopy {
     }
 
     fn request_next(&mut self) -> Result<bool, Error> {
+        if self.phase == Phase::Negotiating && self.hold {
+            // Prepared earlier: copy now (or as soon as the offers are complete).
+            self.hold = false;
+            self.have_frame = false;
+            if self.offers_done {
+                self.start_copy()?;
+            }
+            return Ok(true);
+        }
         let Some(out) = self.sel else {
             return Ok(false);
         };
         if self.phase != Phase::Idle {
             return Ok(false);
         }
-        self.frame = self.g.conn.new_id();
-        self.g.conn.request(
-            self.mgr,
-            MGR_CAPTURE_OUTPUT,
-            &[Arg::Obj(self.frame), Arg::Int(0), Arg::Obj(out)],
-        )?;
-        self.phase = Phase::Negotiating;
-        self.noffers = 0;
-        self.ndamage = 0;
-        self.damage_all = false;
-        self.y_invert = false;
+        self.negotiate(out)?;
         self.have_frame = false;
+        Ok(true)
+    }
+
+    fn held(&self) -> bool {
+        self.hold && self.phase == Phase::Negotiating
+    }
+
+    fn prepare(&mut self) -> Result<bool, Error> {
+        let Some(out) = self.sel else {
+            return Ok(false);
+        };
+        if self.phase != Phase::Idle {
+            return Ok(false);
+        }
+        // The last frame stays readable: nothing is copied before `request_next`.
+        self.negotiate(out)?;
+        self.hold = true;
         Ok(true)
     }
 

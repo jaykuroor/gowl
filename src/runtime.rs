@@ -977,6 +977,10 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
         let dl = min_opt(min_opt(cap_dl, pipe_dl), ctl.net_deadline(&pipe.streams));
         ctl.timer.arm(dl)?;
         pfds[4].fd = pipe.streams.verify_fd();
+        // D-051: while a prepared frame waits for its slot, don't wake for its offers
+        // (or anything else the compositor says); the timer reads them all at once.
+        let held = cap.held() && next_capture.is_some();
+        pfds[0].fd = if held { -1 } else { cap.fd() };
         for p in &mut pfds {
             p.revents = 0;
         }
@@ -1029,66 +1033,89 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
             pipe.resend(now);
         }
 
-        if pfds[0].revents != 0 {
-            let st = cap.dispatch()?;
-            if st.lost {
-                warn!("output gone; lights off until it comes back");
-                waiting = true;
-                next_capture = None;
-                if !paused {
-                    pipe.streams.off();
-                }
-            }
-            if st.found {
-                if waiting {
-                    warn!(
-                        "output {} is back; resuming",
-                        cap.output_name().unwrap_or("?")
-                    );
-                    waiting = false;
+        if pfds[0].revents != 0 || (held && pfds[1].revents != 0) {
+            let mut st = cap.dispatch()?;
+            loop {
+                if st.lost {
+                    warn!("output gone; lights off until it comes back");
+                    waiting = true;
+                    next_capture = None;
                     if !paused {
-                        pipe.streams.razer(true);
-                        pipe.resend(now);
+                        pipe.streams.off();
                     }
                 }
-                if !paused {
-                    next_capture = Some(now);
-                }
-            }
-            if st.failed {
-                fails += 1;
-                if fails == 1 {
-                    warn!("capture failed; retrying (logged once until it works again)");
-                }
-                let backoff = if fails == 1 {
-                    BACKOFF_FIRST
-                } else {
-                    BACKOFF_NEXT
-                };
-                if !paused && !waiting {
-                    next_capture = Some(now + backoff);
-                }
-            }
-            if st.ready {
-                if fails > 0 {
-                    warn!("capture works again after {fails} failure(s)");
-                    fails = 0;
-                }
-                if let Some(f) = cap.frame() {
-                    pipe.on_frame(&f, now);
-                }
-                if !paused && !waiting {
-                    let at = last_request + interval;
-                    if at <= now {
-                        // Slow copy: the slot has passed, ask now (saves a timer wakeup).
-                        next_capture = None;
-                        if cap.request_next()? {
-                            last_request = now;
+                if st.found {
+                    if waiting {
+                        warn!(
+                            "output {} is back; resuming",
+                            cap.output_name().unwrap_or("?")
+                        );
+                        waiting = false;
+                        if !paused {
+                            pipe.streams.razer(true);
+                            pipe.resend(now);
                         }
-                    } else {
-                        next_capture = Some(at);
+                    }
+                    if !paused {
+                        next_capture = Some(now);
                     }
                 }
+                if st.failed {
+                    fails += 1;
+                    if fails == 1 {
+                        warn!("capture failed; retrying (logged once until it works again)");
+                    }
+                    let backoff = if fails == 1 {
+                        BACKOFF_FIRST
+                    } else {
+                        BACKOFF_NEXT
+                    };
+                    if !paused && !waiting {
+                        next_capture = Some(now + backoff);
+                    }
+                }
+                let mut prepared = false;
+                if st.ready {
+                    if fails > 0 {
+                        warn!("capture works again after {fails} failure(s)");
+                        fails = 0;
+                    }
+                    let live = !paused && !waiting;
+                    let at = last_request + interval;
+                    // D-051: negotiate the next frame now, so its offers arrive while
+                    // this one is sampled; the copy waits for the slot (timer).
+                    if live && at > now && cap.prepare()? {
+                        if let Err(e) = cap.flush() {
+                            if ctl.sig.read() == Some(Sig::Stop) {
+                                debug!(
+                                    "stop signal while the compositor was not reading: razer off, exit"
+                                );
+                                return Ok(());
+                            }
+                            return Err(e);
+                        }
+                        prepared = true;
+                    }
+                    if let Some(f) = cap.frame() {
+                        pipe.on_frame(&f, now);
+                    }
+                    if live {
+                        if at <= now {
+                            // Slow copy: the slot has passed, ask now (saves a timer wakeup).
+                            next_capture = None;
+                            if cap.request_next()? {
+                                last_request = now;
+                            }
+                        } else {
+                            next_capture = Some(at);
+                        }
+                    }
+                }
+                if !prepared {
+                    break;
+                }
+                // Offers that came in while we sampled: handled without a wakeup.
+                st = cap.dispatch()?;
             }
         }
 
