@@ -233,7 +233,80 @@ def main() -> None:
                             "params": {"target": 0.10, "max_boost": 40.0, "attack_s": 0.15, "release_s": 1.0}},
     }, indent=1))
 
+    # ------------------------------------------------------- music renderer
+    # MusicPatternRenderer.render(bands, reaction, gain=1.7, palette) over a fixed band
+    # sequence; one fresh renderer (fps 60) per case. Rust regenerates the sequence with
+    # render_bands() below (same formula) — it is also stored here.
+    bands_seq = render_bands(36)
+    concrete = ("flow", "pulse", "energy_fill", "band_split", "center_burst",
+                "wave", "bass_bounce", "chase", "twinkle")
+    palettes = ("rgb", "auto", "rainbow", "aurora", "sunset", "ocean", "neon", "jewel",
+                "fire", "spectrum", "warm", "cool", "mono")
+
+    def run_case(n: int, reactions, palette_name: str, seq) -> list:
+        r = audio.MusicPatternRenderer(n, 60)
+        return [r.render(b, reaction=reactions[i], gain=1.7, palette=palette_name)
+                for i, b in enumerate(seq)]
+
+    render_cases = []
+    # Every palette through `flow` (each frame holds the last n source colors).
+    for p in palettes:
+        render_cases.append({"segments": 10, "reaction": "flow", "palette": p,
+                             "frames": run_case(10, ["flow"] * len(bands_seq), p, bands_seq)})
+    # Every reaction × a few palettes (10 segments), and × rgb at 14 segments.
+    for rx in concrete:
+        for n, p in ((10, "rgb"), (10, "rainbow"), (10, "fire"), (14, "rgb"), (14, "mono")):
+            render_cases.append({"segments": n, "reaction": rx, "palette": p,
+                                 "frames": run_case(n, [rx] * len(bands_seq), p, bands_seq)})
+    # Small strips.
+    for rx in concrete:
+        for n in (1, 2, 3):
+            render_cases.append({"segments": n, "reaction": rx, "palette": "rgb",
+                                 "frames": run_case(n, [rx] * len(bands_seq), "rgb", bands_seq)})
+    # Reaction switches mid-stream (reset keeps the previous level).
+    switch = ["flow"] * 9 + ["pulse"] * 9 + ["chase"] * 9 + ["energy_fill"] * 9
+    render_cases.append({"segments": 10, "reaction": switch, "palette": "rainbow",
+                         "frames": run_case(10, switch, "rainbow", bands_seq)})
+    # Auto Director: long enough for several phrase changes and crossfades.
+    long_seq = render_bands(420)
+    render_cases.append({"segments": 10, "reaction": "auto", "palette": "rgb", "bands": long_seq,
+                         "frames": run_case(10, ["auto"] * len(long_seq), "rgb", long_seq)})
+
+    (out_dir / "render.json").write_text(json.dumps({
+        "_note": "MusicPatternRenderer(n, fps=60).render(bands, reaction, gain=1.7, palette) per frame; "
+                 "fresh renderer per case. 'reaction' is a string or a per-frame list. "
+                 "Cases without 'bands' use the top-level 'bands' (render_bands(36) in gen_vectors.py). "
+                 "Tolerance ±1 per channel.",
+        "gain": 1.7,
+        "fps": 60,
+        "bands": bands_seq,
+        "cases": render_cases,
+    }, separators=(",", ":")))
+
     print(f"wrote vectors to {out_dir}")
+
+
+def render_bands(count: int) -> list[list[float]]:
+    """Deterministic post-AutoGain-like band triples with silences, transients and
+    clipping-level frames. Formula (i = frame index):
+      silence when i % 23 in (11, 12) or i % 37 == 30
+      bass   = 0.11 * (0.5 + 0.5 sin(0.9 i))^2 + (0.16 if i % 8 == 0 else 0)
+      mid    = 0.05 * (0.5 + 0.5 cos(0.4 i)) + (0.12 if i % 13 == 5 else 0)
+      treble = 0.035 * ((7 i) % 5) / 4 + (0.09 if i % 11 == 3 else 0)
+      every frame with i % 29 == 20 is (0.45, 0.30, 0.20) (level clips at 1)."""
+    out = []
+    for i in range(count):
+        if i % 23 in (11, 12) or i % 37 == 30:
+            out.append([0.0, 0.0, 0.0])
+            continue
+        if i % 29 == 20:
+            out.append([0.45, 0.30, 0.20])
+            continue
+        bass = 0.11 * (0.5 + 0.5 * math.sin(0.9 * i)) ** 2 + (0.16 if i % 8 == 0 else 0.0)
+        mid = 0.05 * (0.5 + 0.5 * math.cos(0.4 * i)) + (0.12 if i % 13 == 5 else 0.0)
+        treble = 0.035 * ((7 * i) % 5) / 4 + (0.09 if i % 11 == 3 else 0.0)
+        out.append([bass, mid, treble])
+    return out
 
 
 if __name__ == "__main__":
