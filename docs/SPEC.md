@@ -55,7 +55,7 @@ Device cache (written by `scan`): `$XDG_STATE_HOME/gowl/devices`, one device per
 | Screen sampling | edge zones from `led_mapping.generate_screen_mapping`, capture depth 0.28, ≤24×24 samples per zone, gamma-correct (linear-light) average |
 | Saturation | 1.15 around Rec.709 luma |
 | Brightness factor | screen 0.75, music 0.85 (multiplies channels; separate from device brightness) |
-| Smoothing | per-zone EMA, α = 0.55 screen, 0.60 music; first frame snaps |
+| Smoothing | per-zone EMA, α = 0.55 screen, 0.60 music; starts from black (first frames fade in), zone-count change snaps |
 | Send policy | send if any channel moved > 3, else keepalive every 0.5 s |
 | Rate caps | screen 45 fps (gowl default 30 — see BUDGETS), music 60 fps, device cap 40 Hz |
 | Stream start/end | razer mode ON before first frame, OFF on exit/pause |

@@ -93,7 +93,7 @@ is `dlopen`ed so screen mode never maps it. PipeWire on Fedora serves this throu
   (≤ 47·47 = 2209 samples × 65535 < 2³²). Mean → sRGB8 by binary search over 256 midpoint thresholds
   (exact nearest, 8 compares, once per zone per frame).
 - Saturation: luma = (54·r + 183·g + 19·b) >> 8 (Rec.709 ×256); out = luma + ((c−luma)·sat_q8 >> 8), clamp.
-- EMA state: `u16` = value << 8; `s += ((t<<8) − s) · α_q8 >> 8`; first frame snaps.
+- EMA state: `u16` = value << 8; `s += ((t<<8) − s) · α_q16 >> 16` (rounded); state starts black (first frames fade in, as legacy `ColorSmoother(alpha, count)` does); a zone-count change snaps (D-012).
 - All results within ±1/channel of `tests/vectors/processing.json`.
 
 ## Release profile (put in Cargo.toml)

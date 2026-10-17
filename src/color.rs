@@ -330,23 +330,28 @@ pub fn scale(colors: &mut [Rgb], k_q16: u32) {
     }
 }
 
-/// Per-zone temporal EMA. State is value << 8 (u16); the first frame (or a zone
-/// count change) snaps to the target.
+/// Per-zone temporal EMA. State is value << 8 (u16). Like legacy
+/// `ColorSmoother(alpha, count)`, the state starts black, so the first frames fade
+/// in; a zone-count change snaps to the target.
 pub struct Smoother {
     alpha_q16: i64,
     state: Vec<[u16; 3]>,
 }
 
 impl Smoother {
-    pub fn new(alpha: f64) -> Smoother {
+    pub fn new(alpha: f64, count: usize) -> Smoother {
+        let mut state = Vec::with_capacity(crate::proto::MAX_SEGMENTS.max(count));
+        state.resize(count, [0u16; 3]);
         Smoother {
             alpha_q16: i64::from(q16(alpha.clamp(0.0, 1.0))),
-            state: Vec::with_capacity(crate::proto::MAX_SEGMENTS),
+            state,
         }
     }
 
-    pub fn reset(&mut self) {
+    /// Back to black with `count` zones (legacy `reset(count)`).
+    pub fn reset(&mut self, count: usize) {
         self.state.clear();
+        self.state.resize(count, [0u16; 3]);
     }
 
     /// `out.len() == target.len()`. Allocation-free once `target.len() <= 255`.
