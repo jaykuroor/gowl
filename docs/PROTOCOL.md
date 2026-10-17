@@ -1,6 +1,6 @@
 # PROTOCOL — Govee LAN (UDP), byte-exact
 
-Source of truth: `legacy/LumiSync/lumisync/connection.py`, `lumisync/utils/colors.py`,
+Source of truth: `legacy/lumisync/connection.py`, `lumisync/utils/colors.py`,
 `lumisync/sync/processing.py`. Golden bytes: `tests/vectors/protocol.json`.
 
 Prerequisite on the device side: **"LAN Control" enabled** for that device in the Govee

@@ -1,7 +1,7 @@
 # AUDIO — music sync
 
-Legacy reference: `legacy/LumiSync/lumisync/sync/music.py` (loop) and
-`legacy/LumiSync/lumisync/sync/audio.py` (bands, AutoGain, `MusicPatternRenderer`).
+Legacy reference: `legacy/lumisync/sync/music.py` (loop) and
+`legacy/lumisync/sync/audio.py` (bands, AutoGain, `MusicPatternRenderer`).
 Golden numbers: `tests/vectors/audio.json`.
 
 ## Capture

@@ -49,7 +49,7 @@ Device cache (written by `scan`): `$XDG_STATE_HOME/gowl/devices`, one device per
 `mac ip sku`. Pidfile: `$XDG_RUNTIME_DIR/gowl.pid`.
 
 ## Behaviour that must match legacy
-| Thing | Legacy value (see `legacy/LumiSync/lumisync/config/options.py`) |
+| Thing | Legacy value (see `legacy/lumisync/config/options.py`) |
 |---|---|
 | Screen sampling | edge zones from `led_mapping.generate_screen_mapping`, capture depth 0.28, ≤24×24 samples per zone, gamma-correct (linear-light) average |
 | Saturation | 1.15 around Rec.709 luma |

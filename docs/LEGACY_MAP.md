@@ -1,6 +1,6 @@
 # LEGACY_MAP — where each legacy piece goes
 
-Paths relative to `legacy/LumiSync/lumisync/`. Read only the files marked **port**.
+Paths relative to `legacy/lumisync/`. Read only the files marked **port**.
 
 | Legacy | Fate | New home / note |
 |---|---|---|

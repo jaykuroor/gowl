@@ -5,7 +5,7 @@ The new implementation must reproduce these outputs (exactly for protocol bytes,
 within the stated tolerance for color/audio math). Re-run whenever the legacy
 checkout changes:
 
-    python3 -I tools/gen_vectors.py legacy/LumiSync tests/vectors
+    python3 -I tools/gen_vectors.py legacy tests/vectors
 
 Needs only Python 3.11+ and numpy. Legacy modules are loaded by file path with
 their heavy imports (webcolors, colorama, Qt, ...) stubbed out, so nothing from
