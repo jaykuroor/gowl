@@ -20,13 +20,42 @@ usage:
   gowl temp KELVIN [DEV]               2000-9000
   gowl status [DEV]
   gowl doctor [DEV]                    network diagnostics (LAN interface, VPN, firewall)
-  gowl outputs | screen | music | calibrate | pause | resume | stop | toggle
+  gowl outputs                         list Wayland outputs (name, mode, scale, transform)
+  gowl screen [--output NAME] [--fps N] [--depth 0.10-0.50] [DEV...]
+                                       sync the lights to the screen edges (Ctrl+C stops)
+  gowl music | calibrate | pause | resume | stop | toggle
                                        not yet implemented
   gowl --version | --help
 
 DEV = alias | IP | MAC | index from `gowl list`; default: $GOWL_DEVICE, config device=,
 or the only cached device. Config: $XDG_CONFIG_HOME/gowl/config. GOWL_LOG=debug for verbose.
 exit: 0 ok, 1 runtime error, 2 usage, 3 no device, 4 capture unavailable, 5 no LAN interface";
+
+#[cfg(feature = "count-alloc")]
+mod count_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::Ordering;
+
+    pub struct Counting;
+
+    // SAFETY: forwards unchanged to `System`; the counter has no effect on memory.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            gowl::runtime::ALLOCS.fetch_add(1, Ordering::Relaxed);
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            unsafe { System.dealloc(p, l) }
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+            gowl::runtime::ALLOCS.fetch_add(1, Ordering::Relaxed);
+            unsafe { System.realloc(p, l, n) }
+        }
+    }
+
+    #[global_allocator]
+    static A: Counting = Counting;
+}
 
 fn main() {
     gowl::log::init();
@@ -113,7 +142,13 @@ fn run(args: &[String]) -> Result<(), Error> {
         }
         "status" => cmd_status(positionals(cmd, rest, 1)?),
         "doctor" => cmd_doctor(positionals(cmd, rest, 1)?),
-        "outputs" | "screen" | "music" | "calibrate" | "pause" | "resume" | "stop" | "toggle" => {
+        "outputs" => {
+            positionals(cmd, rest, 0)?;
+            println!("{}", gowl::capture::list_outputs()?);
+            Ok(())
+        }
+        "screen" => cmd_screen(rest),
+        "music" | "calibrate" | "pause" | "resume" | "stop" | "toggle" => {
             Err(usage(format!("{cmd}: not yet implemented")))
         }
         other => Err(usage(format!("unknown command {other:?}"))),
@@ -395,4 +430,66 @@ fn cmd_scan(rest: &[String]) -> Result<(), Error> {
     }
     print_table(&new, &c.cfg);
     Ok(())
+}
+
+/// `gowl screen [--output NAME] [--fps N] [--depth D] [DEV...]`.
+fn cmd_screen(rest: &[String]) -> Result<(), Error> {
+    let c = ctx();
+    let mut output = c.cfg.output.clone();
+    let mut fps = c.cfg.fps;
+    let mut depth = c.cfg.depth;
+    let mut specs: Vec<&String> = Vec::new();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--output" => {
+                output = Some(
+                    it.next()
+                        .ok_or_else(|| usage("screen: --output expects a name"))?
+                        .clone(),
+                );
+            }
+            "--fps" => {
+                fps = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|f| (1..=240).contains(f))
+                    .ok_or_else(|| usage("screen: --fps expects 1-240"))?;
+            }
+            "--depth" => {
+                depth = it
+                    .next()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .filter(|d| (0.10..=0.50).contains(d))
+                    .ok_or_else(|| usage("screen: --depth expects 0.10-0.50"))?;
+            }
+            o if o.starts_with("--") => return Err(usage(format!("screen: unknown option {o}"))),
+            _ => specs.push(a),
+        }
+    }
+    let devices = if specs.is_empty() {
+        vec![resolve(&c, None)?]
+    } else {
+        specs
+            .iter()
+            .map(|s| resolve(&c, Some(s)))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let streams = gowl::runtime::Streams::open(
+        &devices,
+        c.cfg.lan_if.as_deref(),
+        c.ports,
+        c.cfg.threshold,
+        c.cfg.keepalive_ms,
+    )?;
+    let mut cap = gowl::capture::open(output.as_deref())?;
+    let mut pipe = gowl::runtime::Pipeline::new(streams, &c.cfg, depth, fps);
+    debug!(
+        "screen sync: {} device(s), output {}, {} fps (cap {}), depth {depth}",
+        devices.len(),
+        cap.output_name().unwrap_or("?"),
+        fps,
+        gowl::runtime::DEVICE_MAX_HZ
+    );
+    gowl::runtime::run_screen(cap.as_mut(), &mut pipe)
 }

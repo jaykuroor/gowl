@@ -4,6 +4,8 @@
 mod common;
 
 use common::{Json, vector};
+use gowl::capture::Format;
+use gowl::capture::sample::{Geometry, Sampler};
 use gowl::color::{self, Rect, Rgb, Rgb8Frame, SendGate, Smoother};
 use gowl::net::Sender;
 use gowl::proto;
@@ -213,6 +215,96 @@ fn processing_zone_averages() {
         worst = worst.max(assert_close(&out, &c.get("colors").rgb_list(), 1, &what));
     }
     eprintln!("zone averages: worst channel error {worst}");
+}
+
+/// Encode an sRGB8 pixel as the 32-bit little-endian word of a wl_shm format.
+fn encode(fmt: Format, [r, g, b]: Rgb) -> [u8; 4] {
+    let (r, g, b) = (u32::from(r), u32::from(g), u32::from(b));
+    let ten = |v: u32| (v << 2) | (v >> 6); // 8 → 10 bit, inverse of >> 2
+    let w = match fmt {
+        Format::Xrgb8888 => 0xff00_0000 | r << 16 | g << 8 | b,
+        Format::Xbgr8888 => 0xff00_0000 | b << 16 | g << 8 | r,
+        Format::Xrgb2101010 => 0xc000_0000 | ten(r) << 20 | ten(g) << 10 | ten(b),
+        Format::Xbgr2101010 => 0xc000_0000 | ten(b) << 20 | ten(g) << 10 | ten(r),
+    };
+    w.to_le_bytes()
+}
+
+/// capture/sample.rs reads a fake SHM frame in every supported format, transform
+/// and y_invert setting; the zone colors must match the legacy (untransformed)
+/// gamma-correct vectors within ±1.
+#[test]
+fn capture_sampler_formats_and_transforms() {
+    let v = vector("processing.json");
+    let mut worst = 0;
+    let mut checked = 0;
+    for c in v.get("average_zone_colors").arr() {
+        if !c.get("gamma_correct").bool() {
+            continue; // the sampler always averages in linear light (legacy default)
+        }
+        let (lh, lw) = (c.get("height").u64() as u32, c.get("width").u64() as u32);
+        let n = c.get("zones").u64() as usize;
+        let want = c.get("colors").rgb_list();
+        let reference = common::synthetic_frame(lh as usize, lw as usize);
+        let big = lw * lh > 3_000_000;
+        let formats: &[Format] = if big {
+            &[Format::Xrgb8888]
+        } else {
+            &[
+                Format::Xrgb8888,
+                Format::Xbgr8888,
+                Format::Xrgb2101010,
+                Format::Xbgr2101010,
+            ]
+        };
+        let transforms: &[u32] = if big {
+            &[0, 1, 6]
+        } else {
+            &[0, 1, 2, 3, 4, 5, 6, 7]
+        };
+        for &fmt in formats {
+            for &t in transforms {
+                for y_invert in [false, true] {
+                    if big && y_invert {
+                        continue;
+                    }
+                    let (bw, bh) = if t & 1 != 0 { (lh, lw) } else { (lw, lh) };
+                    let stride = bw * 4 + 32;
+                    let geo = Geometry {
+                        width: bw,
+                        height: bh,
+                        stride,
+                        format: fmt,
+                        transform: t,
+                        y_invert,
+                    };
+                    assert_eq!(geo.logical(), (lw, lh));
+                    let mut buf = vec![0u8; (stride * bh) as usize];
+                    for ly in 0..lh {
+                        for lx in 0..lw {
+                            let i = ((ly * lw + lx) * 3) as usize;
+                            let (bx, by) = geo.to_buffer(lx, ly);
+                            let o = (by * stride + bx * 4) as usize;
+                            buf[o..o + 4].copy_from_slice(&encode(
+                                fmt,
+                                [reference[i], reference[i + 1], reference[i + 2]],
+                            ));
+                        }
+                    }
+                    let mut s = Sampler::new(n, color::DEFAULT_CAPTURE_DEPTH);
+                    s.ensure(geo);
+                    s.mark(&[], true);
+                    assert!(s.sample(&buf));
+                    let what =
+                        format!("{lw}x{lh} zones {n} {fmt:?} transform {t} y_invert {y_invert}");
+                    worst = worst.max(assert_close(s.colors(), &want, 1, &what));
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked >= 130, "only {checked} combinations checked");
+    eprintln!("sampler: {checked} format/transform combinations, worst channel error {worst}");
 }
 
 #[test]

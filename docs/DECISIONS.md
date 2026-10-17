@@ -128,3 +128,52 @@ and uses the payload `ip` only if it is on the receiving interface's subnet; the
 `zone_bounds`, alloc test asserts frames were actually sent.
 Evidence: tests 30/30, netns `--bin` PASS, binary 529,960 B.
 Revisit-if: devices on a different subnet behind a router are ever needed (they are out of scope).
+
+## D-016 — Hand-written Wayland wire client instead of wayland-client (2026-10-17, phase 2, capture agent)
+Context: CLAUDE.md whitelists `wayland-client` + `wayland-protocols(-wlr)`. gowl speaks 8 interfaces
+(wl_display/registry/callback/shm/shm_pool/buffer/output, zwlr_screencopy_manager/frame_v1) and
+creates one new object per frame (screencopy frames are single-use).
+Decision: `src/capture/wire.rs` (~450 lines incl. test): Unix socket, 16 KB receive / 4 KB send
+buffers allocated once, SCM_RIGHTS for `create_pool`, id reuse via `delete_id`, events parsed in
+place. No dependency added; `cargo tree` stays gowl → libc.
+Evidence (measured): scratch crate with wayland-client 0.31.15 + wayland-protocols-wlr 0.3.12 that only
+lists globals: 448,032 B stripped, 20 crates incl. rustix (rule 3 says rustix *or* libc), cc,
+pkg-config, wayland-sys, a proc-macro scanner (quick-xml), 10 s clean build, max RSS 2.0 MB.
+gowl with the full capture path: 529,960 → 607,784 B (+78 KB), clean build of the whole crate 6.5 s.
+By construction wayland-client allocates for every new proxy (Arc'd object data) → ≥ 1 heap
+allocation per frame, against rule 4; wire.rs allocates nothing per frame (tests/capture_alloc.rs:
+200 frames, 0 allocations; live niri with `--features count-alloc`: 0 per second after warm-up).
+Revisit-if: gowl needs many more protocols (e.g. DMA-BUF feedback tables, ext-image-copy-capture
+sessions) and the hand-written surface becomes a maintenance burden.
+
+## D-017 — Smoothing on a static screen: timer steps until the EMA is settled (2026-10-17, phase 2, capture agent)
+Context: legacy captures and steps the EMA every frame forever; gowl captures only on damage, so
+after the last change no frames arrive and the light would freeze mid-fade.
+Decision: after each frame-driven step, if `Smoother::settled(target)` (another update would change
+nothing — works for any α, including α < 0.5 where the u16 EMA never reaches the target exactly) is
+false, a timer step follows. Steps are spaced ≥ max(¾·interval, 25 ms) so frames, whose arrival
+jitters by the compositor's render phase, step directly; the fallback timer step waits 1.5 intervals
+after a frame-driven step. Keepalive resends the current smoothed colors (legacy `frame_needs_send`).
+Evidence: busy screen 30 fps: timer wakeups 52/s → 32/s (30 capture + 2 keepalive); mock e2e test:
+static phase sends keepalive only.
+Revisit-if: the human sees a visible difference in fade timing vs legacy.
+
+## D-018 — Wakeups: 3 per frame is the screencopy minimum we accept for now (2026-10-17, phase 2, capture agent)
+Context: BUDGETS S1 asks ≤ 2·fps wakeups. Each screencopy frame costs a timer wakeup (send
+`capture_output`), a Wayland wakeup for `buffer`…`buffer_done` (send `copy_with_damage`) and one for
+`ready`. Measured 92/s at 30 fps (3/frame + 2 keepalive), down from 122 (D-017 fix).
+Options: speculatively send `copy_with_damage` together with `capture_output` (reusing the previous
+offer) → 2/frame. Rejected for now: if the output mode changes in between, niri/wlroots answer with
+the fatal protocol error `invalid_buffer` and gowl would die; doing it safely needs reconnect logic.
+Decision: keep 3/frame; Phase 5 may add speculation + reconnect if the wakeup budget matters.
+Revisit-if: Phase 5 perf pass.
+
+## D-019 — niri pays ~14 % of a core for 30 fps SHM screencopy at 3440x1440 (2026-10-17, phase 2, capture agent)
+Context: BUDGETS target "niri CPU delta ≤ 3 % at 1440p30".
+Evidence: S0 niri 5.7–6.4 %; S1 (30 fps) niri 19.4–20.1 % → Δ ≈ 14 %; `--fps 15` niri 12.8 % → Δ ≈ 6.5 %.
+gowl itself 0.27 % (30 fps) / 0.10 % (15 fps). niri reports full-output damage on every frame (even
+byte-identical ones), so it reads back all 19.8 MB per frame.
+Decision: not fixed in Phase 2 (functional phase); flagged for Phase 5: DMA-BUF variant
+(CAPTURE_NIRI.md), `capture_output_region` per edge band, and/or a lower default fps. Default fps
+unchanged (30, D-004) until the human weighs responsiveness vs niri CPU.
+Revisit-if: Phase 5.

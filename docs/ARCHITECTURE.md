@@ -17,8 +17,9 @@ src/
                  brightness, EMA smoother, resample, reverse/offset, delta check — all fixed-point
   capture/
     mod.rs       trait Capture { fn fd(); fn dispatch() -> Option<FrameRef>; fn request_next(); }
-    screencopy.rs  zwlr_screencopy_manager_v1 (v3) — default on niri
-    imagecopy.rs   ext_image_copy_capture_v1 — used when advertised (future niri)
+    wire.rs        hand-written Wayland wire client (D-016): fixed buffers, fd passing, id reuse
+    screencopy.rs  zwlr_screencopy_manager_v1 (v3) — default on niri; outputs + hot-plug
+    imagecopy.rs   ext_image_copy_capture_v1 — stub until niri advertises it (D-006)
     shm.rs         memfd + mmap + wl_shm_pool buffer, reused across frames
     sample.rs      precomputed per-zone sample offsets, pixel-format readers, damage→zone mask
   audio/
@@ -79,6 +80,12 @@ poll([wayland_fd, timerfd, signalfd, netlink_fd], -1)
 ```
 One timerfd armed to the nearest deadline (absolute, CLOCK_MONOTONIC). No periodic
 tick. Static screen ⇒ wakeups = keepalive rate only. Paused ⇒ zero wakeups.
+The timerfd has a third job: smoothing steps. Legacy steps the EMA once per captured
+frame even on a static screen; gowl gets no frames then, so after a change it keeps
+stepping on the timer (at the frame rate) until `Smoother::settled` says the EMA has
+reached its fixed point, then stops (D-017). Busy screen: 3 wakeups per frame
+(timer → `capture_output`, `buffer_done` → copy, `ready` → process); see D-018.
+(netlink rebind is Phase 4; not in the loop yet.)
 
 ## Music mode
 `pa_simple_new(NULL, "gowl", PA_STREAM_RECORD, "@DEFAULT_MONITOR@", …, float32le,

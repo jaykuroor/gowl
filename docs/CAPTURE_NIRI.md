@@ -107,8 +107,13 @@ Goal: replace niri's GPU→CPU readback with a GPU→GPU blit into a LINEAR buff
 
 ## Things to verify on the machine (write results into this file)
 - [x] screencopy version advertised; ext-image-copy-capture present? — **screencopy v3; ext-image-copy-capture and ext-output-image-capture-source absent on niri 26.04** (2026-10-17, wayland-info). The imagecopy backend stays a seam only.
-- [ ] which SHM formats niri offers on this output (8-bit? 10-bit?) — partial: `wl_shm` advertises only XRGB8888, ARGB8888, XBGR8888, ABGR8888 (no 10-bit). The per-frame `buffer` offer still needs checking in Phase 2.
-- [ ] does `copy_with_damage` really block on a static screen (gowl CPU ≈ 0)?
-- [ ] damage rect granularity niri reports (full-output vs. tight rects)
-- [ ] y_invert ever set?
-- [ ] behaviour on output power-off (`niri msg action power-off-monitors`) and on lock screen
+- [x] which SHM formats niri offers on this output — **one `buffer` offer per frame: XRGB8888 (`XR24`), 3440x1440, stride 13760**, plus a `linux_dmabuf` offer and `buffer_done` (v3). `wl_shm` itself advertises XR24/AR24/XB24/AB24, no 10-bit (2026-10-17, `GOWL_LOG=debug gowl screen`: "shm buffer 3440x1440 stride 13760 format XR24 (1 offers)").
+- [ ] does `copy_with_damage` really block on a static screen (gowl CPU ≈ 0)? — **not verifiable by the agent**: this desktop never went static (an animated background layer / focused browser repaint the whole output; ~98% of pixels change on every other frame, mean Δ 15/channel). Copies completed 8–38 ms after the request, every time. On the mock compositor (tests/screen_mock.rs) the loop drops to keepalive-only when copies block. Needs the human: idle desktop, then `python3 tools/measure.py screen 30 --fake` (S2).
+- [x] damage rect granularity niri reports — **always one full-output rect (0,0,3440,1440)**, even for frames whose pixels are byte-identical to the previous frame (every second frame in a 12-frame probe). So on niri 26.04 the damage → dirty-zone filter never skips work; it is kept because it costs nothing and helps on compositors with tight damage. (2026-10-17, probe that diffed consecutive frames.)
+- [x] y_invert ever set? — **no** (flags = 0 on every frame observed, SHM, transform normal).
+- [ ] behaviour on output power-off (`niri msg action power-off-monitors`) and on lock screen — not tested (would blank the human's live session). Code path: `failed` → back-off 100 ms then 1 s, logged once; `global_remove` of the output → razer OFF, wait for it to come back, razer ON. Ask the human.
+- [ ] rotated output (`niri msg output HDMI-A-1 transform 90`): logical→buffer mapping follows grim (flip in buffer space, then rotate; unit-tested as a bijection and against the vectors in all 8 transforms) but the absolute direction on niri needs the human's eyes.
+
+## Measured on the machine (Phase 2, 2026-10-17)
+- niri CPU: S0 baseline 5.7–6.4 % of a core; with `gowl screen` (30 fps, 3440x1440 SHM) 19.4–20.1 % → **Δ ≈ 14 %** (target ≤ 3 %). At `--fps 15`: 12.8 % → Δ ≈ 6.5 %. This is niri's full-output GPU→CPU readback (19.8 MB per frame); gowl itself is 0.27 %. Phase 5 must look at the DMA-BUF variant, `capture_output_region`, or a lower default fps.
+- gowl RSS 8.6 MB = 0.2 MB anon + 2.9 MB file (binary + libc) + **5.9 MB shmem**: the kernel's fault-around maps 16 pages around each sampled page of the SHM buffer (~340 pages touched → ~1480 mapped). `MADV_RANDOM` does not change it (measured, reverted). Those pages exist anyway (niri fills the whole 19.8 MB buffer); they are shared, not private.
