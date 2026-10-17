@@ -103,8 +103,9 @@ pub struct Conn {
     nwfds: usize,
     next_id: u32,
     free_ids: Vec<u32>,
-    /// Keep received fds for `take_fd` (the test compositor); clients close them.
-    keep_fds: bool,
+    /// Test compositor side: keep received fds for `take_fd` and hand `wl_display`
+    /// messages (requests, there) to the caller. Clients close fds they get.
+    server: bool,
     rfds: [RawFd; MAX_FDS],
     nrfds: usize,
 }
@@ -185,7 +186,7 @@ impl Conn {
             nwfds: 0,
             next_id: 2,
             free_ids: Vec::with_capacity(64),
-            keep_fds: false,
+            server: false,
             rfds: [-1; MAX_FDS],
             nrfds: 0,
         }
@@ -195,7 +196,7 @@ impl Conn {
     /// allocate ids from the server range.
     pub fn test_server(fd: OwnedFd) -> Conn {
         let mut c = Conn::from_fd(fd);
-        c.keep_fds = true;
+        c.server = true;
         c.next_id = 0xff00_0000;
         c
     }
@@ -386,7 +387,7 @@ impl Conn {
                     let n = ((*c).cmsg_len - libc::CMSG_LEN(0) as usize) / mem::size_of::<RawFd>();
                     for i in 0..n {
                         let fd = data.add(i).read_unaligned();
-                        if self.keep_fds && self.nrfds < MAX_FDS {
+                        if self.server && self.nrfds < MAX_FDS {
                             self.rfds[self.nrfds] = fd;
                             self.nrfds += 1;
                         } else {
@@ -426,7 +427,7 @@ impl Conn {
                 len: size - 8,
             };
             self.rstart += size;
-            if obj != DISPLAY {
+            if obj != DISPLAY || self.server {
                 return Ok(Some(ev));
             }
             let mut a = self.args(&ev);
