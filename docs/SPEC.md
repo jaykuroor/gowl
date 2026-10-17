@@ -14,7 +14,7 @@
 Qt/any GUI, tray icon, Govee cloud/MQTT/Platform API, accounts, Tuya/LSC, iDotMatrix/BLE,
 plug metering, update checker, album-art palette, Windows/macOS/X11, xdg-desktop-portal
 / PipeWire video capture (keep a trait seam for it; see `ARCHITECTURE.md`), the legacy
-LED-mapping editor (replaced by `reverse`/`offset`/`depth` config + `calibrate`).
+LED-mapping editor (replaced by `gowl calibrate` → `layout`, plus `reverse`/`offset`/`depth` config).
 
 ## CLI
 Hand-parsed. `DEV` = alias | IP | MAC | index from `gowl list`; omitted → config
@@ -31,7 +31,8 @@ gowl status [DEV]                    devStatus query (falls back to "status")
 gowl outputs                         list Wayland outputs: name, size, scale, transform
 gowl screen [--output NAME] [--fps 1-40] [--depth 0.10-0.50] [DEV...]
 gowl music  [--reaction R] [--palette P] [--fps N] [DEV...]
-gowl calibrate [DEV]                 segment walk: 1 red segment at a time, Enter to step
+gowl calibrate [DEV]                 segment walk: 1 red segment at a time, type its numpad
+                                     position; saves segments= and layout= (D-040)
 gowl pause | resume | stop           signal the running sync (pidfile)
 gowl doctor [DEV]                    network diagnostics: LAN iface, VPN hijack, firewall (docs/NETWORK.md)
 gowl toggle [screen|music]           running → stop it; not running → run that mode (default screen)
@@ -64,7 +65,7 @@ Device cache (written by `scan`): `$XDG_STATE_HOME/gowl/devices`, one device per
 
 Additions over legacy (allowed because they reduce cost or fix Wayland gaps):
 damage-aware zone recompute, pull-paced capture (no frames when screen static),
-per-device `reverse`/`offset`, multi-device fan-out from one capture, VPN-proof
+per-device `reverse`/`offset` or a calibrated `layout` (D-040), multi-device fan-out from one capture, VPN-proof
 interface-bound sockets with automatic rebind on network changes.
 
 ## Shutdown contract

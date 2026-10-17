@@ -14,6 +14,8 @@ pub struct DeviceCfg {
     pub segments: Option<u8>,
     pub reverse: bool,
     pub offset: u16,
+    /// Calibrated position of each segment (numpad cells, `color::layout_rects`).
+    pub layout: Option<Vec<u8>>,
 }
 
 /// Defaults are the legacy values (`legacy/lumisync/config/options.py`), except
@@ -226,9 +228,81 @@ fn device_key(d: &mut DeviceCfg, k: &str, v: &str) -> Result<(), String> {
         "segments" => d.segments = Some(int_in(v, 1, 255)?),
         "reverse" => d.reverse = boolean(v)?,
         "offset" => d.offset = int_in(v, 0, 254)?,
+        "layout" => d.layout = Some(parse_layout(v)?),
         _ => return Err("unknown key (ignored)".into()),
     }
     Ok(())
+}
+
+/// `layout = 4 4 8 8 9 …`: one numpad cell (0-9) per segment, spaces or commas.
+pub fn parse_layout(v: &str) -> Result<Vec<u8>, String> {
+    let cells = v
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|w| !w.is_empty())
+        .map(|w| match w.parse::<u8>() {
+            Ok(c) if c <= crate::color::LAYOUT_MAX_CELL => Ok(c),
+            _ => Err(format!("bad cell {w:?} (expected 0-9)")),
+        })
+        .collect::<Result<Vec<u8>, String>>()?;
+    if cells.is_empty() || cells.len() > crate::proto::MAX_SEGMENTS {
+        return Err(format!("expected 1-{} cells", crate::proto::MAX_SEGMENTS));
+    }
+    Ok(cells)
+}
+
+/// The key of a `key = value` line (comment stripped), if it is one.
+fn line_key(line: &str) -> Option<&str> {
+    let l = line.split('#').next()?.trim();
+    if l.starts_with('[') {
+        return None;
+    }
+    l.split_once('=').map(|(k, _)| k.trim())
+}
+
+/// Is this line the header `[device ALIAS]`?
+fn is_header_for(line: &str, alias: &str) -> bool {
+    let l = line.split('#').next().unwrap_or("").trim();
+    let Some(inner) = l.strip_prefix('[').and_then(|l| l.strip_suffix(']')) else {
+        return false;
+    };
+    let mut w = inner.split_whitespace();
+    (w.next(), w.next(), w.next()) == (Some("device"), Some(alias), None)
+}
+
+/// Set `keys` in the `[device ALIAS]` section of config `text`, leaving every
+/// other byte as it was: an existing `key =` line is replaced in place, a missing
+/// one goes after the section's last non-blank line. The last header for ALIAS
+/// wins, like `parse`. `None` if there is no such section.
+pub fn set_device_keys(text: &str, alias: &str, keys: &[(&str, String)]) -> Option<String> {
+    let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
+    let head = lines.iter().rposition(|l| is_header_for(l, alias))?;
+    let end = lines[head + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .map_or(lines.len(), |p| head + 1 + p);
+    let mut insert_at = lines[head + 1..end]
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map_or(head + 1, |p| head + 2 + p);
+    for (k, v) in keys {
+        let new = format!("{k} = {v}\n");
+        match (head + 1..end)
+            .rev()
+            .find(|&i| line_key(&lines[i]) == Some(k))
+        {
+            Some(i) => lines[i] = new,
+            None => {
+                if let Some(prev) = lines.get_mut(insert_at.wrapping_sub(1))
+                    && !prev.ends_with('\n')
+                {
+                    prev.push('\n');
+                }
+                lines.insert(insert_at, new);
+                insert_at += 1;
+            }
+        }
+    }
+    Some(lines.concat())
 }
 
 #[cfg(test)]
@@ -262,5 +336,42 @@ mod tests {
         assert_eq!(c.fps, 30);
         assert_eq!(c.depth, 0.28);
         assert!(!c.devices[0].reverse);
+    }
+
+    #[test]
+    fn layout_parses() {
+        let c = parse(
+            "[device a]\nlayout = 4 4,8 8 9 6 6 2 2 1 # from calibrate\n",
+            &mut |_, m| panic!("{m}"),
+        );
+        assert_eq!(
+            c.devices[0].layout,
+            Some(vec![4, 4, 8, 8, 9, 6, 6, 2, 2, 1])
+        );
+        assert!(parse_layout("1 x").is_err());
+        assert!(parse_layout("10").is_err());
+        assert!(parse_layout("  ").is_err());
+    }
+
+    #[test]
+    fn set_device_keys_preserves_everything_else() {
+        let text = "fps = 30 # mine\n\n[device desk]\nmac = AA\nsegments = 8   # old\n\n# trailing note\n[device other]\nsegments = 4\n";
+        let out = set_device_keys(
+            text,
+            "desk",
+            &[("segments", "10".into()), ("layout", "4 8 6 2".into())],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "fps = 30 # mine\n\n[device desk]\nmac = AA\nsegments = 10\n\n# trailing note\nlayout = 4 8 6 2\n[device other]\nsegments = 4\n"
+        );
+        // No trailing newline, section at the end of the file.
+        let out = set_device_keys("[device x]\nip = 1.2.3.4", "x", &[("layout", "5".into())]);
+        assert_eq!(
+            out.as_deref(),
+            Some("[device x]\nip = 1.2.3.4\nlayout = 5\n")
+        );
+        assert_eq!(set_device_keys(text, "nope", &[]), None);
     }
 }

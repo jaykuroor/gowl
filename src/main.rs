@@ -27,8 +27,8 @@ usage:
                                        sync to what you hear (default sink monitor)
       reactions: flow pulse energy_fill band_split center_burst wave bass_bounce chase twinkle auto
       palettes:  rgb auto rainbow aurora sunset ocean neon jewel fire spectrum warm cool mono
-  gowl calibrate | pause | resume | stop | toggle
-                                       not yet implemented
+  gowl calibrate [DEV]                 find where each segment sits; saves layout= to the config
+  gowl pause | resume | stop | toggle  not yet implemented
   gowl --version | --help
 
 DEV = alias | IP | MAC | index from `gowl list`; default: $GOWL_DEVICE, config device=,
@@ -153,9 +153,8 @@ fn run(args: &[String]) -> Result<(), Error> {
         }
         "screen" => cmd_screen(rest),
         "music" => gowl::audio::cmd_music(rest),
-        "calibrate" | "pause" | "resume" | "stop" | "toggle" => {
-            Err(usage(format!("{cmd}: not yet implemented")))
-        }
+        "calibrate" => gowl::calibrate::cmd_calibrate(rest),
+        "pause" | "resume" | "stop" | "toggle" => Err(usage(format!("{cmd}: not yet implemented"))),
         other => Err(usage(format!("unknown command {other:?}"))),
     }
 }

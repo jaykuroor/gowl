@@ -202,6 +202,8 @@ pub struct Stream {
     gate: SendGate,
     reverse: bool,
     offset: usize,
+    /// Calibrated layout: zones are already in segment order.
+    layout: Option<Vec<u8>>,
     /// Current segment colors (after reverse/offset).
     seg: [Rgb; MAX_SEGMENTS],
     last_ms: Option<u64>,
@@ -284,8 +286,14 @@ impl Streams {
                 sock,
                 sender: Sender::new(SocketAddrV4::new(d.ip, ports.control), n),
                 gate: SendGate::new(threshold, u64::from(keepalive_ms)),
-                reverse: d.reverse,
-                offset: usize::from(d.offset) % n,
+                // A calibrated layout already puts every zone on its segment.
+                reverse: d.reverse && d.layout.is_none(),
+                offset: if d.layout.is_some() {
+                    0
+                } else {
+                    usize::from(d.offset) % n
+                },
+                layout: d.layout.clone().filter(|l| l.len() == n),
                 seg: [[0; 3]; MAX_SEGMENTS],
                 last_ms: None,
                 failing: false,
@@ -352,7 +360,7 @@ impl Streams {
 
 // ------------------------------------------------------------------ screen pipeline
 
-/// Devices sharing one segment count share one zone set and smoother.
+/// Devices sharing one segment count (and layout) share one zone set and smoother.
 struct Group {
     sampler: Sampler,
     smoother: Smoother,
@@ -382,10 +390,17 @@ impl Pipeline {
         let mut groups: Vec<Group> = Vec::new();
         for (i, s) in streams.devs.iter().enumerate() {
             let n = s.n();
-            match groups.iter_mut().find(|g| g.sampler.zone_count() == n) {
+            let layout = s.layout.as_deref();
+            match groups
+                .iter_mut()
+                .find(|g| g.sampler.zone_count() == n && g.sampler.layout() == layout)
+            {
                 Some(g) => g.devs.push(i),
                 None => groups.push(Group {
-                    sampler: Sampler::new(n, depth),
+                    sampler: match layout {
+                        Some(l) => Sampler::with_layout(l, depth),
+                        None => Sampler::new(n, depth),
+                    },
                     smoother: Smoother::new(cfg.smoothing, n),
                     target: vec![[0; 3]; n],
                     out: vec![[0; 3]; n],

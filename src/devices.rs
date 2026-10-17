@@ -109,6 +109,8 @@ pub struct Device {
     pub seg_source: SegSource,
     pub reverse: bool,
     pub offset: u16,
+    /// Calibrated segment positions (`gowl calibrate`); replaces reverse/offset.
+    pub layout: Option<Vec<u8>>,
 }
 
 impl Device {
@@ -144,14 +146,23 @@ fn finish(ip: Ipv4Addr, mac: Option<String>, cfg: Option<&DeviceCfg>, cache: &[C
     let sku = cfg
         .and_then(|d| d.sku.clone())
         .or_else(|| cached.map(|c| c.sku.clone()).filter(|s| s != "?"));
+    let mut layout = cfg.and_then(|d| d.layout.clone());
+    let from_layout = layout.as_ref().map(|l| l.len() as u8);
     let (segments, seg_source) = match (
-        cfg.and_then(|d| d.segments),
+        cfg.and_then(|d| d.segments).or(from_layout),
         sku.as_deref().and_then(sku_segments),
     ) {
         (Some(n), _) => (n, SegSource::Config),
         (None, Some(n)) => (n, SegSource::SkuTable),
         (None, None) => (DEFAULT_SEGMENTS, SegSource::Default),
     };
+    if from_layout.is_some_and(|l| l != segments) {
+        warn!(
+            "layout has {} cells but segments = {segments}; layout ignored (re-run `gowl calibrate`)",
+            from_layout.unwrap_or(0)
+        );
+        layout = None;
+    }
     Device {
         ip,
         mac,
@@ -161,6 +172,7 @@ fn finish(ip: Ipv4Addr, mac: Option<String>, cfg: Option<&DeviceCfg>, cache: &[C
         seg_source,
         reverse: cfg.is_some_and(|d| d.reverse),
         offset: cfg.map_or(0, |d| d.offset),
+        layout,
     }
 }
 

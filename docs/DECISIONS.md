@@ -297,3 +297,28 @@ Decision / evidence:
     core, against 0.40 % for the whole process. A fixed-point port would save nothing measurable and lose
     exactness. The FFT is f32 (float is explicitly allowed there).
 Revisit-if: (a) Phase 4 integrates timers/netlink into the music loop; (b) never, unless profiles show it.
+
+## D-040 — Calibration records a position per segment (`layout`), not reverse/offset (2026-10-17, orchestrator)
+**Context.** First hardware screen test (H6609, HDMI-A-1 3440x1440): sync works but the
+picture lands in the wrong places. The three patterns are consistent with a closed loop of
+10 segments running clockwise from the left side — 2 left, 2 top, top-right corner, 2
+right, 2 bottom, bottom-left corner — while the legacy edge walk at 2.39:1 puts 4 zones on
+top, 1 left, 4 bottom, 1 right. No `reverse`/`offset` maps one onto the other (the
+per-edge counts differ), so the walk planned for Phase 4 (count + reverse) can't fix it.
+The human asked for a calibration mode rather than a hand-made fix.
+**Decision.** `gowl calibrate [DEV]` lights one segment red at a time (others dim white),
+the human types its position as a numpad cell (7 8 9 / 4 6 / 1 2 3, 5 = whole screen,
+0 = off; `n`/`p` change the count, `b` back, `q` quit). At the end the light previews the
+result in edge colors; `y` writes `segments` and `layout = …` into the device's section
+(byte-preserving; a new `[device ALIAS]` keyed by ip/mac if there is none; new file also
+gets `device =`). `color::layout_rects` turns a layout into one rect per segment: corners
+are depth-sized squares, segments sharing an edge split it evenly in the order the strip
+runs (winding from the sum of turns between consecutive cells; runs that wrap past the
+last index stay together), sides leave room for used top/bottom rows. With a layout,
+`reverse`/`offset` are ignored; a layout whose length disagrees with `segments` is
+ignored with a warning. Music mode is unaffected (renders in segment order).
+**Alternatives.** Per-segment free rectangles (too fiddly by keyboard); clock positions
+(1-12, more typing, same information for 4 edges + corners); auto-detect with the camera
+(out of scope). **Cost.** Setup-only code; the sampler hot path is unchanged (off segments
+are zero-sample zones). Binary +36,864 B (665,160 → 702,024 B, mostly the walk UI text and float layout math). Same poll loop shape as screen mode (stdin +
+timerfd keepalive + signalfd), razer OFF ×2 on every exit.

@@ -172,6 +172,155 @@ pub fn generate_screen_mapping(zone_count: usize, aspect: f64, depth: f64) -> Ve
     m.into_iter().map(normalize_rect).collect()
 }
 
+// ------------------------------------------------------------------ calibrated layout
+
+/// Highest numpad cell. A layout lists one cell per segment, as the light is seen
+/// from the front: `7 8 9` top-left/top/top-right, `4`/`6` left/right, `1 2 3`
+/// bottom-left/bottom/bottom-right, `5` whole screen, `0` off (always black).
+pub const LAYOUT_MAX_CELL: u8 = 9;
+
+/// Numpad cell → position around the screen, clockwise from top-left (0..8).
+fn octant(cell: u8) -> Option<i32> {
+    match cell {
+        7 => Some(0),
+        8 => Some(1),
+        9 => Some(2),
+        6 => Some(3),
+        3 => Some(4),
+        2 => Some(5),
+        1 => Some(6),
+        4 => Some(7),
+        _ => None,
+    }
+}
+
+/// Does the strip run clockwise (seen from the front)? Sums the turn between
+/// consecutive placed segments; ties count as clockwise.
+fn runs_clockwise(layout: &[u8]) -> bool {
+    let mut sum = 0;
+    let mut prev: Option<i32> = None;
+    for o in layout.iter().filter_map(|&c| octant(c)) {
+        if let Some(p) = prev {
+            sum += match (o - p).rem_euclid(8) {
+                d @ 1..=3 => d,
+                d @ 5..=7 => d - 8,
+                _ => 0,
+            };
+        }
+        prev = Some(o);
+    }
+    sum >= 0
+}
+
+/// Segment indices on one cell, in strip order: ascending, rotated so a run that
+/// wraps past the last segment (e.g. 9, 0) stays together.
+fn strip_order(layout: &[u8], cell: u8) -> Vec<usize> {
+    let mut v: Vec<usize> = (0..layout.len()).filter(|&i| layout[i] == cell).collect();
+    if v.len() >= 2 {
+        let wrap = layout.len() - v[v.len() - 1] + v[0];
+        let (gap, at) = v
+            .windows(2)
+            .enumerate()
+            .map(|(j, w)| (w[1] - w[0], j + 1))
+            .max_by_key(|&(g, j)| (g, std::cmp::Reverse(j)))
+            .unwrap_or((0, 0));
+        if gap > wrap {
+            v.rotate_left(at);
+        }
+    }
+    v
+}
+
+/// One rect per segment from a calibrated layout (`None` = off). Corners are
+/// `depth`-sized squares; segments sharing an edge split it evenly in the order
+/// the strip runs; side edges leave room for the top/bottom rows when those are
+/// used. `5` is the whole screen.
+pub fn layout_rects(layout: &[u8], depth: f64) -> Vec<Option<Rect>> {
+    let d = clamp_capture_depth(depth);
+    let used = |c: u8| layout.contains(&c);
+    let cw = runs_clockwise(layout);
+    let top = used(7) || used(8) || used(9);
+    let bottom = used(1) || used(2) || used(3);
+    let sq = |x: f64, y: f64| Some(Rect { x, y, w: d, h: d });
+    let mut out: Vec<Option<Rect>> = layout
+        .iter()
+        .map(|&c| match c {
+            5 => Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 1.0,
+                h: 1.0,
+            }),
+            7 => sq(0.0, 0.0),
+            9 => sq(1.0 - d, 0.0),
+            1 => sq(0.0, 1.0 - d),
+            3 => sq(1.0 - d, 1.0 - d),
+            _ => None,
+        })
+        .collect();
+    let side = (
+        if top { d } else { 0.0 },
+        if bottom { 1.0 - d } else { 1.0 },
+    );
+    // (cell, span lo..hi along the edge, clockwise runs toward hi)
+    let edges = [
+        (
+            8,
+            (
+                if used(7) { d } else { 0.0 },
+                if used(9) { 1.0 - d } else { 1.0 },
+            ),
+            true,
+        ),
+        (6, side, true),
+        (
+            2,
+            (
+                if used(1) { d } else { 0.0 },
+                if used(3) { 1.0 - d } else { 1.0 },
+            ),
+            false,
+        ),
+        (4, side, false),
+    ];
+    for (cell, (lo, hi), cw_up) in edges {
+        let segs = strip_order(layout, cell);
+        let k = segs.len();
+        let step = (hi - lo) / k.max(1) as f64;
+        for (j, &i) in segs.iter().enumerate() {
+            let p = if cw == cw_up { j } else { k - 1 - j };
+            let a = lo + p as f64 * step;
+            out[i] = Some(match cell {
+                8 => Rect {
+                    x: a,
+                    y: 0.0,
+                    w: step,
+                    h: d,
+                },
+                2 => Rect {
+                    x: a,
+                    y: 1.0 - d,
+                    w: step,
+                    h: d,
+                },
+                4 => Rect {
+                    x: 0.0,
+                    y: a,
+                    w: d,
+                    h: step,
+                },
+                _ => Rect {
+                    x: 1.0 - d,
+                    y: a,
+                    w: d,
+                    h: step,
+                },
+            });
+        }
+    }
+    out.into_iter().map(|r| r.map(normalize_rect)).collect()
+}
+
 // ------------------------------------------------------------------ zone averaging
 
 /// Legacy cap on samples per axis per zone.
@@ -546,5 +695,59 @@ mod tests {
         assert_eq!(out, [[0; 3], [2; 3], [5; 3], [7; 3]]);
         resample(&c[..2], &mut out);
         assert_eq!(out, [[0; 3], [0; 3], [1; 3], [0; 3]]);
+    }
+
+    fn centre(r: Option<Rect>) -> (f64, f64) {
+        let r = r.expect("placed");
+        (r.x + r.w / 2.0, r.y + r.h / 2.0)
+    }
+
+    #[test]
+    fn layout_loop_clockwise_from_left() {
+        // A loop starting on the left edge, running up, across the top, down the
+        // right and back along the bottom.
+        let l = [4, 4, 8, 8, 9, 6, 6, 2, 2, 1];
+        let r = layout_rects(&l, 0.28);
+        let c: Vec<(f64, f64)> = r.iter().map(|&x| centre(x)).collect();
+        assert!(
+            c[0].0 < 0.2 && c[1].0 < 0.2 && c[0].1 > c[1].1,
+            "left runs up"
+        );
+        assert!(c[2].1 < 0.2 && c[2].0 < c[3].0, "top runs right");
+        assert!(c[4].0 > 0.8 && c[4].1 < 0.2, "top-right corner");
+        assert!(c[5].0 > 0.8 && c[5].1 < c[6].1, "right runs down");
+        assert!(c[7].1 > 0.8 && c[7].0 > c[8].0, "bottom runs left");
+        assert!(c[9].0 < 0.2 && c[9].1 > 0.8, "bottom-left corner");
+        // Top edge stops at the used top-right corner; bottom starts after bottom-left.
+        let (t, b) = (r[3].unwrap(), r[8].unwrap());
+        assert!((t.x + t.w - 0.72).abs() < 1e-9 && (b.x - 0.28).abs() < 1e-9);
+    }
+
+    #[test]
+    fn layout_counter_clockwise_and_wrapping_runs() {
+        // Same loop listed the other way round.
+        let l = [1, 2, 2, 6, 6, 9, 8, 8, 4, 4];
+        let c: Vec<(f64, f64)> = layout_rects(&l, 0.28).iter().map(|&x| centre(x)).collect();
+        assert!(c[1].0 < c[2].0, "bottom runs right");
+        assert!(c[3].1 > c[4].1, "right runs up");
+        assert!(c[6].0 > c[7].0, "top runs left");
+        assert!(c[8].1 < c[9].1, "left runs down");
+        // A left run split across the end of the strip (segments 7 then 0).
+        let l = [4, 8, 8, 6, 6, 2, 2, 4];
+        let c: Vec<(f64, f64)> = layout_rects(&l, 0.28).iter().map(|&x| centre(x)).collect();
+        assert!(
+            c[7].1 > c[0].1,
+            "segment 7 below segment 0 on the left edge"
+        );
+    }
+
+    #[test]
+    fn layout_off_whole_and_bare_sides() {
+        let r = layout_rects(&[0, 5, 4, 6], 0.2);
+        assert_eq!(r[0], None);
+        assert_eq!(r[1].map(|r| (r.w, r.h)), Some((1.0, 1.0)));
+        // No top or bottom row: the sides cover the full height.
+        let l = r[2].unwrap();
+        assert!(l.y == 0.0 && (l.h - 1.0).abs() < 1e-9 && (l.w - 0.2).abs() < 1e-9);
     }
 }

@@ -50,6 +50,7 @@ build with `CARGO_PROFILE_RELEASE_DEBUG=true CARGO_PROFILE_RELEASE_STRIP=false` 
 | Date | Commit | Scenario | CPU % | Wakeups/s | RSS MB | Pkts/s | niri Δ CPU % | Notes |
 |---|---|---|---|---|---|---|---|---|
 | 2026-10-17 | merge 2+3 | screen (busy desktop, 30 fps) | 0.300 | 92.0 | 8.63 | 2.00 | 19.40 | fake=True; merged binary 665,160 B; screen mode maps only ld/libc/libgcc_s/libm (no libpulse) |
+| 2026-10-17 | calibrate (D-040) | binary size | | | | | | 702,024 B (+36,864 B: `gowl calibrate` + `layout` key); hot path unchanged |
 | 2026-10-17 | 886a006 | S1 screen (busy desktop, 30 fps, 3440x1440) | 0.267 | 92.2 | 8.63 | 2.00 | 19.43 (Δ ≈ 14 vs S0) | fake=True. Desktop never static (animated background/browser; niri full-output damage every frame) → 30 frames/s captured, edge colors barely moved so 2 pkts/s (keepalive). Wakeups 3/frame + keepalive (D-018, over the 2·fps target). RSS = 0.2 anon + 2.9 file + 5.9 shmem fault-around (CAPTURE_NIRI.md). 0 heap allocations/s after warm-up (`--features count-alloc`, live niri). Binary 607,784 B |
 | 2026-10-17 | 886a006 | S1 screen `--fps 15` | 0.100 | 47.0 | 8.55 | 2.00 | 12.80 (Δ ≈ 6.5) | fake=True, same busy desktop |
 | 2026-10-17 | 886a006 | S0 baseline | — | — | — | — | 5.65 / 6.35 | two runs, same busy desktop, nothing running |

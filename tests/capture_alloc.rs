@@ -119,6 +119,7 @@ fn capture_to_send_allocates_nothing() {
         seg_source: SegSource::Default,
         reverse: true,
         offset: 2,
+        layout: None,
     };
     let ports = Ports {
         scan: 1,

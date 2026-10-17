@@ -126,6 +126,8 @@ struct ZoneTab {
 pub struct Sampler {
     n: usize,
     depth: f64,
+    /// Calibrated layout (one cell per zone) instead of the legacy edge walk.
+    layout: Option<Vec<u8>>,
     geo: Option<Geometry>,
     offsets: Vec<u32>,
     zones: Vec<ZoneTab>,
@@ -139,6 +141,7 @@ impl Sampler {
         Sampler {
             n,
             depth: color::clamp_capture_depth(depth),
+            layout: None,
             geo: None,
             offsets: Vec::new(),
             zones: Vec::with_capacity(n),
@@ -147,8 +150,20 @@ impl Sampler {
         }
     }
 
+    /// Zones placed by a calibrated layout (`layout.len()` zones, see
+    /// `color::layout_rects`).
+    pub fn with_layout(layout: &[u8], depth: f64) -> Sampler {
+        let mut s = Sampler::new(layout.len(), depth);
+        s.layout = Some(layout[..s.n].to_vec());
+        s
+    }
+
     pub fn zone_count(&self) -> usize {
         self.n
+    }
+
+    pub fn layout(&self) -> Option<&[u8]> {
+        self.layout.as_deref()
     }
 
     /// Rebuild the tables if the geometry changed (allocates; setup only).
@@ -158,13 +173,29 @@ impl Sampler {
             return false;
         }
         let (lw, lh) = geo.logical();
-        let rects =
-            color::generate_screen_mapping(self.n, f64::from(lw) / f64::from(lh), self.depth);
+        let rects: Vec<Option<color::Rect>> = match &self.layout {
+            Some(l) => color::layout_rects(l, self.depth),
+            None => {
+                color::generate_screen_mapping(self.n, f64::from(lw) / f64::from(lh), self.depth)
+                    .into_iter()
+                    .map(Some)
+                    .collect()
+            }
+        };
         self.offsets.clear();
         self.zones.clear();
         for r in rects {
-            let z = color::Zone::new(r, lw, lh);
             let start = self.offsets.len() as u32;
+            let Some(r) = r else {
+                // Off segment: no samples (mean stays black), never damaged.
+                self.zones.push(ZoneTab {
+                    start,
+                    end: start,
+                    bbox: [0; 4],
+                });
+                continue;
+            };
+            let z = color::Zone::new(r, lw, lh);
             for y in (z.y0..z.y1).step_by(z.sy as usize) {
                 for x in (z.x0..z.x1).step_by(z.sx as usize) {
                     let (bx, by) = geo.to_buffer(x, y);
@@ -182,8 +213,13 @@ impl Sampler {
         self.geo = Some(geo);
         self.dirty = [u64::MAX; 4];
         debug!(
-            "zone tables: {} zones, {} samples, logical {lw}x{lh}, transform {}{}",
+            "zone tables: {} zones{}, {} samples, logical {lw}x{lh}, transform {}{}",
             self.n,
+            if self.layout.is_some() {
+                " (calibrated layout)"
+            } else {
+                ""
+            },
             self.offsets.len(),
             super::transform_name(geo.transform),
             if geo.y_invert { ", y-inverted" } else { "" }
@@ -415,5 +451,40 @@ mod tests {
             false,
         );
         assert_eq!(s.dirty, [u64::MAX; 4]);
+    }
+
+    #[test]
+    fn layout_zones_follow_the_calibration() {
+        // 40x20 XRGB: left half red, right half blue.
+        let (w, h) = (40u32, 20u32);
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let o = ((y * w + x) * 4) as usize;
+                data[o..o + 4].copy_from_slice(
+                    &if x < w / 2 { 0x00ff_0000u32 } else { 0xffu32 }.to_le_bytes(),
+                );
+            }
+        }
+        // left, right, off, whole screen
+        let mut s = Sampler::with_layout(&[4, 6, 0, 5], 0.2);
+        assert_eq!((s.zone_count(), s.layout()), (4, Some(&[4u8, 6, 0, 5][..])));
+        s.ensure(geo(w, h, 0, false));
+        assert!(s.sample(&data));
+        let c = s.colors();
+        assert_eq!((c[0], c[1], c[2]), ([255, 0, 0], [0, 0, 255], [0, 0, 0]));
+        assert!(c[3][0] > 150 && c[3][2] > 150 && c[3][1] == 0, "{:?}", c[3]);
+        // The off zone is never dirtied by damage.
+        s.dirty = [0; 4];
+        s.mark(
+            &[DamageRect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            }],
+            false,
+        );
+        assert_eq!(s.dirty[0] & 0b0100, 0);
     }
 }
