@@ -28,12 +28,18 @@ usage:
       reactions: flow pulse energy_fill band_split center_burst wave bass_bounce chase twinkle auto
       palettes:  rgb auto rainbow aurora sunset ocean neon jewel fire spectrum warm cool mono
   gowl calibrate [DEV]                 find where each segment sits; saves layout= to the config
-  gowl pause | resume | stop | toggle  not yet implemented
+  gowl calibrate --keepalive [DEV]     find the slowest keepalive the light tolerates; saves keepalive_ms=
+  gowl pause | resume                  pause the running sync (lights back to normal) / resume it
+  gowl stop                            stop the running sync (lights back to normal)
+  gowl toggle [screen|music] [ARGS]    running → stop it; else run that mode (default screen) with ARGS
   gowl --version | --help
 
 DEV = alias | IP | MAC | index from `gowl list`; default: $GOWL_DEVICE, config device=,
-or the only cached device. Config: $XDG_CONFIG_HOME/gowl/config. GOWL_LOG=debug for verbose.
-exit: 0 ok, 1 runtime error, 2 usage, 3 no device, 4 capture unavailable, 5 no LAN interface";
+or the only cached device; screen and music take several. One sync at a time
+($XDG_RUNTIME_DIR/gowl.pid). Config: $XDG_CONFIG_HOME/gowl/config. GOWL_LOG=debug for verbose.
+niri keybind: binds { Mod+Shift+L { spawn \"gowl\" \"toggle\"; } }
+exit: 0 ok, 1 runtime error (or nothing running), 2 usage, 3 no device, 4 capture unavailable,
+5 no LAN interface";
 
 #[cfg(feature = "count-alloc")]
 mod count_alloc {
@@ -154,8 +160,35 @@ fn run(args: &[String]) -> Result<(), Error> {
         "screen" => cmd_screen(rest),
         "music" => gowl::audio::cmd_music(rest),
         "calibrate" => gowl::calibrate::cmd_calibrate(rest),
-        "pause" | "resume" | "stop" | "toggle" => Err(usage(format!("{cmd}: not yet implemented"))),
+        "pause" | "resume" => {
+            positionals(cmd, rest, 0)?;
+            gowl::control::cmd_pause(cmd == "resume")
+        }
+        "stop" => {
+            positionals(cmd, rest, 0)?;
+            gowl::control::cmd_stop()
+        }
+        "toggle" => cmd_toggle(rest),
         other => Err(usage(format!("unknown command {other:?}"))),
+    }
+}
+
+/// `gowl toggle [screen|music] [ARGS...]`: a running sync is stopped (SIGTERM, wait
+/// ≤ 500 ms); otherwise the mode runs in the foreground, which is what niri's
+/// `spawn` keeps alive.
+fn cmd_toggle(rest: &[String]) -> Result<(), Error> {
+    let (mode, args) = match rest.first().map(String::as_str) {
+        Some(m @ ("screen" | "music")) => (m, &rest[1..]),
+        _ => ("screen", rest),
+    };
+    match gowl::control::stop_running(500)? {
+        Some(true) => Ok(()),
+        Some(false) => {
+            warn!("the running gowl got the stop signal but has not exited within 500 ms");
+            Ok(())
+        }
+        None if mode == "music" => gowl::audio::cmd_music(args),
+        None => cmd_screen(args),
     }
 }
 
@@ -214,7 +247,8 @@ fn send_one(spec: Option<&String>, msg: &[u8]) -> Result<(), Error> {
     let d = resolve(&c, spec)?;
     let lan = lan_for(&c, &d)?;
     let sock = net::bound_socket(&lan, None)?;
-    net::send_to(&sock, msg, SocketAddrV4::new(d.ip, c.ports.control)).map_err(|e| {
+    let ports = c.ports.for_ip(d.ip);
+    net::send_to(&sock, msg, SocketAddrV4::new(d.ip, ports.control)).map_err(|e| {
         if net::is_blocked(&e) {
             Error::Runtime(format!(
                 "sending to {} was refused ({e}): a VPN kill switch blocks LAN traffic; allow LAN access in the VPN (see `gowl doctor`)",
@@ -231,7 +265,8 @@ fn cmd_status(r: &[String]) -> Result<(), Error> {
     let d = resolve(&c, r.first())?;
     let lan = lan_for(&c, &d)?;
     let icmp_before = net::icmp_unreach_sent();
-    match net::status(&lan, c.ports, d.ip, c.ports.control, 1000)? {
+    let ports = c.ports.for_ip(d.ip);
+    match net::status(&lan, ports, d.ip, ports.control, 1000)? {
         Some(rep) => {
             let s = rep.status;
             let power = match s.on {
@@ -258,7 +293,7 @@ fn cmd_status(r: &[String]) -> Result<(), Error> {
         }
         None if net::rejected_since(icmp_before) > 0 => Err(Error::Runtime(format!(
             "{} likely answered, but the firewall rejected the reply (inbound UDP {} blocked) — run `gowl doctor`",
-            d.ip, c.ports.reply
+            d.ip, ports.reply
         ))),
         None => Err(Error::Runtime(format!(
             "no status reply from {} (light offline or LAN Control off) — run `gowl doctor`",
@@ -277,7 +312,10 @@ fn cmd_doctor(r: &[String]) -> Result<(), Error> {
         }
         Err(e) => return Err(e),
     };
-    doctor::run(dev.as_ref(), c.cfg.lan_if.as_deref(), c.ports)
+    let ports = dev
+        .as_ref()
+        .map_or(net::Ports::default(), |d| c.ports.for_ip(d.ip));
+    doctor::run(dev.as_ref(), c.cfg.lan_if.as_deref(), ports)
 }
 
 fn print_table(devs: &[Cached], cfg: &Config) {
@@ -471,20 +509,28 @@ fn cmd_screen(rest: &[String]) -> Result<(), Error> {
             _ => specs.push(a),
         }
     }
-    let devices = if specs.is_empty() {
-        vec![resolve(&c, None)?]
-    } else {
-        specs
-            .iter()
-            .map(|s| resolve(&c, Some(s)))
-            .collect::<Result<Vec<_>, _>>()?
-    };
+    let specs: Vec<&str> = specs.iter().map(|s| s.as_str()).collect();
+    let devices = devices::resolve_many(&specs, &c.cfg, &c.cache)?;
+    for d in &devices {
+        debug!(
+            "device {} mac {} sku {} segments {} ({:?})",
+            d.label(),
+            d.mac.as_deref().unwrap_or("?"),
+            d.sku.as_deref().unwrap_or("?"),
+            d.segments,
+            d.seg_source
+        );
+    }
+    // Signals blocked before anything streams; then claim the pidfile.
+    let mut ctl = gowl::runtime::Ctl::new()?;
+    let _pidfile = gowl::control::Pidfile::acquire()?;
     let streams = gowl::runtime::Streams::open(
         &devices,
         c.cfg.lan_if.as_deref(),
         c.ports,
         c.cfg.threshold,
         c.cfg.keepalive_ms,
+        true,
     )?;
     let mut cap = gowl::capture::open(output.as_deref())?;
     let mut pipe = gowl::runtime::Pipeline::new(streams, &c.cfg, depth, fps);
@@ -495,5 +541,5 @@ fn cmd_screen(rest: &[String]) -> Result<(), Error> {
         fps,
         gowl::runtime::DEVICE_MAX_HZ
     );
-    gowl::runtime::run_screen(cap.as_mut(), &mut pipe)
+    gowl::runtime::run_screen(cap.as_mut(), &mut pipe, &mut ctl)
 }

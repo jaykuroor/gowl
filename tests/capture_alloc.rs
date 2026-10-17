@@ -126,7 +126,7 @@ fn capture_to_send_allocates_nothing() {
         reply: 2,
         control: port,
     };
-    let streams = Streams::open(&[dev], None, ports, 3, 500).unwrap();
+    let streams = Streams::open(&[dev], None, ports, 3, 500, true).unwrap();
     let mut pipe = Pipeline::new(streams, &Config::default(), 0.28, 30);
     let g = Globals::with_conn(Conn::from_fd(client)).unwrap();
     assert_eq!(g.outputs.len(), 1);

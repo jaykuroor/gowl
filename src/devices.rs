@@ -271,6 +271,24 @@ pub fn resolve(spec: Option<&str>, cfg: &Config, cache: &[Cached]) -> Result<Dev
     )))
 }
 
+/// Several DEVs for a sync mode (SPEC.md): none → the default device; the same
+/// light named twice (by alias and IP, say) is streamed to once.
+pub fn resolve_many(specs: &[&str], cfg: &Config, cache: &[Cached]) -> Result<Vec<Device>, Error> {
+    if specs.is_empty() {
+        return Ok(vec![resolve(None, cfg, cache)?]);
+    }
+    let mut out: Vec<Device> = Vec::with_capacity(specs.len());
+    for s in specs {
+        let d = resolve(Some(s), cfg, cache)?;
+        if out.iter().any(|x| x.ip == d.ip) {
+            warn!("{s} is {} again; streaming to it once", d.ip);
+        } else {
+            out.push(d);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

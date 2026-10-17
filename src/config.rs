@@ -305,6 +305,55 @@ pub fn set_device_keys(text: &str, alias: &str, keys: &[(&str, String)]) -> Opti
     Some(lines.concat())
 }
 
+/// Set the global `key = value` in config `text`, leaving every other byte as it
+/// was: the last `key =` line before the first section is replaced in place; if
+/// there is none, the line goes after the last non-blank global line (before the
+/// first `[device …]` section, or at the end of a file without sections).
+pub fn set_global_key(text: &str, key: &str, value: &str) -> String {
+    let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
+    let end = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .unwrap_or(lines.len());
+    let new = format!("{key} = {value}\n");
+    match (0..end).rev().find(|&i| line_key(&lines[i]) == Some(key)) {
+        Some(i) => lines[i] = new,
+        None => {
+            let at = lines[..end]
+                .iter()
+                .rposition(|l| !l.trim().is_empty())
+                .map_or(0, |p| p + 1);
+            if let Some(prev) = lines.get_mut(at.wrapping_sub(1))
+                && !prev.ends_with('\n')
+            {
+                prev.push('\n');
+            }
+            lines.insert(at, new);
+        }
+    }
+    lines.concat()
+}
+
+/// The config file's text; a missing file is empty.
+pub fn read_text(path: &std::path::Path) -> Result<String, crate::Error> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(crate::Error::Io("read config", e)),
+    }
+}
+
+/// Write the config through a sibling file + rename: a crash never leaves a
+/// half-written config.
+pub fn write_atomic(path: &std::path::Path, text: &str) -> Result<(), crate::Error> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| crate::Error::Io("create config dir", e))?;
+    }
+    let tmp = path.with_extension("gowl-tmp");
+    std::fs::write(&tmp, text).map_err(|e| crate::Error::Io("write config", e))?;
+    std::fs::rename(&tmp, path).map_err(|e| crate::Error::Io("rename config", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +422,34 @@ mod tests {
             Some("[device x]\nip = 1.2.3.4\nlayout = 5\n")
         );
         assert_eq!(set_device_keys(text, "nope", &[]), None);
+    }
+
+    #[test]
+    fn set_global_key_preserves_everything_else() {
+        let k = |t: &str| set_global_key(t, "keepalive_ms", "2100");
+        // Replaced in place (the last global occurrence wins, like parse); comments,
+        // unknown keys and sections untouched; a section's own key never matched.
+        let text = "# mine\nkeepalive_ms = 500\nfps = 30\nkeepalive_ms=700 # later\nwhatever = 1\n\n[device a]\nkeepalive_ms = 9\n";
+        assert_eq!(
+            k(text),
+            "# mine\nkeepalive_ms = 500\nfps = 30\nkeepalive_ms = 2100\nwhatever = 1\n\n[device a]\nkeepalive_ms = 9\n"
+        );
+        // Missing: after the last global line, before the blank line + section.
+        assert_eq!(
+            k("fps = 30\n\n[device a]\nip = 1.2.3.4\n"),
+            "fps = 30\nkeepalive_ms = 2100\n\n[device a]\nip = 1.2.3.4\n"
+        );
+        // A commented-out key is not a key.
+        assert_eq!(
+            k("# keepalive_ms = 1\n"),
+            "# keepalive_ms = 1\nkeepalive_ms = 2100\n"
+        );
+        // File starting with a section, file without newline, empty file.
+        assert_eq!(k("[device a]\n"), "keepalive_ms = 2100\n[device a]\n");
+        assert_eq!(k("fps = 30"), "fps = 30\nkeepalive_ms = 2100\n");
+        assert_eq!(k(""), "keepalive_ms = 2100\n");
+        let c = parse(&k(text), &mut |_, _| {}); // unknown keys only warn
+        assert_eq!(c.keepalive_ms, 2100);
+        assert_eq!(c.devices.len(), 1);
     }
 }

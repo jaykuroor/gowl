@@ -6,14 +6,16 @@
 //! only on error paths) — they need a live sound server.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::net::{Ipv4Addr, UdpSocket};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use gowl::audio::fft::N;
 use gowl::audio::render::{Palette, Reaction};
-use gowl::audio::run::{Lane, Music, Settings};
+use gowl::audio::run::{Music, Settings};
 use gowl::config::Config;
-use gowl::net;
+use gowl::devices::{Device, SegSource};
+use gowl::net::Ports;
+use gowl::runtime::Streams;
 
 struct Counting;
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
@@ -58,14 +60,22 @@ fn music_hot_path_allocates_nothing() {
     // ---- setup (allocation allowed)
     let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
     rx.set_nonblocking(true).unwrap();
-    let dst = match rx.local_addr().unwrap() {
-        std::net::SocketAddr::V4(a) => SocketAddrV4::new(*a.ip(), a.port()),
-        _ => unreachable!(),
+    let ports = Ports {
+        scan: 1,
+        reply: 2,
+        control: rx.local_addr().unwrap().port(),
     };
-    let ifaces = net::interfaces().unwrap();
-    let lo = net::select_for(&ifaces, Ipv4Addr::LOCALHOST, None)
-        .unwrap()
-        .iface;
+    let dev = |segments: u8, reverse: bool, offset: u16| Device {
+        ip: Ipv4Addr::LOCALHOST,
+        mac: None,
+        sku: None,
+        alias: None,
+        segments,
+        seg_source: SegSource::Default,
+        reverse,
+        offset,
+        layout: None,
+    };
     let base = Settings::from_config(&Config::default()).unwrap();
     let mut musics: Vec<Music> = Vec::new();
     for (_, reaction) in Reaction::ALL {
@@ -75,27 +85,17 @@ fn music_hot_path_allocates_nothing() {
                 palette,
                 ..base
             };
-            let lanes = vec![
-                Lane::new(
-                    "a".into(),
-                    net::bound_socket(&lo, None).unwrap(),
-                    dst,
-                    10,
-                    false,
-                    0,
-                    &s,
-                ),
-                Lane::new(
-                    "b".into(),
-                    net::bound_socket(&lo, None).unwrap(),
-                    dst,
-                    14,
-                    true,
-                    3,
-                    &s,
-                ),
-            ];
-            musics.push(Music::new(s, lanes));
+            // Two lights, different segment counts and orientation (same receiver).
+            let streams = Streams::open(
+                &[dev(10, false, 0), dev(14, true, 3)],
+                None,
+                ports,
+                s.threshold,
+                s.keepalive_ms as u32,
+                false,
+            )
+            .unwrap();
+            musics.push(Music::new(s, streams));
         }
     }
     let mut buf = [0f32; N];

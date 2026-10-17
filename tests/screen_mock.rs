@@ -4,7 +4,8 @@
 //! razer ON first, frames while the screen changes, keepalive only while it is
 //! static, pause = razer OFF + silence, resume = razer ON, output unplugged =
 //! razer OFF (once, like pause) + silence, replugged = razer ON + frames,
-//! SIGTERM = razer OFF ×2.
+//! SIGTERM = razer OFF ×2. Runtime control through the CLI: one instance per
+//! pidfile, `gowl pause|resume|stop`, `gowl toggle` (start and stop).
 
 mod mock_wl;
 
@@ -33,7 +34,23 @@ enum Kind {
     Frame,
 }
 
+fn gowl_cmd(tmp: &std::path::Path, wl: &std::path::Path, base: u16) -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_gowl"));
+    c.env("WAYLAND_DISPLAY", wl)
+        .env("GOWL_DEVICE", "127.0.0.1")
+        .env("GOWL_PORT_BASE", base.to_string())
+        .env("XDG_CONFIG_HOME", tmp)
+        .env("XDG_STATE_HOME", tmp)
+        .env("XDG_RUNTIME_DIR", tmp)
+        .env("HOME", tmp)
+        .env_remove("GOWL_CONFIG")
+        .env_remove("GOWL_LOG")
+        .env_remove("GOWL_CAPTURE");
+    c
+}
+
 struct Harness {
+    base: u16,
     tmp: PathBuf,
     child: Child,
     rx: UdpSocket,
@@ -47,6 +64,10 @@ struct Harness {
 
 impl Harness {
     fn start(name: &str, base: u16, changing: usize) -> Harness {
+        Harness::start_with(name, base, changing, &["screen", "--fps", "30"])
+    }
+
+    fn start_with(name: &str, base: u16, changing: usize, args: &[&str]) -> Harness {
         let tmp = std::env::temp_dir().join(format!("gowl-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let sock_path = tmp.join("wayland-mock");
@@ -69,21 +90,13 @@ impl Harness {
         let rx = UdpSocket::bind(("127.0.0.1", base + 3)).unwrap();
         rx.set_read_timeout(Some(Duration::from_millis(20)))
             .unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_gowl"))
-            .args(["screen", "--fps", "30"])
-            .env("WAYLAND_DISPLAY", &sock_path)
-            .env("GOWL_DEVICE", "127.0.0.1")
-            .env("GOWL_PORT_BASE", base.to_string())
-            .env("XDG_CONFIG_HOME", &tmp)
-            .env("XDG_STATE_HOME", &tmp)
-            .env("HOME", &tmp)
-            .env_remove("GOWL_CONFIG")
-            .env_remove("GOWL_LOG")
-            .env_remove("GOWL_CAPTURE")
+        let child = gowl_cmd(&tmp, &sock_path, base)
+            .args(args)
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         Harness {
+            base,
             tmp,
             child,
             rx,
@@ -94,6 +107,41 @@ impl Harness {
             on: razer_mode_msg(true),
             off: razer_mode_msg(false),
         }
+    }
+
+    /// Run a gowl CLI command with this harness's environment (same pidfile).
+    fn cli(&self, args: &[&str]) -> (i32, String) {
+        let out = gowl_cmd(&self.tmp, &self.tmp.join("wayland-mock"), self.base)
+            .args(args)
+            .output()
+            .unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    fn now(&self) -> f64 {
+        self.t0.elapsed().as_secs_f64()
+    }
+
+    /// The child has exited (after a CLI stop/toggle): collect the tail, check exit 0.
+    fn exited(&mut self) -> String {
+        let ts = Instant::now();
+        let status = loop {
+            if let Some(s) = self.child.try_wait().unwrap() {
+                break s;
+            }
+            assert!(ts.elapsed() < Duration::from_secs(2), "gowl still running");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        self.collect(self.now() + 0.2);
+        let mut err = String::new();
+        std::io::Read::read_to_string(self.child.stderr.as_mut().unwrap(), &mut err).unwrap();
+        assert!(status.success(), "exit {status:?}: {err}");
+        assert!(!self.tmp.join("gowl.pid").exists(), "pidfile left behind");
+        let _ = std::fs::remove_dir_all(&self.tmp);
+        err
     }
 
     /// Record datagrams until `until` seconds after start.
@@ -214,5 +262,56 @@ fn output_unplug_and_replug() {
     assert_eq!(back.first(), Some(&&Kind::On), "{:?}", h.log);
     assert!(h.frames(3.0, 4.0) >= 5, "{:?}", h.log);
     assert_eq!(h.served.load(Ordering::SeqCst), 20, "mock served frames");
+    h.tail_is_double_off();
+}
+
+#[test]
+fn cli_pause_resume_stop_and_one_instance() {
+    let mut h = Harness::start("screen-ctl", 16200, 20);
+    h.collect(1.2);
+    assert!(h.tmp.join("gowl.pid").exists(), "pidfile");
+    // A second sync refuses to start (and sends nothing).
+    let (code, err) = h.cli(&["screen"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("already running"), "{err}");
+    let (code, err) = h.cli(&["pause"]);
+    assert_eq!(code, 0, "{err}");
+    h.collect(1.8);
+    let (code, _) = h.cli(&["pause"]); // idempotent: no second OFF
+    assert_eq!(code, 0);
+    h.collect(2.4);
+    assert_eq!(h.kinds(1.2, 2.4), [&Kind::Off], "{:?}", h.log);
+    let (code, err) = h.cli(&["resume"]);
+    assert_eq!(code, 0, "{err}");
+    h.collect(2.8);
+    let resumed = h.kinds(2.4, 2.8);
+    assert_eq!(resumed.first(), Some(&&Kind::On), "{:?}", h.log);
+    assert!(resumed.contains(&&Kind::Frame), "{:?}", h.log);
+    let t = Instant::now();
+    let (code, err) = h.cli(&["stop"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(t.elapsed() < Duration::from_millis(1000));
+    let rx = h.cli(&["pause"]);
+    h.exited();
+    h.tail_is_double_off();
+    assert_eq!(rx.0, 1, "pause with nothing running: {}", rx.1);
+    assert!(rx.1.contains("no gowl sync is running"), "{}", rx.1);
+}
+
+#[test]
+fn toggle_starts_then_stops() {
+    let mut h = Harness::start_with("screen-toggle", 16300, 10, &["toggle", "--fps", "30"]);
+    h.collect(1.0);
+    assert_eq!(h.log.first().map(|e| &e.1), Some(&Kind::On), "{:?}", h.log);
+    assert!(h.frames(0.0, 1.0) >= 5, "{:?}", h.log);
+    let t = Instant::now();
+    let (code, err) = h.cli(&["toggle"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        t.elapsed() < Duration::from_millis(700),
+        "toggle waited {:?}",
+        t.elapsed()
+    );
+    h.exited();
     h.tail_is_double_off();
 }

@@ -83,8 +83,10 @@ pub fn run(dev: Option<&Device>, lan_if: Option<&str>, ports: Ports) -> Result<(
     }
 
     // Route hijack check: where would an unbound socket go?
+    // Any address of the LAN interface counts (secondary/labelled addresses too).
+    let on_lan = |a: Ipv4Addr| ifaces.iter().any(|i| i.name == lan.name && i.addr == a);
     match net::route_source(dev.ip, ports.control) {
-        Ok(src) if src == lan.addr => println!(
+        Ok(src) if on_lan(src) => println!(
             "route:     kernel routes {} via {} (no VPN hijack)",
             dev.ip, lan.name
         ),

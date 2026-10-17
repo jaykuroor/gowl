@@ -1,30 +1,29 @@
 //! `gowl music`: blocking read of 1024 samples from the default sink's monitor →
 //! FFT → bands → AutoGain → render → EMA → brightness → reverse/offset → delta
 //! check → send (AUDIO.md, ARCHITECTURE.md "Music mode"). The blocking read is the
-//! pacing: no timers, no sleeps (except a 1 s back-off while the sound server is
-//! unreachable). Renders are capped at min(music_fps, 40 Hz device cap) with a
-//! deadline accumulator; windows in between are read and dropped.
+//! pacing: no periodic timers, no sleeps. Renders are capped at min(music_fps, 40 Hz
+//! device cap) with a deadline accumulator; windows in between are read and dropped.
 //!
-//! Signals: SIGINT/SIGTERM/SIGHUP set an `AtomicBool` (sigaction without
-//! SA_RESTART), so the mainloop's `poll()` returns EINTR and the loop sees the flag.
-//! For the tiny race where a signal lands just before `poll()` while no audio
-//! flows, a 1 s `alarm` watchdog sends razer OFF from the handler and exits.
+//! One `poll()`: libpulse's mainloop polls its own fds plus ours (signalfd, timerfd,
+//! rtnetlink, verify socket) through `pulse::Hook` (D-042). SIGUSR1/SIGUSR2 pause and
+//! resume (stream closed, razer OFF, zero wakeups while paused), SIGINT/SIGTERM/SIGHUP
+//! stop (razer OFF ×2). While the sound server is unreachable the stream is retried
+//! every second on the timerfd and the last frame is kept alive.
 
-use std::ffi::c_int;
-use std::net::{SocketAddrV4, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU32, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::bands::{Analyzer, AutoGain, SAMPLE_RATE};
 use super::fft::N;
-use super::pulse::{Capture, Pulse, ReadError};
+use super::pulse::{Capture, Hook, Pulse, ReadError};
 use super::render::{Palette, Reaction, Renderer};
 use crate::Error;
-use crate::color::{self, Rgb, SendGate, Smoother};
+use crate::color::{self, Rgb, Smoother};
 use crate::config::{self, Config};
-use crate::devices::{self, Device};
-use crate::net::{self, Ports, Sender};
+use crate::control::Pidfile;
+use crate::devices;
+use crate::net::Ports;
 use crate::proto::MAX_SEGMENTS;
+use crate::runtime::{Ctl, Sig, Streams, min_opt, now_ns};
 
 /// Legacy `max_update_hz` for Govee LAN devices.
 pub const DEVICE_CAP_HZ: u32 = 40;
@@ -93,80 +92,45 @@ fn parse_palette(s: &str) -> Result<Palette, Error> {
     })
 }
 
-/// One streaming device: its renderer (segment count), smoother, send gate, socket.
-pub struct Lane {
-    pub label: String,
-    sock: UdpSocket,
-    sender: Sender,
+/// Per-device render state: renderer (segment count) and smoother.
+struct Voice {
     renderer: Renderer,
     smoother: Smoother,
-    gate: SendGate,
-    reverse: bool,
-    offset: usize,
     smooth: [Rgb; MAX_SEGMENTS],
-    out: [Rgb; MAX_SEGMENTS],
-    pub sent: u64,
-    last_err_ms: Option<u64>,
-}
-
-impl Lane {
-    /// `sock` must already be bound to the LAN interface (net::bound_socket).
-    pub fn new(
-        label: String,
-        sock: UdpSocket,
-        dst: SocketAddrV4,
-        segments: usize,
-        reverse: bool,
-        offset: usize,
-        s: &Settings,
-    ) -> Lane {
-        let sender = Sender::new(dst, segments);
-        let n = sender.segments();
-        Lane {
-            label,
-            sock,
-            sender,
-            renderer: Renderer::new(n, s.fps),
-            smoother: Smoother::new(s.smoothing, n),
-            gate: SendGate::new(s.threshold, s.keepalive_ms),
-            reverse,
-            offset: offset % n,
-            smooth: [[0; 3]; MAX_SEGMENTS],
-            out: [[0; 3]; MAX_SEGMENTS],
-            sent: 0,
-            last_err_ms: None,
-        }
-    }
-
-    pub fn razer(&self, on: bool) -> std::io::Result<()> {
-        self.sender.razer_mode(&self.sock, on)
-    }
-
-    fn fd(&self) -> c_int {
-        use std::os::fd::AsRawFd;
-        self.sock.as_raw_fd()
-    }
 }
 
 /// Everything between "1024 samples" and "datagram sent". No allocation per tick.
+/// Sending (reorder, gate, socket, rebind) is the shared `runtime::Streams`.
 pub struct Music {
     analyzer: Analyzer,
     autogain: AutoGain,
     settings: Settings,
     bri_q16: u32,
-    pub lanes: Vec<Lane>,
+    pub streams: Streams,
+    voices: Vec<Voice>,
     /// Last bands after AutoGain (debug output).
     pub last_bands: [f64; 3],
 }
 
 impl Music {
-    pub fn new(settings: Settings, lanes: Vec<Lane>) -> Music {
+    pub fn new(settings: Settings, streams: Streams) -> Music {
+        let voices = (0..streams.devs.len())
+            .map(|i| {
+                let n = streams.segments(i);
+                Voice {
+                    renderer: Renderer::new(n, settings.fps),
+                    smoother: Smoother::new(settings.smoothing, n),
+                    smooth: [[0; 3]; MAX_SEGMENTS],
+                }
+            })
+            .collect();
         Music {
             analyzer: Analyzer::new(SAMPLE_RATE),
             autogain: AutoGain::new(settings.fps),
             settings,
             bri_q16: color::q16(settings.brightness.clamp(0.0, 1.0)),
-            lanes,
+            streams,
+            voices,
             last_bands: [0.0; 3],
         }
     }
@@ -178,136 +142,15 @@ impl Music {
         let bands = self.autogain.process(self.analyzer.bands(samples));
         self.last_bands = bands;
         let mut sent = 0;
-        for l in &mut self.lanes {
-            let n = l.sender.segments();
-            let frame = l.renderer.render(bands, s.reaction, s.gain, s.palette);
-            l.smoother.update(frame, &mut l.smooth[..n]);
-            color::scale(&mut l.smooth[..n], self.bri_q16);
-            color::reorder(&l.smooth[..n], l.reverse, l.offset, &mut l.out[..n]);
-            if !l.gate.needs_send(&l.out[..n], now_ms) {
-                continue;
-            }
-            match l.sender.send_colors(&l.sock, &l.out[..n]) {
-                Ok(()) => {
-                    l.gate.mark_sent(&l.out[..n], now_ms);
-                    l.sent += 1;
-                    sent += 1;
-                }
-                Err(e) => {
-                    if l.last_err_ms
-                        .is_none_or(|t| now_ms.saturating_sub(t) >= 5000)
-                    {
-                        warn!(
-                            "send to {} failed: {e} (retrying; see `gowl doctor`)",
-                            l.label
-                        );
-                        l.last_err_ms = Some(now_ms);
-                    }
-                }
-            }
+        for (i, v) in self.voices.iter_mut().enumerate() {
+            let n = self.streams.segments(i);
+            let frame = v.renderer.render(bands, s.reaction, s.gain, s.palette);
+            v.smoother.update(frame, &mut v.smooth[..n]);
+            color::scale(&mut v.smooth[..n], self.bri_q16);
+            sent += usize::from(self.streams.push(i, &v.smooth[..n], now_ms));
         }
         sent
     }
-
-    /// Razer ON again after an outage, and force the next frame out.
-    fn restart_stream(&mut self) {
-        for l in &mut self.lanes {
-            let _ = l.razer(true);
-            l.gate.reset();
-        }
-    }
-}
-
-// ------------------------------------------------------------------ signals
-
-static STOP: AtomicBool = AtomicBool::new(false);
-
-const MAX_EMERG: usize = 8;
-static EMERG_N: AtomicUsize = AtomicUsize::new(0);
-static EMERG_FD: [AtomicI32; MAX_EMERG] = [const { AtomicI32::new(-1) }; MAX_EMERG];
-static EMERG_IP: [AtomicU32; MAX_EMERG] = [const { AtomicU32::new(0) }; MAX_EMERG];
-static EMERG_PORT: [AtomicU16; MAX_EMERG] = [const { AtomicU16::new(0) }; MAX_EMERG];
-
-/// `razer` OFF datagram (constant; checked against proto in a test).
-pub const RAZER_OFF_MSG: &[u8] = br#"{"msg":{"cmd":"razer","data":{"pt":"uwABsQAL"}}}"#;
-
-extern "C" fn on_stop(_: c_int) {
-    STOP.store(true, Ordering::SeqCst);
-    // SAFETY: alarm is async-signal-safe.
-    unsafe { libc::alarm(1) };
-}
-
-/// Watchdog: the read did not return within 1 s of a stop signal. Only
-/// async-signal-safe calls: sendto + _exit.
-extern "C" fn on_alarm(_: c_int) {
-    let n = EMERG_N.load(Ordering::SeqCst).min(MAX_EMERG);
-    for i in 0..n {
-        let fd = EMERG_FD[i].load(Ordering::SeqCst);
-        let addr = libc::sockaddr_in {
-            sin_family: libc::AF_INET as libc::sa_family_t,
-            sin_port: EMERG_PORT[i].load(Ordering::SeqCst).to_be(),
-            sin_addr: libc::in_addr {
-                s_addr: EMERG_IP[i].load(Ordering::SeqCst).to_be(),
-            },
-            sin_zero: [0; 8],
-        };
-        // SAFETY: fd is a live UDP socket (or -1 → EBADF); buffer and address are valid.
-        unsafe {
-            libc::sendto(
-                fd,
-                RAZER_OFF_MSG.as_ptr().cast(),
-                RAZER_OFF_MSG.len(),
-                0,
-                (&raw const addr).cast(),
-                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-            );
-        }
-    }
-    // SAFETY: _exit is async-signal-safe.
-    unsafe { libc::_exit(0) };
-}
-
-fn install(sig: c_int, handler: extern "C" fn(c_int)) -> Result<(), Error> {
-    // SAFETY: zeroed sigaction is valid; the handler only touches atomics and
-    // async-signal-safe functions. No SA_RESTART, so blocking syscalls return EINTR.
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = handler as usize;
-        sa.sa_flags = 0;
-        libc::sigemptyset(&mut sa.sa_mask);
-        if libc::sigaction(sig, &sa, std::ptr::null_mut()) != 0 {
-            return Err(Error::Io("sigaction", std::io::Error::last_os_error()));
-        }
-    }
-    Ok(())
-}
-
-fn install_signals(lanes: &[Lane]) -> Result<(), Error> {
-    for (i, l) in lanes.iter().take(MAX_EMERG).enumerate() {
-        EMERG_FD[i].store(l.fd(), Ordering::SeqCst);
-        EMERG_IP[i].store(u32::from(*l.sender.dst.ip()), Ordering::SeqCst);
-        EMERG_PORT[i].store(l.sender.dst.port(), Ordering::SeqCst);
-    }
-    EMERG_N.store(lanes.len().min(MAX_EMERG), Ordering::SeqCst);
-    install(libc::SIGALRM, on_alarm)?;
-    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-        install(sig, on_stop)?;
-    }
-    Ok(())
-}
-
-fn stopping() -> bool {
-    STOP.load(Ordering::SeqCst)
-}
-
-/// Sleep up to `d`; returns early on a signal (nanosleep → EINTR).
-fn backoff(d: Duration) {
-    let ts = libc::timespec {
-        tv_sec: d.as_secs() as libc::time_t,
-        tv_nsec: d.subsec_nanos() as libc::c_long,
-    };
-    // SAFETY: valid timespec; remaining time not needed.
-    unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
 }
 
 // ------------------------------------------------------------------ command
@@ -343,38 +186,25 @@ pub fn cmd_music(args: &[String]) -> Result<(), Error> {
 
     let cache = devices::load_cache();
     let ports = Ports::from_env();
-    let mut devs: Vec<Device> = Vec::new();
-    if specs.is_empty() {
-        devs.push(devices::resolve(None, &cfg, &cache)?);
-    }
-    for sp in specs {
-        let d = devices::resolve(Some(sp), &cfg, &cache)?;
-        if !devs.iter().any(|x| x.ip == d.ip) {
-            devs.push(d);
-        }
-    }
-    let ifaces = net::interfaces().map_err(|e| Error::Io("getifaddrs", e))?;
-    let mut lanes = Vec::with_capacity(devs.len());
+    let devs = devices::resolve_many(&specs, &cfg, &cache)?;
+    // Signals blocked before anything streams; then claim the pidfile.
+    let mut ctl = Ctl::new()?;
+    let _pidfile = Pidfile::acquire()?;
+    let streams = Streams::open(
+        &devs,
+        cfg.lan_if.as_deref(),
+        ports,
+        s.threshold,
+        u32::try_from(s.keepalive_ms).unwrap_or(u32::MAX),
+        false,
+    )?;
     for d in &devs {
-        let sel = net::select_for(&ifaces, d.ip, cfg.lan_if.as_deref())?;
         debug!(
-            "music → {} ({} segments, {:?}) via {} — {}",
+            "music → {} ({} segments, {:?})",
             d.label(),
             d.segments,
-            d.seg_source,
-            sel.iface,
-            sel.why
+            d.seg_source
         );
-        let sock = net::bound_socket(&sel.iface, None)?;
-        lanes.push(Lane::new(
-            d.label(),
-            sock,
-            SocketAddrV4::new(d.ip, ports.control),
-            usize::from(d.segments),
-            d.reverse,
-            usize::from(d.offset),
-            &s,
-        ));
     }
     debug!(
         "music: reaction {} palette {} fps {} (renders ≤ {} Hz) gain {} brightness {} smoothing {}",
@@ -388,94 +218,34 @@ pub fn cmd_music(args: &[String]) -> Result<(), Error> {
     );
 
     let pulse = Pulse::load()?;
-    install_signals(&lanes)?;
-    let mut music = Music::new(s, lanes);
+    let mut music = Music::new(s, streams);
     // From the first razer ON on, every exit path below runs the OFF rounds.
-    let r = razer_on_all(&music).and_then(|()| stream_loop(&pulse, &mut music));
-    razer_off_all(&music);
-    disarm_watchdog();
-    drop(music);
+    music.streams.razer(true);
+    let r = run_loop(&pulse, &mut music, &mut ctl);
+    music.streams.shutdown();
     r
 }
 
-/// Razer ON to every lane; the first failure is returned (the caller still sends
-/// OFF to all lanes, so lanes that did switch on are switched off again).
-fn razer_on_all(music: &Music) -> Result<(), Error> {
-    for l in &music.lanes {
-        l.razer(true).map_err(|e| {
-            if net::is_blocked(&e) {
-                Error::Runtime(format!(
-                    "sending to {} was refused ({e}): a VPN kill switch blocks LAN traffic; allow LAN access in the VPN (see `gowl doctor`)",
-                    l.label
-                ))
-            } else {
-                Error::Io("razer on", e)
-            }
-        })?;
-    }
-    Ok(())
-}
+const MS: u64 = 1_000_000;
+// Hook slots.
+const H_SIG: usize = 0;
+const H_TIMER: usize = 1;
+const H_NET: usize = 2;
+const H_VERIFY: usize = 3;
 
-/// Shutdown contract: razer OFF to every lane, twice, 10 ms apart.
-fn razer_off_all(music: &Music) {
-    for round in 0..2 {
-        if round == 1 {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        for l in &music.lanes {
-            if let Err(e) = l.razer(false) {
-                debug!("razer off to {}: {e}", l.label);
-            }
-        }
-    }
-}
-
-/// Cancel a pending watchdog and forget the lane sockets before they are closed,
-/// so the SIGALRM handler can never write to a recycled fd.
-fn disarm_watchdog() {
-    // SAFETY: alarm(0) only cancels a pending SIGALRM.
-    unsafe { libc::alarm(0) };
-    EMERG_N.store(0, Ordering::SeqCst);
-    for fd in &EMERG_FD {
-        fd.store(-1, Ordering::SeqCst);
-    }
-}
-
-fn open_stream(pulse: &Pulse) -> Option<Capture<'_>> {
-    let mut warned = false;
-    while !stopping() {
-        match pulse.open(SOURCE, SAMPLE_RATE, (N * 4) as u32, &stopping) {
-            Ok(st) => {
-                if warned {
-                    warn!("audio capture is back");
-                }
-                return Some(st);
-            }
-            Err(_) if stopping() => break,
-            Err(e) => {
-                if !warned {
-                    warn!(
-                        "cannot open {}: {e}; retrying every second",
-                        SOURCE.to_string_lossy()
-                    );
-                    warned = true;
-                }
-                backoff(Duration::from_secs(1));
-            }
-        }
-    }
-    None
-}
-
-fn stream_loop(pulse: &Pulse, music: &mut Music) -> Result<(), Error> {
-    let Some(mut stream) = open_stream(pulse) else {
-        return Ok(());
-    };
-    debug!(
-        "capturing {} (float32 mono {} Hz)",
-        SOURCE.to_string_lossy(),
-        SAMPLE_RATE
-    );
+/// The music loop. States: streaming (blocked in the mainloop's poll, which also
+/// watches our fds), stream down (retry every second, keepalive the last frame) and
+/// paused (stream closed, razer OFF, timer disarmed: zero wakeups).
+fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error> {
+    let hook = Hook::default();
+    hook.set_fd(H_SIG, ctl.sig.fd());
+    hook.set_fd(H_TIMER, ctl.timer.fd());
+    hook.set_fd(H_NET, ctl.net_fd());
+    let mut stream: Option<Capture<'_>> = None;
+    let mut paused = false;
+    let mut retry_at: Option<u64> = Some(0);
+    let mut warned = false; // "cannot open" logged, waiting for it to come back
+    let mut failed = false; // the stream broke: razer ON again when it's back
     let mut samples = [0f32; N];
     let interval = music.settings.interval_us();
     let start = Instant::now();
@@ -484,81 +254,159 @@ fn stream_loop(pulse: &Pulse, music: &mut Music) -> Result<(), Error> {
     let verbose = crate::log::enabled(crate::log::DEBUG);
     let (mut windows, mut renders, mut sends, mut stat_at) = (0u32, 0u32, 0u32, 0u64);
 
-    while !stopping() {
-        if let Err(e) = stream.read(&mut samples, &stopping) {
-            let ReadError::Failed(e) = e else { break };
-            if stopping() {
-                break;
-            }
-            warn!("audio read failed: {e}; reopening");
-            drop(stream);
-            match open_stream(pulse) {
-                Some(st) => stream = st,
-                None => break,
-            }
-            music.restart_stream();
-            silent = 0;
-            continue;
+    loop {
+        hook.set_fd(H_VERIFY, music.streams.verify_fd());
+        // The timer carries network work always; while the stream is down (not
+        // paused) also the reopen retry and the keepalive of the last frame.
+        let mut dl = ctl.net_deadline(&music.streams);
+        if stream.is_none() && !paused {
+            dl = min_opt(dl, retry_at);
+            dl = min_opt(dl, music.streams.keepalive_due_ms().map(|t| t * MS));
         }
-        if stopping() {
-            break;
-        }
-        windows += 1;
-        if samples.iter().all(|&v| v == 0.0) {
-            silent += 1;
-            if silent >= SILENCE_REOPEN_WINDOWS {
-                debug!(
-                    "30 s of silence: reopening the monitor stream (default sink may have changed)"
-                );
-                drop(stream);
-                match open_stream(pulse) {
-                    Some(st) => stream = st,
-                    None => break,
+        ctl.timer.arm(dl)?;
+
+        if stream.is_none() && !paused && retry_at.is_some_and(|t| t <= now_ns()) {
+            retry_at = None;
+            match pulse.open(SOURCE, SAMPLE_RATE, (N * 4) as u32, &hook) {
+                Ok(st) => {
+                    if warned {
+                        warn!("audio capture is back");
+                        warned = false;
+                    }
+                    if failed {
+                        // The light may have left stream mode during the outage.
+                        music.streams.razer(true);
+                        failed = false;
+                    }
+                    debug!(
+                        "capturing {} (float32 mono {} Hz)",
+                        SOURCE.to_string_lossy(),
+                        SAMPLE_RATE
+                    );
+                    stream = Some(st);
+                    silent = 0;
+                    continue;
                 }
-                silent = 0;
+                Err(ReadError::Interrupted) => retry_at = Some(now_ns()),
+                Err(ReadError::Failed(e)) => {
+                    if !warned {
+                        warn!(
+                            "cannot open {}: {e}; retrying every second",
+                            SOURCE.to_string_lossy()
+                        );
+                        warned = true;
+                    }
+                    failed = true;
+                    retry_at = Some(now_ns() + 1000 * MS);
+                    continue;
+                }
             }
-        } else {
-            silent = 0;
         }
 
-        let now_us = start.elapsed().as_micros() as u64;
-        if now_us < next_us {
-            continue;
+        if let Some(st) = stream.as_mut() {
+            match st.read(&mut samples) {
+                Ok(()) => {}
+                Err(ReadError::Interrupted) => {}
+                Err(ReadError::Failed(e)) => {
+                    warn!("audio read failed: {e}; reopening");
+                    stream = None;
+                    failed = true;
+                    retry_at = Some(now_ns());
+                    continue;
+                }
+            }
+            if !hook.fired() {
+                // A full window.
+                windows += 1;
+                if samples.iter().all(|&v| v == 0.0) {
+                    silent += 1;
+                    if silent >= SILENCE_REOPEN_WINDOWS {
+                        debug!(
+                            "30 s of silence: reopening the monitor stream (default sink may have changed)"
+                        );
+                        stream = None;
+                        retry_at = Some(now_ns());
+                        continue;
+                    }
+                } else {
+                    silent = 0;
+                }
+                let now_us = start.elapsed().as_micros() as u64;
+                if now_us < next_us {
+                    continue;
+                }
+                // Deadline accumulator: average rate = 1/interval, no burst after a stall.
+                next_us = if now_us - next_us >= interval {
+                    now_us + interval
+                } else {
+                    next_us + interval
+                };
+                renders += 1;
+                sends += music.tick(&samples, now_us / 1000) as u32;
+                if verbose && now_us / 1000 >= stat_at + 1000 {
+                    let b = music.last_bands;
+                    debug!(
+                        "music: {} wakeups, {windows} windows, {renders} renders, {sends} datagrams in the last second; bands {:.3} {:.3} {:.3}",
+                        st.take_iterations(),
+                        b[0],
+                        b[1],
+                        b[2]
+                    );
+                    (windows, renders, sends, stat_at) = (0, 0, 0, now_us / 1000);
+                }
+                continue;
+            }
+        } else if !hook.fired() {
+            hook.wait(-1).map_err(|e| Error::Io("poll", e))?;
         }
-        // Deadline accumulator: average rate = 1/interval, no burst after a stall.
-        next_us = if now_us - next_us >= interval {
-            now_us + interval
-        } else {
-            next_us + interval
-        };
-        renders += 1;
-        sends += music.tick(&samples, now_us / 1000) as u32;
 
-        if verbose && now_us / 1000 >= stat_at + 1000 {
-            let b = music.last_bands;
-            debug!(
-                "music: {} wakeups, {windows} windows, {renders} renders, {sends} datagrams in the last second; bands {:.3} {:.3} {:.3}",
-                stream.take_iterations(),
-                b[0],
-                b[1],
-                b[2]
-            );
-            (windows, renders, sends, stat_at) = (0, 0, 0, now_us / 1000);
+        // One of our fds is ready.
+        let now = now_ns();
+        let ev = hook.take();
+        if ev[H_SIG] != 0 {
+            while let Some(sig) = ctl.sig.read() {
+                match sig {
+                    Sig::Stop => {
+                        debug!("stop signal: razer off, exit");
+                        return Ok(());
+                    }
+                    Sig::Pause if !paused => {
+                        debug!("paused: stream closed, razer off");
+                        paused = true;
+                        stream = None;
+                        music.streams.razer(false);
+                    }
+                    Sig::Resume if paused => {
+                        debug!("resumed");
+                        paused = false;
+                        music.streams.razer(true);
+                        retry_at = Some(now);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if ev[H_NET] != 0 {
+            ctl.on_netlink(now);
+        }
+        if ev[H_VERIFY] != 0 {
+            // A moved device got razer ON; the next render sends to it.
+            music.streams.on_verify_readable();
+        }
+        if ev[H_TIMER] != 0 {
+            ctl.timer.drain();
+            // Rebound devices got razer ON (gate reset): the next render sends.
+            ctl.service_net(&mut music.streams, now);
+            if stream.is_none() && !paused {
+                music.streams.keepalive(now / MS);
+            }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn razer_off_constant_matches_proto() {
-        let mut m = [0u8; 64];
-        let n = crate::proto::razer_msg(&crate::proto::razer_mode_frame(false), &mut m);
-        assert_eq!(&m[..n], RAZER_OFF_MSG);
-    }
 
     #[test]
     fn interval_caps_at_device_rate() {

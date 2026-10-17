@@ -20,6 +20,8 @@ use crate::proto::{self, MAX_FRAME, MSG_MAX};
 
 /// Destination/listen ports. `GOWL_PORT_BASE=N` shifts them to N+1/N+2/N+3 — a test
 /// hook matching `tools/fake_govee.py --port-base N`; real devices use 4001-4003.
+/// The hook only applies to loopback targets ([`Ports::for_ip`], [`Ports::for_iface`]),
+/// so a stray environment variable can never send real LAN traffic to odd ports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ports {
     pub scan: u16,
@@ -49,6 +51,24 @@ impl Ports {
                 control: b + 3,
             },
             _ => Ports::default(),
+        }
+    }
+
+    /// These ports if `ip` is loopback (the fake device), else the real ones.
+    pub fn for_ip(self, ip: Ipv4Addr) -> Ports {
+        if ip.is_loopback() {
+            self
+        } else {
+            Ports::default()
+        }
+    }
+
+    /// These ports on the loopback interface, else the real ones.
+    pub fn for_iface(self, iface: &Iface) -> Ports {
+        if iface.is_loopback() || iface.addr.is_loopback() {
+            self
+        } else {
+            Ports::default()
         }
     }
 }
@@ -146,7 +166,9 @@ pub fn interfaces() -> io::Result<Vec<Iface>> {
         }
         // SAFETY: ifa_name is a NUL-terminated string owned by the list.
         let cname = unsafe { CStr::from_ptr(ifa.ifa_name) };
-        let name = cname.to_string_lossy().into_owned();
+        // A labelled secondary address ("enp5s0:1") belongs to device "enp5s0";
+        // SO_BINDTODEVICE and if_nametoindex need the device name.
+        let name = base_name(&cname.to_string_lossy()).to_string();
         // SAFETY: ifa_addr is non-null and points at a sockaddr of `sa_family`.
         let family = i32::from(unsafe { (*ifa.ifa_addr).sa_family });
         if family == libc::AF_INET {
@@ -159,8 +181,9 @@ pub fn interfaces() -> io::Result<Vec<Iface>> {
                 let m = unsafe { &*(ifa.ifa_netmask as *const libc::sockaddr_in) };
                 u32::from_be(m.sin_addr.s_addr).count_ones() as u8
             };
-            // SAFETY: cname is a valid C string.
-            let index = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+            let index = std::ffi::CString::new(name.as_str())
+                // SAFETY: a valid NUL-terminated C string.
+                .map_or(0, |c| unsafe { libc::if_nametoindex(c.as_ptr()) });
             out.push(Iface {
                 name,
                 index,
@@ -181,6 +204,11 @@ pub fn interfaces() -> io::Result<Vec<Iface>> {
         i.hw_type = hw.iter().find(|(n, _)| *n == i.name).map(|&(_, t)| t);
     }
     Ok(out)
+}
+
+/// The device name of an interface label: `enp5s0:1` → `enp5s0`.
+pub fn base_name(label: &str) -> &str {
+    label.split(':').next().unwrap_or(label)
 }
 
 /// The chosen interface plus a one-line reason (for `doctor` and debug logs).
@@ -440,6 +468,19 @@ pub fn is_blocked(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES))
 }
 
+/// True for send errors that mean "this interface/address is gone or down": the
+/// cue to re-select the LAN interface (NETWORK.md "React to network changes").
+pub fn is_net_down(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENETUNREACH)
+            | Some(libc::ENODEV)
+            | Some(libc::EADDRNOTAVAIL)
+            | Some(libc::ENETDOWN)
+            | Some(libc::EHOSTUNREACH)
+    )
+}
+
 /// Send one datagram; logs at debug level.
 pub fn send_to(sock: &UdpSocket, msg: &[u8], dst: SocketAddrV4) -> io::Result<()> {
     let r = sock.send_to(msg, dst).map(|_| ());
@@ -505,17 +546,19 @@ pub struct Found {
 
 /// Discovery per PROTOCOL.md: bind the reply port on each interface, probe, collect
 /// replies until `timeout_ms` after the last probe, dedupe by device id.
-/// `sweep` also unicasts to every host of each discovery interface's /24 on the scan
-/// and control ports, paced at one datagram per millisecond.
+/// `sweep` also unicasts to every host of each discovery interface's subnet (at most
+/// its own /24) on the scan and control ports, paced at one datagram per millisecond
+/// whether or not replies arrive in between.
 pub fn scan(
     targets: &[ScanTarget],
     ports: Ports,
     timeout_ms: u64,
     sweep: bool,
 ) -> Result<Vec<Found>, Error> {
+    let tports: Vec<Ports> = targets.iter().map(|t| ports.for_iface(&t.iface)).collect();
     let mut socks = Vec::with_capacity(targets.len());
-    for t in targets {
-        let s = bound_socket(&t.iface, Some(ports.reply))?;
+    for (t, p) in targets.iter().zip(&tports) {
+        let s = bound_socket(&t.iface, Some(p.reply))?;
         s.set_nonblocking(true)
             .map_err(|e| Error::Io("set_nonblocking", e))?;
         socks.push(s);
@@ -527,42 +570,37 @@ pub fn scan(
         Err(e) if is_blocked(&e) => blocked = true,
         Err(_) => {}
     };
-    for (t, s) in targets.iter().zip(&socks) {
+    for ((t, s), p) in targets.iter().zip(&socks).zip(&tports) {
         if t.discover {
             fire(
                 s,
-                SocketAddrV4::new(Ipv4Addr::from(proto::MULTICAST), ports.scan),
+                SocketAddrV4::new(Ipv4Addr::from(proto::MULTICAST), p.scan),
             );
-            fire(s, SocketAddrV4::new(Ipv4Addr::BROADCAST, ports.scan));
+            fire(s, SocketAddrV4::new(Ipv4Addr::BROADCAST, p.scan));
             if t.iface.prefix <= 30 {
-                fire(s, SocketAddrV4::new(t.iface.broadcast(), ports.scan));
+                fire(s, SocketAddrV4::new(t.iface.broadcast(), p.scan));
             }
         }
         for &ip in &t.unicast {
-            fire(s, SocketAddrV4::new(ip, ports.scan));
+            fire(s, SocketAddrV4::new(ip, p.scan));
         }
     }
 
-    // Sweep queue: (socket index, host, port), generated lazily.
+    // Sweep queue: (socket index, host).
     let sweep_list: Vec<(usize, u32)> = if sweep {
         targets
             .iter()
             .enumerate()
             .filter(|(_, t)| t.discover)
-            .flat_map(|(si, t)| {
-                let own = u32::from(t.iface.addr);
-                let base = own & 0xFFFF_FF00;
-                (1..255u32)
-                    .map(move |h| base | h)
-                    .filter(move |&h| h != own)
-                    .map(move |h| (si, h))
-            })
+            .flat_map(|(si, t)| sweep_hosts(&t.iface).map(move |h| (si, h)))
             .collect()
     } else {
         Vec::new()
     };
-    let mut sweep_i = 0usize; // index into sweep_list × 2 ports
+    let mut sweep_i = 0usize; // index into sweep_list x 2 ports
     let sweep_total = sweep_list.len() * 2;
+    let pace = Duration::from_millis(1);
+    let mut next_fire = Instant::now();
 
     let mut pfds: Vec<libc::pollfd> = socks
         .iter()
@@ -578,20 +616,27 @@ pub fn scan(
     let mut deadline = Instant::now() + timeout;
     loop {
         let sweeping = sweep_i < sweep_total;
-        let wait = if sweeping { 1 } else { ms_until(deadline) };
+        let wait = if sweeping {
+            // Round up: a sub-millisecond remainder must still wait, not spin.
+            let left = next_fire.saturating_duration_since(Instant::now());
+            left.as_micros().div_ceil(1000).min(1000) as i32
+        } else {
+            ms_until(deadline)
+        };
         if !sweeping && wait == 0 {
             break;
         }
         let ready = poll_readable(&mut pfds, wait).map_err(|e| Error::Io("poll", e))?;
-        if sweeping {
+        if sweeping && Instant::now() >= next_fire {
             let (si, host) = sweep_list[sweep_i / 2];
             let port = if sweep_i.is_multiple_of(2) {
-                ports.scan
+                tports[si].scan
             } else {
-                ports.control
+                tports[si].control
             };
             fire(&socks[si], SocketAddrV4::new(Ipv4Addr::from(host), port));
             sweep_i += 1;
+            next_fire += pace;
             if sweep_i == sweep_total {
                 deadline = Instant::now() + timeout;
             }
@@ -642,6 +687,27 @@ pub fn scan(
         ));
     }
     Ok(found)
+}
+
+/// Hosts a sweep probes on `iface`: its subnet without network, broadcast and its
+/// own address, clipped to its own /24 (a /16 sweep would be 130k datagrams).
+pub fn sweep_hosts(iface: &Iface) -> impl Iterator<Item = u32> + use<> {
+    let own = u32::from(iface.addr);
+    let prefix = iface.prefix.max(24);
+    let mask = if prefix >= 32 {
+        u32::MAX
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    };
+    let net = own & mask;
+    let bcast = net | !mask;
+    // /31 and /32 have no network/broadcast addresses to skip.
+    let (lo, hi) = if prefix >= 31 {
+        (net, bcast)
+    } else {
+        (net + 1, bcast - 1)
+    };
+    (lo..=hi).filter(move |&h| h != own)
 }
 
 // ------------------------------------------------------------------ status
@@ -894,6 +960,43 @@ mod tests {
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].name, "enp5s0");
         assert_eq!(tunnel_names(&machine()), ["tailscale0", "wg0", "proton0"]);
+    }
+
+    #[test]
+    fn labels_ports_and_sweep_ranges() {
+        assert_eq!(base_name("enp5s0:1"), "enp5s0");
+        assert_eq!(base_name("wlp4s0"), "wlp4s0");
+        let test = Ports {
+            scan: 14001,
+            reply: 14002,
+            control: 14003,
+        };
+        // The port test hook never applies to a real LAN device.
+        assert_eq!(test.for_ip(Ipv4Addr::new(192, 168, 1, 3)), Ports::default());
+        assert_eq!(test.for_ip(Ipv4Addr::new(127, 0, 0, 2)), test);
+        let m = machine();
+        assert_eq!(test.for_iface(&m[1]), Ports::default());
+        assert_eq!(test.for_iface(&m[0]), test);
+        // /24: 253 hosts (no network, broadcast or self).
+        let h: Vec<u32> = sweep_hosts(&m[1]).collect();
+        assert_eq!(h.len(), 253);
+        assert!(!h.contains(&u32::from(m[1].addr)));
+        // /28 stays inside its 16 addresses; /16 is clipped to its own /24.
+        let small = iface("e", [10, 0, 0, 20], 28, 0, Some(1), 3);
+        let h: Vec<Ipv4Addr> = sweep_hosts(&small).map(Ipv4Addr::from).collect();
+        assert_eq!(h.first(), Some(&Ipv4Addr::new(10, 0, 0, 17)));
+        assert_eq!(h.last(), Some(&Ipv4Addr::new(10, 0, 0, 30)));
+        assert_eq!(h.len(), 13);
+        let big = iface("e", [10, 1, 2, 3], 16, 0, Some(1), 3);
+        let h: Vec<Ipv4Addr> = sweep_hosts(&big).map(Ipv4Addr::from).collect();
+        assert_eq!(
+            (h.len(), h[0], h[252]),
+            (
+                253,
+                Ipv4Addr::new(10, 1, 2, 1),
+                Ipv4Addr::new(10, 1, 2, 254)
+            )
+        );
     }
 
     #[test]

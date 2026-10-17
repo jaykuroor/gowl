@@ -5,12 +5,17 @@
 //! We drive libpulse's *non-threaded* `pa_mainloop` from our own thread instead of
 //! using `pa_simple` (DECISIONS D-030): `pa_simple` runs a second mainloop thread,
 //! so every fragment woke two threads (measured 100 wakeups/s vs the ≤ 50 budget),
-//! and its read waits on a condition variable that signals cannot interrupt. Here a
-//! signal makes `poll()` return EINTR, `pa_mainloop_iterate` returns, and the caller
-//! sees its stop flag. No callbacks: states are polled after each iteration and
-//! audio is taken with `pa_stream_peek`/`pa_stream_drop`.
+//! and its read waits on a condition variable that signals cannot interrupt.
+//!
+//! The mainloop's `poll()` is ours (`pa_mainloop_set_poll_func`, D-042): it watches
+//! libpulse's fds *plus* the [`Hook`] fds (signalfd, timerfd, netlink, verify
+//! socket) in one call, so music mode is one `poll()` over everything, like screen
+//! mode. When one of ours fires, the read returns [`ReadError::Interrupted`] and the
+//! caller handles it. No callbacks otherwise: states are polled after each
+//! iteration and audio is taken with `pa_stream_peek`/`pa_stream_drop`.
 
-use std::ffi::{CStr, c_char, c_int, c_void};
+use std::cell::Cell;
+use std::ffi::{CStr, c_char, c_int, c_ulong, c_void};
 
 use crate::Error;
 
@@ -42,6 +47,118 @@ struct BufferAttr {
 }
 
 type P = *mut c_void;
+type PollFn = unsafe extern "C" fn(*mut libc::pollfd, c_ulong, c_int, *mut c_void) -> c_int;
+
+/// Extra fds the mainloop's `poll()` watches for the caller.
+pub const HOOK_FDS: usize = 4;
+const NO_FD: libc::pollfd = libc::pollfd {
+    fd: -1,
+    events: libc::POLLIN,
+    revents: 0,
+};
+
+/// The caller's fds, polled together with libpulse's (fd -1 = unused slot).
+/// Interior mutability: the poll callback runs inside `pa_mainloop_iterate` on the
+/// same thread while the caller holds a shared reference.
+pub struct Hook {
+    fds: Cell<[libc::pollfd; HOOK_FDS]>,
+    fired: Cell<bool>,
+}
+
+impl Default for Hook {
+    fn default() -> Self {
+        Hook {
+            fds: Cell::new([NO_FD; HOOK_FDS]),
+            fired: Cell::new(false),
+        }
+    }
+}
+
+impl Hook {
+    pub fn set_fd(&self, i: usize, fd: c_int) {
+        let mut f = self.fds.get();
+        f[i].fd = fd;
+        self.fds.set(f);
+    }
+
+    /// One of our fds was ready during the last poll.
+    pub fn fired(&self) -> bool {
+        self.fired.get()
+    }
+
+    /// The ready events of each slot since the last `take`, clearing them.
+    pub fn take(&self) -> [i16; HOOK_FDS] {
+        let mut f = self.fds.get();
+        let ev = f.map(|p| p.revents);
+        for p in &mut f {
+            p.revents = 0;
+        }
+        self.fds.set(f);
+        self.fired.set(false);
+        ev
+    }
+
+    /// Block on our fds alone (no stream open). EINTR counts as "nothing ready".
+    pub fn wait(&self, timeout_ms: c_int) -> std::io::Result<()> {
+        let mut f = self.fds.get();
+        // SAFETY: valid pollfd array of HOOK_FDS entries.
+        let r = unsafe { libc::poll(f.as_mut_ptr(), HOOK_FDS as libc::nfds_t, timeout_ms) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            return if e.kind() == std::io::ErrorKind::Interrupted {
+                Ok(())
+            } else {
+                Err(e)
+            };
+        }
+        if r > 0 {
+            self.fired.set(true);
+        }
+        self.fds.set(f);
+        Ok(())
+    }
+}
+
+/// `pa_poll_func`: poll libpulse's fds and the hook's in one call. Returns the
+/// number of *libpulse* fds with events (its dispatch counts down from that).
+unsafe extern "C" fn hook_poll(
+    ufds: *mut libc::pollfd,
+    nfds: c_ulong,
+    timeout: c_int,
+    ud: *mut c_void,
+) -> c_int {
+    const MAX: usize = 32;
+    // SAFETY: `ud` is the `&Hook` registered with this mainloop; the Capture that
+    // owns the mainloop borrows it, so it outlives every call.
+    let hook = unsafe { &*(ud as *const Hook) };
+    let n = nfds as usize;
+    if n + HOOK_FDS > MAX {
+        // Never seen (libpulse uses a handful of fds); stay correct without ours.
+        // SAFETY: forwarding libpulse's own array.
+        return unsafe { libc::poll(ufds, nfds as libc::nfds_t, timeout) };
+    }
+    let mut all = [NO_FD; MAX];
+    all[..HOOK_FDS].copy_from_slice(&hook.fds.get());
+    // SAFETY: libpulse passes `nfds` valid pollfds.
+    let theirs = unsafe { std::slice::from_raw_parts_mut(ufds, n) };
+    all[HOOK_FDS..HOOK_FDS + n].copy_from_slice(theirs);
+    // SAFETY: `all` holds HOOK_FDS + n valid entries.
+    let r = unsafe { libc::poll(all.as_mut_ptr(), (HOOK_FDS + n) as libc::nfds_t, timeout) };
+    if r < 0 {
+        return r;
+    }
+    for (t, a) in theirs.iter_mut().zip(&all[HOOK_FDS..]) {
+        t.revents = a.revents;
+    }
+    let mut ours = [NO_FD; HOOK_FDS];
+    ours.copy_from_slice(&all[..HOOK_FDS]);
+    let hits = ours.iter().filter(|p| p.revents != 0).count() as c_int;
+    if hits > 0 {
+        hook.fds.set(ours);
+        hook.fired.set(true);
+    }
+    r - hits
+}
 
 /// Declares the function table and its loader together, so each C signature is
 /// written once and every `transmute` names its exact target type.
@@ -69,6 +186,7 @@ pulse_fns! {
     mainloop_get_api = c"pa_mainloop_get_api": fn(P) -> P;
     mainloop_iterate = c"pa_mainloop_iterate": fn(P, c_int, *mut c_int) -> c_int;
     mainloop_free = c"pa_mainloop_free": fn(P);
+    mainloop_set_poll_func = c"pa_mainloop_set_poll_func": fn(P, PollFn, *mut c_void);
     context_new = c"pa_context_new": fn(P, *const c_char) -> P;
     context_connect = c"pa_context_connect": fn(P, *const c_char, c_int, *const c_void) -> c_int;
     context_get_state = c"pa_context_get_state": fn(P) -> c_int;
@@ -104,7 +222,7 @@ fn dlerror() -> String {
 /// Why a read returned without a window.
 #[derive(Debug)]
 pub enum ReadError {
-    /// A signal interrupted the wait (caller checks its stop flag).
+    /// One of the hook's fds is ready (signal, timer, network): handle it, read again.
     Interrupted,
     /// Stream or connection failed; reopen.
     Failed(String),
@@ -152,22 +270,27 @@ impl Pulse {
 
     /// Connect and start a record stream on `source` (e.g. `@DEFAULT_MONITOR@`):
     /// float32 LE, mono (server downmixes), `rate` Hz, fragments of `frag_bytes`.
-    /// `stop` is polled while waiting so a signal aborts the connect.
-    pub fn open(
-        &self,
+    /// The hook's fds are polled while waiting, so a signal aborts the connect.
+    pub fn open<'a>(
+        &'a self,
         source: &CStr,
         rate: u32,
         frag_bytes: u32,
-        stop: &dyn Fn() -> bool,
-    ) -> Result<Capture<'_>, String> {
+        hook: &'a Hook,
+    ) -> Result<Capture<'a>, ReadError> {
         let f = &self.f;
         // SAFETY: plain constructor; NULL on OOM.
         let m = unsafe { (f.mainloop_new)() };
         if m.is_null() {
-            return Err("pa_mainloop_new failed".into());
+            return Err(ReadError::Failed("pa_mainloop_new failed".into()));
+        }
+        // SAFETY: live mainloop; `hook` outlives it (the Capture borrows it).
+        unsafe {
+            (f.mainloop_set_poll_func)(m, hook_poll, (hook as *const Hook).cast_mut().cast());
         }
         let mut cap = Capture {
             p: self,
+            hook,
             m,
             c: std::ptr::null_mut(),
             s: std::ptr::null_mut(),
@@ -178,7 +301,7 @@ impl Pulse {
         // SAFETY: `m` is live; the API pointer lives as long as `m`.
         cap.c = unsafe { (f.context_new)((f.mainloop_get_api)(m), c"gowl".as_ptr()) };
         if cap.c.is_null() {
-            return Err("pa_context_new failed".into());
+            return Err(ReadError::Failed("pa_context_new failed".into()));
         }
         // SAFETY: live context; NULL server = default; no spawn API.
         if unsafe {
@@ -190,14 +313,16 @@ impl Pulse {
             )
         } < 0
         {
-            return Err(cap.context_error());
+            return Err(ReadError::Failed(cap.context_error()));
         }
         loop {
             // SAFETY: live context.
             match unsafe { (f.context_get_state)(cap.c) } {
                 PA_CONTEXT_READY => break,
-                PA_CONTEXT_FAILED | PA_CONTEXT_TERMINATED => return Err(cap.context_error()),
-                _ => cap.iterate(stop).map_err(|_| "interrupted".to_string())?,
+                PA_CONTEXT_FAILED | PA_CONTEXT_TERMINATED => {
+                    return Err(ReadError::Failed(cap.context_error()));
+                }
+                _ => cap.iterate()?,
             }
         }
         let ss = SampleSpec {
@@ -215,21 +340,23 @@ impl Pulse {
         // SAFETY: live context; `ss` valid for the call (copied); NULL map = default.
         cap.s = unsafe { (f.stream_new)(cap.c, c"gowl music".as_ptr(), &ss, std::ptr::null()) };
         if cap.s.is_null() {
-            return Err(cap.context_error());
+            return Err(ReadError::Failed(cap.context_error()));
         }
         // SAFETY: live stream; `source` and `attr` valid for the call (copied).
         if unsafe {
             (f.stream_connect_record)(cap.s, source.as_ptr(), &attr, PA_STREAM_ADJUST_LATENCY)
         } < 0
         {
-            return Err(cap.context_error());
+            return Err(ReadError::Failed(cap.context_error()));
         }
         loop {
             // SAFETY: live stream.
             match unsafe { (f.stream_get_state)(cap.s) } {
                 PA_STREAM_READY => return Ok(cap),
-                PA_STREAM_FAILED | PA_STREAM_TERMINATED => return Err(cap.context_error()),
-                _ => cap.iterate(stop).map_err(|_| "interrupted".to_string())?,
+                PA_STREAM_FAILED | PA_STREAM_TERMINATED => {
+                    return Err(ReadError::Failed(cap.context_error()));
+                }
+                _ => cap.iterate()?,
             }
         }
     }
@@ -238,6 +365,7 @@ impl Pulse {
 /// An open record stream with its own mainloop and connection; torn down on drop.
 pub struct Capture<'a> {
     p: &'a Pulse,
+    hook: &'a Hook,
     m: P,
     c: P,
     s: P,
@@ -260,10 +388,10 @@ impl Capture<'_> {
         self.p.strerror(unsafe { (self.p.f.context_errno)(self.c) })
     }
 
-    /// One blocking mainloop iteration. Err if a signal arrived (stop flag set).
+    /// One blocking mainloop iteration. Err(Interrupted) if a hook fd is ready.
     #[inline]
-    fn iterate(&mut self, stop: &dyn Fn() -> bool) -> Result<(), ReadError> {
-        if stop() {
+    fn iterate(&mut self) -> Result<(), ReadError> {
+        if self.hook.fired() {
             return Err(ReadError::Interrupted);
         }
         self.iterations += 1;
@@ -272,7 +400,7 @@ impl Capture<'_> {
         if r < 0 {
             return Err(ReadError::Failed("pulse mainloop quit".into()));
         }
-        if stop() {
+        if self.hook.fired() {
             return Err(ReadError::Interrupted);
         }
         Ok(())
@@ -280,7 +408,7 @@ impl Capture<'_> {
 
     /// Fill `buf` with the next `buf.len()` samples, blocking. Allocation-free.
     #[inline]
-    pub fn read(&mut self, buf: &mut [f32], stop: &dyn Fn() -> bool) -> Result<(), ReadError> {
+    pub fn read(&mut self, buf: &mut [f32]) -> Result<(), ReadError> {
         let f = &self.p.f;
         loop {
             while self.filled < buf.len() {
@@ -329,7 +457,7 @@ impl Capture<'_> {
             if ss != PA_STREAM_READY || cs != PA_CONTEXT_READY {
                 return Err(ReadError::Failed(self.context_error()));
             }
-            self.iterate(stop)?;
+            self.iterate()?;
         }
     }
 }

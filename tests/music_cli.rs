@@ -11,6 +11,7 @@ fn music(args: &[&str]) -> (i32, String) {
         .args(args)
         .env("XDG_CONFIG_HOME", &tmp)
         .env("XDG_STATE_HOME", &tmp)
+        .env("XDG_RUNTIME_DIR", &tmp)
         .env("HOME", &tmp)
         .env("GOWL_DEVICE", "127.0.0.1")
         .env_remove("GOWL_CONFIG")

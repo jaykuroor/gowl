@@ -5,19 +5,27 @@
 //! the result in edge colors, and `y` writes `segments` and `layout` into the
 //! device's config section, leaving the rest of the file byte-for-byte as it was.
 //!
-//! One `poll()` over stdin, a timerfd (keepalive, so the light stays in stream
-//! mode while the human looks) and the signalfd. Razer OFF on every exit path.
+//! `gowl calibrate --keepalive [DEV]` holds a fixed frame and repeats it at slower
+//! and slower rates (0.5 s … 8 s), asking after each whether the light dropped out of
+//! stream mode; `keepalive_ms` = 70 % of the longest interval it held is written to
+//! the config the same byte-preserving way (`config::set_global_key`).
+//!
+//! Both run on one `poll()` over stdin, the timerfd (keepalive, so the light stays in
+//! stream mode while the human looks, plus network deadlines), the signalfd and the
+//! rtnetlink listener (`runtime::Ctl`). They hold the pidfile like a sync, so
+//! `gowl stop` ends them too. Razer OFF on every exit path.
 
 use std::io::Write as _;
 use std::path::PathBuf;
 
 use crate::color::Rgb;
 use crate::config::{self, Config};
+use crate::control::Pidfile;
 use crate::devices::{self, Device};
 use crate::error::Error;
 use crate::net::Ports;
 use crate::proto::MAX_SEGMENTS;
-use crate::runtime::{self, Sig, Signals, Streams, Timer};
+use crate::runtime::{self, Ctl, Sig, Streams};
 
 const RED: Rgb = [255, 0, 0];
 const DIM: Rgb = [24, 24, 24];
@@ -216,24 +224,27 @@ impl Walk {
     }
 }
 
-/// `gowl calibrate [DEV]`.
+/// `gowl calibrate [--keepalive] [DEV]`.
 pub fn cmd_calibrate(rest: &[String]) -> Result<(), Error> {
-    if let Some(f) = rest.iter().find(|a| a.starts_with("--")) {
-        return Err(Error::Usage(format!("calibrate: unknown option {f}")));
-    }
-    if rest.len() > 1 {
-        return Err(Error::Usage("calibrate: too many arguments".into()));
+    let mut keepalive_mode = false;
+    let mut spec: Option<&str> = None;
+    for a in rest {
+        match a.as_str() {
+            "--keepalive" => keepalive_mode = true,
+            o if o.starts_with("--") => {
+                return Err(Error::Usage(format!("calibrate: unknown option {o}")));
+            }
+            d if spec.is_none() => spec = Some(d),
+            _ => return Err(Error::Usage("calibrate: too many arguments".into())),
+        }
     }
     let cfg = config::load();
     let cache = devices::load_cache();
-    let dev = devices::resolve(rest.first().map(String::as_str), &cfg, &cache)?;
+    let dev = devices::resolve(spec, &cfg, &cache)?;
     let ports = Ports::from_env();
-    let keepalive = if cfg.keepalive_ms == 0 {
-        500
-    } else {
-        cfg.keepalive_ms
-    };
-    let open = |n: usize| -> Result<Streams, Error> {
+    let mut ctl = Ctl::new()?;
+    let _pidfile = Pidfile::acquire()?;
+    let open = |n: usize, keepalive: u32| -> Result<Streams, Error> {
         // Raw segment order while calibrating: no layout, reverse or offset.
         let d = Device {
             segments: n as u8,
@@ -242,26 +253,36 @@ pub fn cmd_calibrate(rest: &[String]) -> Result<(), Error> {
             layout: None,
             ..dev.clone()
         };
-        Streams::open(&[d], cfg.lan_if.as_deref(), ports, 0, keepalive)
+        Streams::open(&[d], cfg.lan_if.as_deref(), ports, 0, keepalive, false)
     };
-    let mut walk = Walk::new(usize::from(dev.segments), cfg.depth);
-    let sig = Signals::new()?;
-    let mut timer = Timer::new()?;
-    let mut streams = open(walk.n())?;
+    if keepalive_mode {
+        return tune_keepalive(&dev, &cfg, &open, &mut ctl);
+    }
+    let keepalive = if cfg.keepalive_ms == 0 {
+        500
+    } else {
+        cfg.keepalive_ms
+    };
+    let mut walk = WalkSession {
+        walk: Walk::new(usize::from(dev.segments), cfg.depth),
+        open: &|n| open(n, keepalive),
+    };
+    let mut streams = open(walk.walk.n(), keepalive)?;
     println!(
         "gowl calibrate — {}{}, {} segments\n{LEGEND}\n",
         dev.label(),
         dev.sku
             .as_deref()
             .map_or(String::new(), |s| format!(" {s}")),
-        walk.n()
+        walk.walk.n()
     );
     streams.razer(true);
-    let r = walk_loop(&mut walk, &mut streams, &open, &sig, &mut timer);
+    walk.show(&mut streams);
+    let r = line_loop(&mut walk, &mut streams, &mut ctl);
     streams.shutdown();
     match r? {
         true => {
-            let layout = walk.layout();
+            let layout = walk.walk.layout();
             let path = save(&dev, &cfg, &layout)?;
             println!("saved to {}", path.display());
             if dev.reverse || dev.offset != 0 {
@@ -274,43 +295,46 @@ pub fn cmd_calibrate(rest: &[String]) -> Result<(), Error> {
     Ok(())
 }
 
-/// Ok(true) = save, Ok(false) = quit.
-fn walk_loop(
-    walk: &mut Walk,
-    streams: &mut Streams,
-    open: &dyn Fn(usize) -> Result<Streams, Error>,
-    sig: &Signals,
-    timer: &mut Timer,
-) -> Result<bool, Error> {
-    let mut seg = [[0u8; 3]; MAX_SEGMENTS];
+/// What a line of input asks the loop to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flow {
+    Go,
+    Save,
+    Quit,
+}
+
+/// An interactive calibration: what the light shows, and what a line of input does.
+trait Session {
+    /// Push the current frame (also after a network rebind).
+    fn frame(&mut self, streams: &mut Streams);
+    fn line(&mut self, line: &str, streams: &mut Streams) -> Result<Flow, Error>;
+}
+
+/// One `poll()` over stdin, the timerfd (keepalive + network deadlines), the
+/// signalfd, rtnetlink and the verify socket. Ok(true) = save, Ok(false) = quit.
+/// Pause/resume signals are ignored here; stop quits without saving.
+fn line_loop(sess: &mut dyn Session, streams: &mut Streams, ctl: &mut Ctl) -> Result<bool, Error> {
     let mut pending: Vec<u8> = Vec::with_capacity(256);
-    let mut show = |walk: &Walk, streams: &mut Streams| {
-        let n = walk.n();
-        walk.frame(&mut seg[..n]);
-        streams.push(0, &seg[..n], runtime::now_ns() / 1_000_000);
-        print!("{}", walk.prompt());
-        let _ = std::io::stdout().flush();
+    let pfd = |fd: i32| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
     };
-    show(walk, streams);
     let mut pfds = [
-        libc::pollfd {
-            fd: libc::STDIN_FILENO,
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: timer.fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: sig.fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
+        pfd(libc::STDIN_FILENO),
+        pfd(ctl.timer.fd()),
+        pfd(ctl.sig.fd()),
+        pfd(ctl.net_fd()),
+        pfd(-1),
     ];
     loop {
-        timer.arm(streams.keepalive_due_ms().map(|ms| ms * 1_000_000))?;
+        let ka = streams.keepalive_due_ms().map(|ms| ms * MS);
+        ctl.timer
+            .arm(runtime::min_opt(ka, ctl.net_deadline(streams)))?;
+        pfds[4].fd = streams.verify_fd();
+        for p in &mut pfds {
+            p.revents = 0;
+        }
         // SAFETY: valid pollfd array of the stated length.
         let r = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, -1) };
         if r < 0 {
@@ -320,13 +344,27 @@ fn walk_loop(
             }
             return Err(Error::Io("poll", e));
         }
-        if pfds[2].revents != 0 && sig.read() == Some(Sig::Stop) {
-            println!();
-            return Ok(false);
+        let now = runtime::now_ns();
+        if pfds[2].revents != 0 {
+            while let Some(s) = ctl.sig.read() {
+                if s == Sig::Stop {
+                    println!();
+                    return Ok(false);
+                }
+            }
+        }
+        if pfds[3].revents != 0 {
+            ctl.on_netlink(now);
+        }
+        if pfds[4].revents != 0 && streams.on_verify_readable() {
+            sess.frame(streams);
         }
         if pfds[1].revents != 0 {
-            timer.drain();
-            streams.keepalive(runtime::now_ns() / 1_000_000);
+            ctl.timer.drain();
+            streams.keepalive(now / MS);
+            if ctl.service_net(streams, now) {
+                sess.frame(streams);
+            }
         }
         if pfds[0].revents == 0 {
             continue;
@@ -348,34 +386,283 @@ fn walk_loop(
         pending.extend_from_slice(&buf[..got as usize]);
         while let Some(nl) = pending.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = pending.drain(..=nl).collect();
-            match walk.input(&String::from_utf8_lossy(&line)) {
-                Step::Show => show(walk, streams),
-                Step::Resize(n) => {
-                    *streams = open(n)?;
-                    streams.razer(true);
-                    println!("now {n} segments");
-                    show(walk, streams);
-                }
-                Step::Save => return Ok(true),
-                Step::Quit => return Ok(false),
-                Step::Help => {
-                    println!("{LEGEND}");
-                    show(walk, streams);
-                }
-                Step::Bad => {
-                    print!(
-                        "type a digit 0-9{} (? for help): ",
-                        if walk.review {
-                            ", or y / b / r / q"
-                        } else {
-                            ""
-                        }
-                    );
-                    let _ = std::io::stdout().flush();
-                }
+            match sess.line(&String::from_utf8_lossy(&line), streams)? {
+                Flow::Go => {}
+                Flow::Save => return Ok(true),
+                Flow::Quit => return Ok(false),
             }
         }
     }
+}
+
+const MS: u64 = 1_000_000;
+
+/// The segment walk on the shared line loop.
+struct WalkSession<'a> {
+    walk: Walk,
+    open: &'a dyn Fn(usize) -> Result<Streams, Error>,
+}
+
+impl WalkSession<'_> {
+    fn show(&mut self, streams: &mut Streams) {
+        self.frame(streams);
+        print!("{}", self.walk.prompt());
+        let _ = std::io::stdout().flush();
+    }
+}
+
+impl Session for WalkSession<'_> {
+    fn frame(&mut self, streams: &mut Streams) {
+        let mut seg = [[0u8; 3]; MAX_SEGMENTS];
+        let n = self.walk.n();
+        self.walk.frame(&mut seg[..n]);
+        streams.push(0, &seg[..n], runtime::now_ns() / MS);
+    }
+
+    fn line(&mut self, line: &str, streams: &mut Streams) -> Result<Flow, Error> {
+        match self.walk.input(line) {
+            Step::Show => self.show(streams),
+            Step::Resize(n) => {
+                *streams = (self.open)(n)?;
+                streams.razer(true);
+                println!("now {n} segments");
+                self.show(streams);
+            }
+            Step::Save => return Ok(Flow::Save),
+            Step::Quit => return Ok(Flow::Quit),
+            Step::Help => {
+                println!("{LEGEND}");
+                self.show(streams);
+            }
+            Step::Bad => {
+                print!(
+                    "type a digit 0-9{} (? for help): ",
+                    if self.walk.review {
+                        ", or y / b / r / q"
+                    } else {
+                        ""
+                    }
+                );
+                let _ = std::io::stdout().flush();
+            }
+        }
+        Ok(Flow::Go)
+    }
+}
+
+// ------------------------------------------------------------------ keepalive tuning
+
+/// Keepalive intervals tried, shortest first (prompts/04_runtime.md item 6).
+const KA_STEPS: [u32; 6] = [500, 1000, 2000, 3000, 5000, 8000];
+const CYAN: Rgb = [0, 255, 255];
+const MAGENTA: Rgb = [255, 0, 255];
+
+/// What the tuning walk does after a line of input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TuneStep {
+    /// Next interval (ms).
+    Next(u32),
+    /// Done: ask whether to save this keepalive_ms.
+    Ask(u32),
+    /// Done, nothing worth saving (dropped out even at the shortest interval).
+    Fail,
+    Save,
+    Quit,
+    Help,
+    Bad,
+}
+
+/// The tuning walk's state, separate from I/O so it can be tested.
+#[derive(Debug, Default)]
+struct Tune {
+    step: usize,
+    /// Longest interval the light held.
+    safe: Option<u32>,
+    asking: bool,
+}
+
+impl Tune {
+    fn interval(&self) -> u32 {
+        KA_STEPS[self.step]
+    }
+
+    /// 70 % of the longest safe interval, in whole tens of ms.
+    fn recommend(&self) -> Option<u32> {
+        self.safe.map(|s| s * 7 / 100 * 10)
+    }
+
+    fn finish(&mut self) -> TuneStep {
+        match self.recommend() {
+            Some(r) => {
+                self.asking = true;
+                TuneStep::Ask(r)
+            }
+            None => TuneStep::Fail,
+        }
+    }
+
+    fn input(&mut self, line: &str) -> TuneStep {
+        let l = line.trim().to_ascii_lowercase();
+        if self.asking {
+            return match l.as_str() {
+                "y" | "yes" => TuneStep::Save,
+                "n" | "no" | "q" | "" => TuneStep::Quit,
+                _ => TuneStep::Bad,
+            };
+        }
+        match l.as_str() {
+            "y" | "yes" => {
+                self.safe = Some(self.interval());
+                if self.step + 1 == KA_STEPS.len() {
+                    self.finish()
+                } else {
+                    self.step += 1;
+                    TuneStep::Next(self.interval())
+                }
+            }
+            "n" | "no" => self.finish(),
+            "q" | "quit" => TuneStep::Quit,
+            "?" | "h" | "help" => TuneStep::Help,
+            _ => TuneStep::Bad,
+        }
+    }
+
+    fn prompt(&self) -> String {
+        let ms = self.interval();
+        let watch = (3 * ms).max(10_000) / 1000;
+        format!(
+            "\nstep {}/{}: one frame every {} — watch the light for about {watch} s.\n\
+             Did it stay cyan + magenta the whole time? y = yes, n = it dropped out (q quits) ",
+            self.step + 1,
+            KA_STEPS.len(),
+            secs(ms)
+        )
+    }
+}
+
+fn secs(ms: u32) -> String {
+    if ms.is_multiple_of(1000) {
+        format!("{} s", ms / 1000)
+    } else {
+        format!("{:.1} s", f64::from(ms) / 1000.0)
+    }
+}
+
+const TUNE_LEGEND: &str = "\
+Finds how long the light stays in stream mode without new frames, so gowl can send
+as few keepalive datagrams as possible. The light shows a fixed cyan + magenta frame
+and gowl repeats it at slower and slower rates. After each step say whether the light
+kept the colors the whole time (y) or dropped out — went back to its own colors or
+mode, even briefly (n). The first n ends the test.";
+
+struct TuneSession {
+    tune: Tune,
+    n: usize,
+}
+
+impl TuneSession {
+    fn show(&mut self, streams: &mut Streams) {
+        print!("{}", self.tune.prompt());
+        let _ = std::io::stdout().flush();
+        self.frame(streams);
+    }
+}
+
+impl Session for TuneSession {
+    fn frame(&mut self, streams: &mut Streams) {
+        let mut seg = [[0u8; 3]; MAX_SEGMENTS];
+        for (i, s) in seg[..self.n].iter_mut().enumerate() {
+            *s = if i < self.n.div_ceil(2) {
+                CYAN
+            } else {
+                MAGENTA
+            };
+        }
+        streams.push(0, &seg[..self.n], runtime::now_ns() / MS);
+    }
+
+    fn line(&mut self, line: &str, streams: &mut Streams) -> Result<Flow, Error> {
+        match self.tune.input(line) {
+            TuneStep::Next(ms) => {
+                streams.set_keepalive_ms(u64::from(ms));
+                // Back into stream mode in case the light wobbled; then the new pace.
+                streams.razer(true);
+                self.show(streams);
+            }
+            TuneStep::Ask(r) => {
+                println!(
+                    "\nThe light held at {} between frames. Recommended keepalive_ms = {r} (70 % of that).",
+                    secs(self.tune.safe.unwrap_or(0))
+                );
+                if self.tune.safe == Some(KA_STEPS[KA_STEPS.len() - 1]) {
+                    println!("(It held at the longest step; it may hold even longer.)");
+                }
+                print!("Save keepalive_ms = {r} to the config? y/N ");
+                let _ = std::io::stdout().flush();
+            }
+            TuneStep::Fail => {
+                println!(
+                    "\nThe light dropped out even at {}: leave keepalive_ms at 500 or lower it (e.g. 300) by hand. Nothing saved.",
+                    secs(KA_STEPS[0])
+                );
+                return Ok(Flow::Quit);
+            }
+            TuneStep::Save => return Ok(Flow::Save),
+            TuneStep::Quit => return Ok(Flow::Quit),
+            TuneStep::Help => {
+                println!("{TUNE_LEGEND}");
+                self.show(streams);
+            }
+            TuneStep::Bad => {
+                print!("y or n (q quits): ");
+                let _ = std::io::stdout().flush();
+            }
+        }
+        Ok(Flow::Go)
+    }
+}
+
+/// `gowl calibrate --keepalive [DEV]`.
+fn tune_keepalive(
+    dev: &Device,
+    cfg: &Config,
+    open: &dyn Fn(usize, u32) -> Result<Streams, Error>,
+    ctl: &mut Ctl,
+) -> Result<(), Error> {
+    let n = usize::from(dev.segments).clamp(1, MAX_SEGMENTS);
+    let mut sess = TuneSession {
+        tune: Tune::default(),
+        n,
+    };
+    let mut streams = open(n, sess.tune.interval())?;
+    println!(
+        "gowl calibrate --keepalive — {} (now keepalive_ms = {})\n{TUNE_LEGEND}",
+        dev.label(),
+        cfg.keepalive_ms
+    );
+    streams.razer(true);
+    sess.show(&mut streams);
+    let r = line_loop(&mut sess, &mut streams, ctl);
+    streams.shutdown();
+    if !r? {
+        println!("not saved");
+        return Ok(());
+    }
+    let (Some(ms), Some(safe)) = (sess.tune.recommend(), sess.tune.safe) else {
+        return Ok(());
+    };
+    let path = config::config_path().ok_or_else(|| {
+        Error::Runtime("no config path: HOME and XDG_CONFIG_HOME are unset".into())
+    })?;
+    let text = config::read_text(&path)?;
+    let out = config::set_global_key(
+        &text,
+        "keepalive_ms",
+        &format!("{ms}   # light held {safe} ms between frames (gowl calibrate --keepalive)"),
+    );
+    config::write_atomic(&path, &out)?;
+    println!("saved keepalive_ms = {ms} to {}", path.display());
+    Ok(())
 }
 
 /// A section alias for a new device: its SKU (lowercase) or `light`, made unique.
@@ -442,19 +729,8 @@ fn save(dev: &Device, cfg: &Config, layout: &[u8]) -> Result<PathBuf, Error> {
     let path = config::config_path().ok_or_else(|| {
         Error::Runtime("no config path: HOME and XDG_CONFIG_HOME are unset".into())
     })?;
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(Error::Io("read config", e)),
-    };
-    let out = updated_config(&text, dev, cfg, layout);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| Error::Io("create config dir", e))?;
-    }
-    // Write a sibling file, then rename: a crash never leaves a half-written config.
-    let tmp = path.with_extension("gowl-tmp");
-    std::fs::write(&tmp, out).map_err(|e| Error::Io("write config", e))?;
-    std::fs::rename(&tmp, &path).map_err(|e| Error::Io("rename config", e))?;
+    let text = config::read_text(&path)?;
+    config::write_atomic(&path, &updated_config(&text, dev, cfg, layout))?;
     Ok(path)
 }
 
@@ -562,6 +838,32 @@ mod tests {
         let out = updated_config(text, &dev(None), &cfg, &layout);
         assert!(out.starts_with("fps = 30\n[device h6609]\nip = 10.0.0.1\n\n[device h6609-2]\n"));
         assert!(!out.contains("device = "));
+    }
+
+    #[test]
+    fn keepalive_walk_recommends_70_percent_of_the_longest_hold() {
+        let mut t = Tune::default();
+        assert_eq!(t.interval(), 500);
+        assert_eq!(t.input("y"), TuneStep::Next(1000));
+        assert_eq!(t.input("Y "), TuneStep::Next(2000));
+        assert_eq!(t.input("x"), TuneStep::Bad);
+        assert_eq!(t.input("?"), TuneStep::Help);
+        assert_eq!(t.input("y"), TuneStep::Next(3000));
+        // Dropped out at 3 s: the longest hold was 2 s → 1400 ms.
+        assert_eq!(t.input("n"), TuneStep::Ask(1400));
+        assert_eq!(t.input("maybe"), TuneStep::Bad);
+        assert_eq!(t.input("y"), TuneStep::Save);
+        // Held all the way.
+        let mut t = Tune::default();
+        for _ in 0..5 {
+            assert!(matches!(t.input("y"), TuneStep::Next(_)));
+        }
+        assert_eq!(t.input("y"), TuneStep::Ask(5600));
+        assert_eq!(t.input(""), TuneStep::Quit, "Enter = don't save");
+        // Dropped out at once: nothing to recommend.
+        let mut t = Tune::default();
+        assert_eq!(t.input("n"), TuneStep::Fail);
+        assert_eq!(Tune::default().input("q"), TuneStep::Quit);
     }
 
     #[test]

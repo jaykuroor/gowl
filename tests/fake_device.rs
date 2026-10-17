@@ -1,5 +1,5 @@
 //! End-to-end against tools/fake_govee.py on test ports (base 14000, loopback).
-//! Skipped (with a message) if python3 is missing.
+//! Needs python3; fails without it unless GOWL_TEST_NO_PYTHON=1 opts out.
 
 mod common;
 
@@ -29,7 +29,12 @@ impl Drop for Fake {
 impl Fake {
     fn start() -> Option<Fake> {
         if Command::new("python3").arg("--version").output().is_err() {
-            eprintln!("python3 not found: skipping fake-device test");
+            // Never pass silently: skipping needs an explicit opt-out.
+            assert!(
+                std::env::var_os("GOWL_TEST_NO_PYTHON").is_some(),
+                "python3 not found: install it, or set GOWL_TEST_NO_PYTHON=1 to skip the fake-device tests"
+            );
+            eprintln!("python3 not found and GOWL_TEST_NO_PYTHON set: skipping fake-device test");
             return None;
         }
         let mut child = Command::new("python3")
