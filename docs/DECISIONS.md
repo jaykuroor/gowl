@@ -37,3 +37,28 @@ Context: CAPTURE_NIRI.md prefers ext-image-copy-capture when advertised.
 Decision: Phase 2 implements screencopy v3 only; keep the `Capture` trait seam for imagecopy.
 Evidence: `wayland-info` lists zwlr_screencopy_manager_v1 v3, no ext_image_copy_capture_manager_v1.
 Revisit-if: a niri update advertises it.
+
+## D-007 — VPN-proof LAN path via interface binding (UPDATE_001)
+Context: human uses Tailscale and ProtonVPN; on Windows, Tailscale broke Govee LAN control.
+VPNs reroute unicast (policy tables, exit nodes, overlapping subnet routes) and pull
+multicast/broadcast discovery into the tunnel.
+Decision: choose the LAN interface by the light's subnet; SO_BINDTODEVICE (unprivileged
+since Linux 5.7) on every socket, IP_MULTICAST_IF, directed broadcast; rtnetlink-driven
+rebind. Never bypass kill switches or touch VPN/firewall state; diagnose via `gowl doctor`.
+Evidence: tools/netns_vpn_test.py: naive sockets leak unicast, multicast and limited
+broadcast into the fake VPN; bound sockets keep all four datagram kinds on the LAN.
+Revisit-if: the Phase 4 VPN matrix shows a VPN that still breaks it.
+(Numbered D-005 in UPDATE_001; renumbered because D-005/D-006 were taken in Phase 0.)
+
+## D-008 — Firewall: no unscoped port opening (UPDATE_001)
+Context: Fedora `public` zone drops inbound UDP 4002 (scan/status replies only).
+Decision: sync and one-shots need no inbound. Test conntrack for unicast replies first;
+if a rule is needed, suggest a LAN-subnet-scoped rich rule, runtime before permanent.
+(Numbered D-006 in UPDATE_001.)
+
+## D-009 — netns_vpn_test.py: fall back when unshare itself fails (2026-10-17, UPDATE_001, orchestrator)
+Context: on this machine newuidmap refuses `--map-users=65534:65534:1` (no subuid range); `unshare`
+then exits 1, which the script treated as a test FAIL and never tried its `-r` fallback.
+Decision: if the child's stderr starts with `newuidmap:`/`newgidmap:`/`unshare:`, try the next variant.
+Evidence: before: exit 1 with only the newuidmap error; after: fallback runs, RESULT PASS.
+Revisit-if: the human adds a subuid range (then the unprivileged variant runs and proves no caps).

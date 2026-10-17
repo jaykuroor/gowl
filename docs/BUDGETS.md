@@ -21,13 +21,16 @@ evidence and the best achieved number in `DECISIONS.md` — don't silently lower
 | Heap allocations after warm-up | 0 | 0 | 0 | 0 |
 | UDP datagrams/s per device | ≤ min(fps, 40) | = 1000/keepalive_ms | ≤ min(music_fps, 40) | 0 |
 | Bytes per datagram (10 seg) | 92 | 92 | 92 | — |
+| Wakeups from netlink on a stable network | 0 | 0 | 0 | 0 |
 | niri CPU delta vs S0 | record; target ≤ 3% of a core at 1440p30 | ≈ 0 | — | 0 |
 
 Other:
 - Stripped release binary ≤ 1.5 MB (target ≤ 800 KB).
 - `gowl screen` start → first datagram ≤ 150 ms. One-shot commands ≤ 20 ms wall.
 - Frame ready → `sendto` returns: p99 ≤ 1 ms (debug feature timestamps; off in release).
-- Network: zero datagrams to non-RFC1918/non-link-local addresses; zero DNS lookups.
+- Network: zero datagrams to non-RFC1918/non-link-local addresses; zero DNS lookups; zero datagrams on any
+  VPN/tunnel interface (`tools/netns_vpn_test.py --bin`).
+- Recovery after VPN up/down or Wi-Fi roam: sync resumes ≤ 1 s, no restart.
 - `cargo build --release` from clean ≤ 60 s on the human's machine (dependency diet check).
 
 ## How to measure

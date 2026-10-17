@@ -33,10 +33,11 @@ gowl screen [--output NAME] [--fps N] [--depth 0.10-0.50] [DEV...]
 gowl music  [--reaction R] [--palette P] [--fps N] [DEV...]
 gowl calibrate [DEV]                 segment walk: 1 red segment at a time, Enter to step
 gowl pause | resume | stop           signal the running sync (pidfile)
+gowl doctor [DEV]                    network diagnostics: LAN iface, VPN hijack, firewall (docs/NETWORK.md)
 gowl toggle [screen|music]           running → stop it; not running → run that mode (default screen)
 gowl --version | --help
 ```
-Exit codes: 0 ok, 1 runtime error, 2 usage error, 3 no device, 4 capture unavailable.
+Exit codes: 0 ok, 1 runtime error, 2 usage error, 3 no device, 4 capture unavailable, 5 no LAN interface for the device.
 All diagnostics to stderr, one line each; `GOWL_LOG=debug` for verbose.
 
 ## Config
@@ -63,7 +64,8 @@ Device cache (written by `scan`): `$XDG_STATE_HOME/gowl/devices`, one device per
 
 Additions over legacy (allowed because they reduce cost or fix Wayland gaps):
 damage-aware zone recompute, pull-paced capture (no frames when screen static),
-per-device `reverse`/`offset`, multi-device fan-out from one capture.
+per-device `reverse`/`offset`, multi-device fan-out from one capture, VPN-proof
+interface-bound sockets with automatic rebind on network changes.
 
 ## Shutdown contract
 On SIGINT/SIGTERM/SIGHUP or `stop`: send razer OFF to every streaming device (twice,

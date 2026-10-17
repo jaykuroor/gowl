@@ -9,7 +9,10 @@ src/
   config.rs      key=value parser, device sections, env overrides, XDG paths
   devices.rs     device cache (load/save atomic), DEV resolution, SKU table
   proto.rs       message templates, razer frame encoder, base64 encoder, reply scanner
-  net.rs         UDP sockets, discovery, status query, Sender (per-device prealloc buffers)
+  net.rs         UDP sockets bound to the LAN interface (VPN-proof, see NETWORK.md),
+                 discovery, status query, Sender (per-device prealloc buffers)
+  netwatch.rs    rtnetlink change listener in the poll set → re-select interface, rebind
+  doctor.rs      `gowl doctor` diagnostics
   color.rs       sRGB↔linear LUTs, zone mapping (port of led_mapping.py), saturation,
                  brightness, EMA smoother, resample, reverse/offset, delta check — all fixed-point
   capture/
@@ -68,10 +71,11 @@ behind a cargo feature without touching `color.rs`/`net.rs`. Not in v1.
 
 ## Event loop (screen mode)
 ```
-poll([wayland_fd, timerfd, signalfd], -1)
+poll([wayland_fd, timerfd, signalfd, netlink_fd], -1)
   wayland readable → prepare_read/read/dispatch → on frame ready: process + send
   timerfd          → either "issue next capture request" or "keepalive resend"
   signalfd         → SIGTERM/SIGINT/SIGHUP: razer OFF, exit; SIGUSR1: pause; SIGUSR2: resume
+  netlink          → link/addr/route changed: debounce 500 ms, re-select LAN interface, rebind if changed
 ```
 One timerfd armed to the nearest deadline (absolute, CLOCK_MONOTONIC). No periodic
 tick. Static screen ⇒ wakeups = keepalive rate only. Paused ⇒ zero wakeups.

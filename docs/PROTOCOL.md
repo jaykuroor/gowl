@@ -20,10 +20,9 @@ Only `scan` and `status` need replies, so **only those commands bind 4002**
 (`SO_REUSEADDR` + `SO_REUSEPORT`, timeout-bounded, then close). Sync modes and one-shot
 control send from an ephemeral port and never read the network.
 
-Fedora note: the default *FedoraWorkstation* firewalld zone allows inbound UDP 1025–65535,
-so 4002 replies arrive. If the user's zone is `public`/`home` with defaults, scan replies
-are dropped — `scan` must then print the exact fix
-(`sudo firewall-cmd --add-port=4002/udp` / `--permanent`) and never apply it itself.
+**Every gowl socket is bound to the LAN interface (`SO_BINDTODEVICE`) so VPNs can't
+reroute it. See `docs/NETWORK.md`, which also covers the firewall (`public` zone), the
+conntrack test, and the scoped rule to suggest. Never apply firewall changes.**
 
 ## Messages (JSON, UTF-8, one datagram each)
 Wire JSON may be compact (no spaces). Legacy sends `json.dumps` output with spaces;
@@ -99,8 +98,9 @@ Built-in table (from legacy `sku_catalog.py`): H619A/B/C/D/E/Z = 10, H6199 = 10,
 H6672 = 14. Unknown SKU → 10 and print a hint to run `gowl calibrate`.
 
 ## Discovery details
-1. Bind 4002 (reuse flags), send scan to `239.255.255.250:4001` and `255.255.255.255:4001`
-   (set `SO_BROADCAST`; `IP_MULTICAST_IF` from config `multicast_if` if set; TTL 1).
+1. Per LAN interface (NETWORK.md selection): socket bound to the interface, bind 4002
+   (reuse flags), send scan to `239.255.255.250:4001`, `255.255.255.255:4001` and the
+   subnet-directed broadcast `:4001` (`SO_BROADCAST`, `IP_MULTICAST_IF`, TTL 1).
 2. Collect replies until `--timeout` (default 1000 ms) using `poll`, dedupe by `device`.
 3. `--sweep`: also unicast the scan to every host of each local IPv4 /24 (from
    `getifaddrs`, not the legacy 8.8.8.8 connect trick) on ports 4001 and 4003, paced at

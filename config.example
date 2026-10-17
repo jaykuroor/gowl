@@ -23,7 +23,9 @@ music_brightness = 0.85
 music_smoothing = 0.6
 
 # ---- network ----
-# multicast_if = 192.168.1.10   # pin the interface used for discovery
+# gowl binds to the interface whose subnet contains the light, so VPNs (Tailscale,
+# ProtonVPN, WireGuard, OpenVPN) can't reroute it. Only set this to force a choice.
+# lan_if = wlp3s0
 
 # ---- devices ----
 [device desk]
