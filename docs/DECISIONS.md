@@ -62,3 +62,57 @@ then exits 1, which the script treated as a test FAIL and never tried its `-r` f
 Decision: if the child's stderr starts with `newuidmap:`/`newgidmap:`/`unshare:`, try the next variant.
 Evidence: before: exit 1 with only the newuidmap error; after: fallback runs, RESULT PASS.
 Revisit-if: the human adds a subuid range (then the unprivileged variant runs and proves no caps).
+
+## D-010 — libc, not rustix (2026-10-17, phase 1, core agent)
+Context: CLAUDE.md allows `rustix` or `libc`, not both. Phase 1 needs getifaddrs,
+SO_BINDTODEVICE, ip_mreqn/IP_MULTICAST_IF, poll; later phases need memfd, mmap, timerfd, signalfd.
+Decision: `libc` with `default-features = false`. It is declarations only (no runtime code),
+covers getifaddrs (rustix has no getifaddrs), and matches the hand-written FFI style planned for
+libpulse-simple/libgbm. Lib + bin targets in the one crate so integration tests can reach modules.
+Evidence: `cargo tree` = gowl → libc 0.2.191 only; stripped release binary 538,152 B.
+Revisit-if: unsafe surface grows enough that rustix's safe wrappers would remove real risk.
+
+## D-011 — Interface-selection fallbacks + test port hook (2026-10-17, phase 1, core agent)
+Context: NETWORK.md excludes loopback and point-to-point links. But the fake device lives on
+127.0.0.1, and `tools/netns_vpn_test.py` models the LAN as a TUN (`lan0`, POINTOPOINT, ARPHRD_NONE).
+Decision: (1) loopback device IP → `lo`. (2) If no non-tunnel interface contains the device IP,
+accept a P2P link that contains it, is not VPN-named (tailscale/wg/tun/proton/pvpn/ipv6leak), not
+CGNAT and not a /32; discovery likewise falls back to such links only when no normal LAN exists.
+Real VPNs are still never used: their addresses are /32 or CGNAT, or their names match.
+(3) `GOWL_PORT_BASE=N` (test hook, undocumented in --help) shifts ports to N+1..N+3 to match
+`fake_govee.py --port-base N`.
+Evidence: unit tests `picks_lan_not_vpn`, `tun_lan_fallback_like_netns_test`; netns `--bin` PASS.
+Revisit-if: a VPN shows up as a non-/32, oddly named P2P link containing the LAN subnet.
+
+## D-012 — Smoother starts black, as legacy actually does (2026-10-17, phase 1, core agent)
+Context: SPEC/ARCHITECTURE said "first frame snaps". Every legacy sync loop constructs
+`ColorSmoother(alpha, segment_count)`, which pre-sizes the state to zeros, so the first frames
+fade in from black; only a count change snaps. `processing.json` (frame 0 → 140 for 255 at α .55) agrees.
+Decision: match legacy + vectors (rule 8): `Smoother::new(alpha, count)` starts at black; count
+change snaps. SPEC and ARCHITECTURE corrected.
+Revisit-if: the human prefers an instant first frame (one-line change: start empty).
+
+## D-013 — Fixed-point formats: Q16 saturation/brightness/EMA alpha (2026-10-17, phase 1, core agent)
+Context: ARCHITECTURE proposed Rec.709 ×256 luma and Q8 factors for saturation and EMA.
+Decision: Q16 (×65536) weights and factors with i64 intermediates and round-to-nearest. Same
+instruction count on x86-64, and the error vs legacy is 0, not "within 1". The zone average
+uses LIN16 (u16) sums → Q8 mean → 255 midpoint thresholds (branchless 8-step search).
+Evidence: tests/vectors.rs: worst channel error 0 for all 12 zone cases, saturation and
+brightness; smoother and resample within ±1.
+Revisit-if: Phase 5 profiling shows these per-zone ops matter (they run 10×/frame).
+
+## D-014 — Firewall: unicast replies do NOT pass conntrack; detect with ICMP counters (2026-10-17, phase 1, core agent)
+Context: NETWORK.md asked whether bound unicast status replies pass the `public` zone via
+conntrack. Rule: no firewall changes, no root.
+Decision: result is "blocked": the H6609 replies to status *and* unicast scan from a port that
+doesn't match the flow (not 4001/4002/4003, probably ephemeral), so conntrack can't help. Recommend
+the LAN-scoped rich rule (runtime, then permanent) for `status`/`scan` only. To make this
+self-diagnosing without root, doctor/status/scan compare `/proc/net/snmp` `Icmp OutDestUnreachs`
+before/after waiting: a rise means the light answered and the firewall rejected it.
+Evidence: +2 ICMP unreachables per `gowl status` (3 runs), +3 per `gowl doctor` (3 runs), +2 for
+one multicast `gowl scan`, 0 in 1-s idle baselines; `Udp NoPorts` 0; priming :4001/:4002 didn't help.
+Also: `gowl scan` additionally unicasts the scan to known IPs (cache/config/GOWL_DEVICE; one
+datagram each) and merges results into the cache instead of overwriting it (a scan that misses a
+device keeps its entry). Compact JSON on the wire (PROTOCOL.md allows it): legacy strings minus
+json.dumps spaces, byte-equal.
+Revisit-if: the human captures the reply port (tcpdump) and it turns out to be fixed.

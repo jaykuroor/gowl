@@ -96,6 +96,9 @@ flag). Keep it `01`.
 Devices do not report it. Precedence: config `segments` → built-in SKU table → 10.
 Built-in table (from legacy `sku_catalog.py`): H619A/B/C/D/E/Z = 10, H6199 = 10,
 H6672 = 14. Unknown SKU → 10 and print a hint to run `gowl calibrate`.
+The human's H6609 is **not** in the table: gowl uses 10 (shown as `10?` in `scan`/`list`),
+exactly what legacy does (`get_segment_count` → catalog miss → default 10). Phase 4's
+`calibrate` must confirm the real count, then set `segments =` in the config.
 
 ## Discovery details
 1. Per LAN interface (NETWORK.md selection): socket bound to the interface, bind 4002

@@ -32,6 +32,10 @@ directed broadcast scan → 192.168.50.255:4001    lan0           lan0          
    (Tailscale CGNAT) and link names starting `tailscale`, `wg`, `tun`, `proton`, `pvpn`,
    `ipv6leak` as a belt-and-braces check. Tie-break: ARPHRD_ETHER (Wi-Fi/Ethernet) over
    anything else, then lowest ifindex. Config `lan_if = NAME` overrides everything.
+   Two narrow fallbacks (D-011): a loopback device IP (the fake device, `127.0.0.1`)
+   uses `lo`; and if *only* a point-to-point/TUN link that is not VPN-named and not
+   a /32 has the device in its subnet, that link is used (this is also what
+   `tools/netns_vpn_test.py`'s TUN-based `lan0` looks like).
 2. **`SO_BINDTODEVICE` that interface on every gowl socket** (send and receive). The
    route lookup is then forced through that interface's routes, so policy tables and
    tunnel default routes are skipped. Unprivileged since Linux 5.7 as long as the socket
@@ -81,6 +85,29 @@ firewalld's `public` zone accepts it). Record the result in PROGRESS.md:
   ```
   (substitute the real LAN subnet). Never suggest the unscoped `--add-port=4002/udp`
   as the first option. Never run either command yourself.
+
+### Result on the human's machine (Phase 1, 2026-10-17): **blocked**
+Firewall unchanged (zone `public` on enp5s0), light H6609 at 192.168.1.3 (ARP REACHABLE):
+- `gowl status` (devStatus → status, sent from :4002 to :4003): **no reply reached gowl**.
+- `gowl doctor`'s unicast scan (from :4002 to :4001): **no reply reached gowl**.
+- `gowl scan` (multicast + limited + directed broadcast): **nothing found**.
+- But the light *does* answer: while gowl waited, the kernel's `Icmp OutDestUnreachs`
+  (`/proc/net/snmp`, readable without root) rose by exactly one per query (2 for
+  status, 3 for doctor, 2 for the multicast scan; 0 in 1-s idle baselines), and
+  `Ip InReceives − InDelivers` rose by the same amount with `Udp NoPorts` = 0, so the
+  replies were rejected by netfilter (firewalld rejects with ICMP admin-prohibited)
+  before reaching UDP.
+- **Reply source port:** not 4003 (else conntrack would have matched the status flow),
+  not 4001 (the unicast-scan flow didn't match either), not 4002 (a priming datagram
+  from :4002 to light:4002 before the query didn't help). Most likely an ephemeral
+  port per reply, which conntrack can never match. It can only be read with a capture
+  (`sudo tcpdump -ni enp5s0 udp and host 192.168.1.3`, ask first) or once the rule is in.
+
+So the "passes" case does not apply: **status and scan need the scoped rule above**
+(`192.168.1.0/24`, UDP 4002, runtime first). Sync and one-shot control still need
+nothing. `gowl doctor` detects this case by itself (ICMP counter delta) and prints
+the rule with the real zone and subnet; `gowl status`/`scan` say "the firewall
+rejected the reply" instead of a bare "no reply".
 
 ## `gowl doctor [DEV]`
 One screen of facts, no fixes applied:
