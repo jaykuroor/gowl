@@ -49,6 +49,10 @@ build with `CARGO_PROFILE_RELEASE_DEBUG=true CARGO_PROFILE_RELEASE_STRIP=false` 
 ## Results log (append; newest first)
 | Date | Commit | Scenario | CPU % | Wakeups/s | RSS MB | Pkts/s | niri Δ CPU % | Notes |
 |---|---|---|---|---|---|---|---|---|
+| 2026-10-17 | phase 4 (7947711+) | binary size | | | | | | **734,760 B** stripped (+32,736 B vs 702,024: pidfile/control, netwatch + verify, music poll hook, keepalive walk); `cargo tree` = libc only |
+| 2026-10-17 | 7947711 | **S4 paused** (`measure.py paused 20 --fake`, netlink fd in the poll set) | 0.000 | 0.0 | 8.81 | 0.00 | 26.70 abs | fake=True; 20 s window: 0 CPU ticks, 0 context switches, 0 datagrams → S4 met, and netlink adds 0 wakeups on a stable network. niri absolute was high from the human's desktop (gowl captures nothing while paused) |
+| 2026-10-17 | 7947711 | S1 screen 30 fps (regression check after Phase 4) | 0.250 | 70.3 | 8.63 | 4.35 | 36.00 abs | fake=True; desktop partly static (~12 frames/s captured). `GOWL_LOG=debug` per-second line: `netlink 0 verify 0` in all 11 s |
+| 2026-10-17 | 7947711 | music paused (live PipeWire, `gowl pause`) | — | 0 in 5 s | — | 0 | — | loopback receiver; stream closed while paused; resume → razer ON + frames; `gowl stop` exit in 12 ms |
 | 2026-10-17 | merge 2+3 | screen (busy desktop, 30 fps) | 0.300 | 92.0 | 8.63 | 2.00 | 19.40 | fake=True; merged binary 665,160 B; screen mode maps only ld/libc/libgcc_s/libm (no libpulse) |
 | 2026-10-17 | calibrate (D-040) | binary size | | | | | | 702,024 B (+36,864 B: `gowl calibrate` + `layout` key); hot path unchanged |
 | 2026-10-17 | 886a006 | S1 screen (busy desktop, 30 fps, 3440x1440) | 0.267 | 92.2 | 8.63 | 2.00 | 19.43 (Δ ≈ 14 vs S0) | fake=True. Desktop never static (animated background/browser; niri full-output damage every frame) → 30 frames/s captured, edge colors barely moved so 2 pkts/s (keepalive). Wakeups 3/frame + keepalive (D-018, over the 2·fps target). RSS = 0.2 anon + 2.9 file + 5.9 shmem fault-around (CAPTURE_NIRI.md). 0 heap allocations/s after warm-up (`--features count-alloc`, live niri). Binary 607,784 B |

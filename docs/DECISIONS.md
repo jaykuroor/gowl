@@ -334,3 +334,107 @@ middle shows the blend (orange/teal). The legend now says corner keys are only f
 segment that wraps a corner, and that several segments on one side are split evenly in
 strip order (direction detected). Aspect ratio needs no input: rects are fractions of the
 captured output, whose size gowl reads from the compositor.
+
+## D-042 — Music mode on one poll(): our pa_poll_func + signalfd, no sigaction/alarm (2026-10-17, phase 4, runtime agent)
+**Context.** Phase 3 left music mode outside the runtime contract: SIGINT/TERM/HUP set an
+`AtomicBool` (sigaction, no SA_RESTART) with a 1 s `alarm` watchdog for the race before
+`poll()`, no SIGUSR1/2, no pidfile, no netlink, and a 1 s `nanosleep` back-off while the
+sound server is down (D-035 (a)). **Decision.** libpulse lets the owner of a `pa_mainloop`
+replace its poll function (`pa_mainloop_set_poll_func`). Ours (`pulse::hook_poll`) copies
+libpulse's pollfds behind up to 4 of ours (signalfd, timerfd, netlink, verify socket) into
+one stack array, calls `poll()` once, copies revents back and returns libpulse's own count;
+if one of ours fired, `Capture::read` returns `Interrupted` and the loop handles it. Signals
+are blocked + signalfd (shared `runtime::Ctl`), so none can be missed and the watchdog and
+its static emergency socket table are gone. Pause closes the stream (disconnects from
+PipeWire, 0 wakeups), razer OFF; resume = razer ON + reopen. Server down: retry every 1 s on
+the timerfd, and keepalives hold the last frame meanwhile (the D-035 gap). **Evidence.**
+Live PipeWire, loopback receiver: pause → 1 razer OFF, **0 context switches in 5 s**, resume
+→ razer ON + frames, `gowl stop` → razer OFF ×2, exit 0 in 12 ms, pidfile removed; second
+`gowl music` → exit 1 "already running"; server unreachable → retries + keepalives, stop in
+14 ms. No allocation added to the window path (alloc_music still 0). **Alternatives.**
+`pa_mainloop_api->io_new` per fd (callbacks, re-registered on every reopen); a second
+thread (rule 5). **Revisit-if.** libpulse ever needs > 28 pollfds (then the hook falls back
+to polling libpulse's fds alone, losing ours until the next window — never seen).
+
+## D-043 — Pidfile + control commands (2026-10-17, phase 4, runtime agent)
+`$XDG_RUNTIME_DIR/gowl.pid`, created `O_EXCL`, content `PID\n`. Stale = pid dead
+(`kill(pid,0)` → ESRCH) or `/proc/PID/comm` not `gowl` (or this binary's own comm, so a
+renamed build works); a stale file is removed only if it still holds the pid just read; an
+empty file younger than 1 s is "another gowl starting" (the create→write window). Held by
+`screen`, `music` and `calibrate` (both walks): one session drives the lights at a time,
+and `gowl stop`/`toggle` end a calibration too. Signals go through a pidfd
+(`pidfd_open` + `pidfd_send_signal`), so a pid recycled between the check and the signal is
+never hit; `stop` (≤ 1 s) and `toggle` (≤ 500 ms) wait by polling the pidfd — no sleep loop
+(fallback to `kill` + 10 ms checks only on kernels < 5.3). `pause|resume|stop` with nothing
+running exit 1 ("no gowl sync is running"). `toggle [screen|music] [ARGS]` passes ARGS to
+the mode it starts (`gowl toggle music --reaction pulse` works as a keybind). Signals are
+blocked (signalfd) *before* the pidfile is claimed, so a `stop` racing startup is queued.
+Without XDG_RUNTIME_DIR a sync runs unclaimed with a warning.
+
+## D-044 — netwatch: rebind only on interface change or send errors; non-blocking re-verify (2026-10-17, phase 4, runtime agent)
+**Decision.** rtnetlink groups `RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV4_ROUTE`; content
+ignored; drained into an 8 KB stack buffer (ENOBUFS = "changed"). Debounce: 500 ms after the
+last event, capped at 2 s after the first (a flapping link still gets re-checked). Then one
+`getifaddrs` + `select_for` per device; a device is rebound only if its interface name,
+index or address changed (VPN up/down normally changes neither — the bound socket keeps
+working, nothing is sent), it had no LAN interface before, or its last send failed with
+ENETUNREACH/ENODEV/EADDRNOTAVAIL/ENETDOWN/EHOSTUNREACH (re-selection then retried at 0.25 →
+1 → 5 s, reset on the first good send). Rebind while live: new bound socket, razer ON,
+current colors resent; while paused/output-gone: socket only, razer waits for resume. No LAN
+interface: keep the old socket, one warning, recover when it is back. Device-IP re-verify
+(NETWORK.md): only after a rebind that changed the interface and only for devices with a
+known MAC: devStatus to the known IP (reply port bound on the LAN interface, socket in the
+poll set), 300 ms, then one scan (multicast + limited + directed broadcast; unicast only on
+loopback), 1 s, matched by MAC; a move is followed (razer ON) and written to the device
+cache, never to a config `ip =`. On the human's machine firewalld rejects replies, so this
+gives up silently after 1.3 s and ≤ 4 datagrams per rebind. **Evidence.**
+`tools/netns_vpn_test.py --bin` (new rebind check): LAN address moved lan0 → lan1 mid-stream,
+then a /25 VPN route over half the LAN: first lan1 datagram (razer ON) **0.511 s** after the
+move, keepalives continue on lan1 after the VPN route, razer OFF ×2 on lan1, **0 packets on
+vpn0**. Stable network: `GOWL_LOG=debug gowl screen` prints `netlink 0` every second (11 s
+shown), and `measure.py paused 20` (netlink fd in the poll set) = **0.0 context switches/s**.
+**Alternatives.** Parsing messages to filter (more code, the debounce + one getifaddrs per
+burst is already ~free); `SO_MARK`/fwmark (rule 11). **Revisit-if.** Wi-Fi drivers that
+spam RTM_NEWLINK (wireless events) show up as periodic debounce wakeups in the debug line.
+
+## D-045 — One `runtime::Streams` for screen, music and calibrate (2026-10-17, phase 4, runtime agent)
+Music's own `Lane` (socket + Sender + gate + reorder + send-error log) duplicated
+`runtime::Stream`; rebind, back-off and verify would have had to be written twice. Music now
+keeps only per-device render state (`Voice`: renderer, smoother) and pushes through
+`Streams::push`, exactly as screen does. `Streams::open(.., use_layout)`: screen honours a
+calibrated `layout` (zones already in segment order); music passes false and keeps
+`reverse`/`offset` as before (D-040: music renders in segment order). Behaviour changes:
+a failed razer ON in music is a warning (like screen), not a fatal error — music now keeps
+running and recovers when a kill switch is lifted; send errors are logged once per failing
+streak instead of every 5 s. Multi-device: `devices::resolve_many` — no DEV = default
+device; the same light named twice (alias + IP) is streamed to once (warning); screen
+groups devices by (segment count, layout) for one zone set each (unchanged), music renders
+per device from one analysis. Tested: tests/multi_device.rs (two fake_govee.py on 127.0.0.2
+/ .3, 10 and 6 segments, one reversed) and tests/alloc_music.rs (two devices, 0 allocs).
+
+## D-046 — Keepalive tuning walk (2026-10-17, phase 4, runtime agent)
+`gowl calibrate --keepalive [DEV]`: razer ON, a fixed two-tone frame (first half cyan, rest
+magenta — unlike any built-in scene, so a drop-out is obvious), repeated every 0.5, 1, 2, 3,
+5, 8 s; after each step "did it stay cyan + magenta the whole time?" (watch ≥ max(10 s, 3
+intervals)); razer ON again at each step so every step starts from stream mode; the first
+"n" ends it. Recommendation = 70 % of the longest interval held, rounded down to 10 ms
+(8 s → 5600, 0.5 s → 350); dropped out at 0.5 s → nothing saved, advice printed. `y` writes
+the global `keepalive_ms` with `config::set_global_key` (last global occurrence replaced in
+place, else inserted after the last global line, before the first section; every other byte
+kept; tests in config.rs and tests/calibrate_cli.rs). Runs on the same `line_loop` as the
+segment walk (stdin + timerfd + signalfd + netlink + verify). **Pending hardware:** the
+H6609's value goes here once the human has run it (it also unblocks D-034's passive stream).
+
+## D-047 — Phase 1 review leftovers fixed in Phase 4 (2026-10-17, phase 4, runtime agent)
+- `GOWL_PORT_BASE` now only applies to loopback targets (`Ports::for_ip`/`for_iface`): a
+  stray variable can never send real LAN traffic to odd ports; tests and the fake device
+  are loopback, so nothing else changes.
+- Labelled secondary addresses (`enp5s0:1`) map to the device name before
+  `SO_BINDTODEVICE`/`if_nametoindex` (`net::base_name`).
+- `scan --sweep` pacing: one datagram per millisecond by deadline, no longer early when
+  replies arrive; the sweep covers the interface's own subnet clipped to its /24 (a /28
+  no longer sweeps off-subnet hosts).
+- `doctor` hijack check accepts any address of the LAN interface as "no hijack".
+- Fake-device tests fail without python3 unless `GOWL_TEST_NO_PYTHON=1` opts out.
+- New tests: status source-IP filter and scan end to end (tests/net_e2e.rs, loopback).
+Still open (Phase 5): per-device port override (legacy `Device_Port`).

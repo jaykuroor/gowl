@@ -22,6 +22,12 @@ interface each packet actually left on.
     python3 tools/netns_vpn_test.py --bin target/release/gowl    # also the real binary
     exit 0 = every datagram stayed on the LAN interface
 
+With --bin it also checks the runtime rebind (netwatch): `gowl calibrate --keepalive`
+streams a fixed frame with 0.5 s keepalives on lan0; the LAN address then moves to a
+second interface (lan1) and a more specific VPN route for half the LAN appears. gowl
+must follow to lan1 within ~1 s (razer ON first), never send into vpn0, and end with
+razer OFF x2 on lan1.
+
 Needs: util-linux `unshare`, iproute2 `ip`, /dev/net/tun, unprivileged user namespaces
 (Fedora default). This does NOT emulate firewall-level kill switches (nftables drop
 rules) — no socket option can or should bypass those; see docs/NETWORK.md.
@@ -41,6 +47,7 @@ TUNSETIFF = 0x400454CA
 IFF_TUN, IFF_NO_PI = 0x0001, 0x1000
 SO_BINDTODEVICE = 25
 LAN_IF, VPN_IF = "lan0", "vpn0"
+LAN2_IF = "lan1"  # where the LAN address moves to in the rebind check (Wi-Fi roam, new dongle)
 LIGHT = "192.168.50.23"
 
 SETUP = f"""
@@ -48,6 +55,8 @@ set -e
 ip link set lo up
 ip tuntap add {LAN_IF} mode tun
 ip tuntap add {VPN_IF} mode tun
+ip tuntap add {LAN2_IF} mode tun
+ip link set {LAN2_IF} up multicast on
 ip addr add 192.168.50.1/24 dev {LAN_IF}
 ip addr add 10.2.0.2/32 dev {VPN_IF}
 ip link set {LAN_IF} up multicast on
@@ -132,6 +141,89 @@ def check_binary(fds: dict[str, int], binary: str) -> bool:
               f"vpn0 {len(on_vpn):2d} pkts  {'OK' if good else 'FAIL'}")
         if not good:
             print("    stderr:", proc.stderr.strip()[-400:])
+    return ok & check_rebind(fds, binary, env)
+
+
+RAZER_ON, RAZER_OFF = b"uwABsQEK", b"uwABsQAL"
+
+
+def collect(fds: dict[str, int], seconds: float, t0: float) -> list[tuple[float, str, bytes]]:
+    """(time since t0, iface, payload) for every UDP packet within `seconds`."""
+    import time
+    out = []
+    end = time.monotonic() + seconds
+    while (left := end - time.monotonic()) > 0:
+        ready, _, _ = select.select(list(fds.values()), [], [], left)
+        for name, fd in fds.items():
+            if fd not in ready:
+                continue
+            while True:
+                try:
+                    pkt = os.read(fd, 65535)
+                except BlockingIOError:
+                    break
+                if len(pkt) < 28 or pkt[0] >> 4 != 4 or pkt[9] != 17:
+                    continue
+                ihl = (pkt[0] & 0x0F) * 4
+                out.append((time.monotonic() - t0, name, pkt[ihl + 8:]))
+    return out
+
+
+def kind(payload: bytes) -> str:
+    return "ON" if RAZER_ON in payload else "OFF" if RAZER_OFF in payload else "frame"
+
+
+def check_rebind(fds: dict[str, int], binary: str, env: dict) -> bool:
+    """netwatch: follow the LAN address to another interface, ignore VPN routes."""
+    import signal
+    import time
+    fds = dict(fds, **{LAN2_IF: open_tun(LAN2_IF)})
+    drain(fds)
+    t0 = time.monotonic()
+    proc = subprocess.Popen([binary, "calibrate", "--keepalive"], env=env, stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    seen = collect(fds, 1.6, t0)
+    t_move = time.monotonic() - t0
+    subprocess.run(["sh", "-c", f"ip addr del 192.168.50.1/24 dev {LAN_IF} && "
+                    f"ip addr add 192.168.50.1/24 dev {LAN2_IF}"], check=True)
+    seen += collect(fds, 2.0, t0)
+    t_vpn = time.monotonic() - t0
+    # A VPN pushes a route for half the LAN (more specific than the /24) into the tunnel.
+    subprocess.run(["ip", "route", "add", "192.168.50.0/25", "dev", VPN_IF], check=True)
+    seen += collect(fds, 1.6, t0)
+    t_stop = time.monotonic() - t0
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    seen += collect(fds, 0.4, t0)
+    err = proc.stderr.read()
+
+    before = [(t, k) for t, n, p in seen if t < t_move for k in [kind(p)] if n == LAN_IF]
+    after = [(t, kind(p)) for t, n, p in seen if n == LAN2_IF]
+    on_vpn = [t for t, n, _ in seen if n == VPN_IF]
+    first_after = after[0][0] - t_move if after else None
+    checks = {
+        "razer ON first on lan0": bool(before) and before[0][1] == "ON",
+        "keepalive frames on lan0": sum(k == "frame" for _, k in before) >= 2,
+        "moved to lan1 within 1.2 s": first_after is not None and first_after <= 1.2,
+        "razer ON first on lan1": bool(after) and after[0][1] == "ON",
+        "keepalives on lan1 after the VPN route": sum(1 for t, k in after if t_vpn + 0.2 < t < t_stop and k == "frame") >= 2,
+        "razer OFF x2 last on lan1": [k for _, k in after[-2:]] == ["OFF", "OFF"],
+        "nothing on vpn0": not on_vpn,
+        "exit 0": proc.returncode == 0,
+    }
+    print(f"\nrebind (gowl calibrate --keepalive, address moves {LAN_IF} -> {LAN2_IF} at {t_move:.2f} s):")
+    print(f"  lan0 {len(before)} pkts before the move, lan1 {len(after)} pkts after "
+          f"(first {first_after if first_after is None else round(first_after, 3)} s after the move), "
+          f"vpn0 {len(on_vpn)} pkts")
+    ok = True
+    for label, good in checks.items():
+        ok &= good
+        print(f"  {label:42s} {'OK' if good else 'FAIL'}")
+    if not ok:
+        print("    stderr:", err.strip()[-800:])
     return ok
 
 

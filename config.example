@@ -12,7 +12,7 @@ saturation = 1.15
 screen_brightness = 0.75 # channel multiplier, 0-1
 smoothing = 0.55         # EMA alpha, higher = snappier
 threshold = 3            # min channel change that triggers a send
-keepalive_ms = 500       # resend interval on a static screen (tune per device in Phase 4)
+keepalive_ms = 500       # resend interval on a static screen; `gowl calibrate --keepalive` finds your light's
 
 # ---- music sync ----
 reaction = flow          # flow | pulse | energy_fill | band_split | center_burst | wave | bass_bounce | chase | twinkle | auto

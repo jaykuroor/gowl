@@ -12,7 +12,8 @@ Golden numbers: `tests/vectors/audio.json` (bands, AutoGain) and `tests/vectors/
   non-threaded `pa_mainloop` is iterated (blocking) on the main thread; ~18 hand-declared
   symbols, no callbacks — context/stream state is polled after each iteration and audio is
   copied out with `pa_stream_peek`/`pa_stream_drop` into the fixed 1024-sample window.
-  Stream flags: `PA_STREAM_ADJUST_LATENCY` only. Signals → `poll()` EINTR → stop flag.
+  Stream flags: `PA_STREAM_ADJUST_LATENCY` only. Signals → signalfd in the mainloop's own `poll()` (our `pa_poll_func`, D-042) → read returns
+  `Interrupted` → the loop handles stop / pause (stream closed) / resume (reopened).
 - Source `"@DEFAULT_MONITOR@"` (the default sink's monitor = what you hear).
 - Sample spec: `PA_SAMPLE_FLOAT32LE`, 48000 Hz, **1 channel** (server downmixes — cheaper
   than us doing it). `pa_buffer_attr.fragsize = 1024 * 4` bytes, others `u32::MAX`.

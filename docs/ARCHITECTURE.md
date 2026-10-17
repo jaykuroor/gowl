@@ -11,7 +11,8 @@ src/
   proto.rs       message templates, razer frame encoder, base64 encoder, reply scanner
   net.rs         UDP sockets bound to the LAN interface (VPN-proof, see NETWORK.md),
                  discovery, status query, Sender (per-device prealloc buffers)
-  netwatch.rs    rtnetlink change listener in the poll set → re-select interface, rebind
+  netwatch.rs    rtnetlink change listener in the poll set (debounce) + device-IP re-verify by MAC
+  control.rs     pidfile ($XDG_RUNTIME_DIR/gowl.pid), `gowl pause|resume|stop`, toggle helper (pidfd)
   doctor.rs      `gowl doctor` diagnostics
   color.rs       sRGB↔linear LUTs, zone mapping (port of led_mapping.py), saturation,
                  brightness, EMA smoother, resample, reverse/offset, delta check — all fixed-point
@@ -28,8 +29,9 @@ src/
     fft.rs       radix-2 real FFT, N=1024 (packed 512-pt complex), twiddles + Hann table
     bands.rs     band RMS (precomputed bin ranges), AutoGain
     render.rs    reactions × palettes (port of MusicPatternRenderer)
-  runtime.rs     poll loop (wayland fd, timerfd, signalfd), pidfile, pause/stop, keepalive
-  calibrate.rs   segment walk
+  runtime.rs     Signals/Timer/Ctl (signalfd + timerfd + netwatch), Streams (per-device socket,
+                 gate, reorder, razer, rebind, back-off) shared by every mode; screen poll loop
+  calibrate.rs   segment walk + keepalive tuning walk (stdin on the same Ctl loop)
 ```
 
 ## Screen-sync data flow (per captured frame)
@@ -86,7 +88,13 @@ frame even on a static screen; gowl gets no frames then, so after a change it ke
 stepping on the timer (at the frame rate) until `Smoother::settled` says the EMA has
 reached its fixed point, then stops (D-017). Busy screen: 3 wakeups per frame
 (timer → `capture_output`, `buffer_done` → copy, `ready` → process); see D-018.
-(netlink rebind is Phase 4; not in the loop yet.)
+netlink: drained into a stack buffer; a 500 ms debounce (capped at 2 s after the first
+event) arms the shared timerfd, then `Streams` re-runs interface selection and rebinds only
+devices whose interface name/index/address changed (or whose sends fail with
+ENETUNREACH/ENODEV/EADDRNOTAVAIL/ENETDOWN/EHOSTUNREACH, retried at 0.25 → 1 → 5 s). A rebind
+while live sends razer ON on the new socket and resends the current colors; if the device
+has a MAC, a non-blocking re-verify (devStatus, then a scan matched by MAC) joins the poll
+set (D-044). Stable network: the netlink fd never becomes readable — 0 wakeups.
 
 ## Music mode
 Record stream on `"@DEFAULT_MONITOR@"` (float32le, 48000 Hz, mono, fragsize 1024·4) via
@@ -97,6 +105,12 @@ AutoGain → render → smooth → brightness → reverse/offset → delta check
 set an `AtomicBool` via `sigaction` (no SA_RESTART), so the mainloop's `poll()` returns
 EINTR; a 1 s `alarm` watchdog covers the race before `poll()`. libpulse is `dlopen`ed so
 other modes never map it. Details: `AUDIO.md`.
+**Since Phase 4 (D-042):** no `sigaction`/`alarm`. The mainloop's poll function is ours
+(`pa_mainloop_set_poll_func`): one `poll()` over libpulse's fds plus signalfd, timerfd,
+netlink and the verify socket (`pulse::Hook`), so music honours pause/resume/stop and
+rebinds exactly like screen mode. Paused = stream closed, timer disarmed (0 wakeups). Sound
+server down = retry every 1 s on the timerfd while keepalives hold the last frame.
+Sending goes through the same `runtime::Streams` as screen mode.
 
 ## Numbers & formats
 - Linear light: `LUT_LIN16[256]: u16` (sRGB8 → linear × 65535). Zone sum in `u32`

@@ -63,10 +63,24 @@ with `nl_groups`, `recv` into a 8 KB stack buffer.
 Send errors (`ENETUNREACH`, `ENODEV`, `EADDRNOTAVAIL`, `ENETDOWN`) → same re-selection,
 with back-off 0.25 s → 1 s → 5 s, logged once per state change, not per packet.
 
+**Implemented (Phase 4, `src/netwatch.rs` + `runtime::Streams`, D-044).** A VPN coming up or
+down changes routes, not the LAN interface, so it normally triggers one `getifaddrs` and
+nothing else (the bound sockets keep working). A device is rebound only when its interface
+name, index or address changed (roam, re-plug, DHCP renumber) or its sends fail with the
+errors above (also `EHOSTUNREACH`). `tools/netns_vpn_test.py --bin` checks it: the LAN
+address moves from `lan0` to `lan1` mid-stream and a /25 VPN route covering half the LAN
+appears — gowl follows to `lan1` ~0.5 s after the move (razer ON first) with 0 packets on
+`vpn0`.
+
 **Device IP changed (DHCP):** sync can't notice silently (UDP). Re-verify only on network
 change events and on explicit `gowl scan`: unicast `devStatus` to the cached IP first (1
 datagram); if no reply in 300 ms, run a scan on the LAN interface and match by MAC.
 Recommend a DHCP reservation for the light in the README — it removes this whole class.
+Implemented as a non-blocking state machine (`netwatch::Verify`): it runs after a rebind
+that changed the interface, for devices with a known MAC, and gives up silently when no
+reply arrives (as on the human's machine, where firewalld rejects replies). A device found
+at a new IP is followed (razer ON) and the device cache is updated; a config `ip =` is not
+edited (a warning says so).
 
 ## Inbound replies and the firewall (Fedora `public` zone)
 Only `scan` and `status` need inbound UDP 4002. Sync, `on/off/color/...` are send-only and
