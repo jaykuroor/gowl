@@ -12,7 +12,7 @@ libc = { version = "0.2.191", default-features = false }
 count-alloc = []
 
 [profile.release]
-opt-level = 3
+opt-level = "s"
 lto = "fat"
 codegen-units = 1
 panic = "abort"

@@ -125,7 +125,7 @@ the timer holds only a stall guard (keepalive + ¼) for a monitor that stops del
 ## Release profile (put in Cargo.toml)
 ```toml
 [profile.release]
-opt-level = 3
+opt-level = "s"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
@@ -134,8 +134,8 @@ debug = false
 incremental = false
 ```
 `-C target-cpu=native` only via an opt-in `.cargo/config.toml` the human enables locally
-(the RPM build must stay portable). Try `opt-level = "s"` in Phase 5 and keep whichever
-measures better on CPU (binary size is secondary).
+(the RPM build must stay portable). Phase 5 measured `"s"` against `3`: same or slightly
+less CPU, 102 KB smaller binary → `"s"` (D-053).
 
 ## Errors & logging
 Own `enum Error` with `Display`; no panics on I/O paths; `?` everywhere. Logging = a

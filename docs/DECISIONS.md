@@ -553,3 +553,17 @@ System-wide: the USB DAC and the PipeWire graph can now suspend while `gowl musi
 **Not verified here:** reaction to real music (the human: `gowl music`, start/stop a song).
 **Revisit-if.** A PipeWire update keeps passive streams from resuming (music would stay dark);
 the fix is to drop the flag (one constant in pulse.rs).
+
+## D-053 — Release profile opt-level "s" (2026-10-17, phase 5, perf agent)
+ARCHITECTURE.md asked to try `"s"` against `3` and keep whichever measures better on CPU.
+**Evidence** (same desktop, fake device, `perf stat` over 20 s of S1, two alternating runs each):
+task-clock 62.5 / 62.8 ms (`3`) vs **58.2 / 59.4 ms** (`"s"`), user cycles 53.0M / 53.8M vs 51.1M / 50.7M.
+Music benches (`cargo test --release --lib -- --ignored bench`): render+AutoGain 41–43 vs 49 ns/frame
+(flow), 191–196 vs 184 ns (wave), 130 vs 171 ns (auto); window+FFT 3.55–3.84 vs 3.24 µs — all noise
+at ≤ 47 windows/s (≤ 0.02 % of a core). All 86 tests (vectors included) pass at `"s"`. Binary
+**743,016 → 640,616 B**; S1 RSS 8.84 → 8.55 MB (the binary's mapped text 600 → 560 KB).
+**Decision.** `opt-level = "s"`. **Revisit-if.** A profile shows a hot loop losing vectorization.
+Not tried, with reasons: `target-cpu=native` (user code is ~20 % of gowl's CPU, the rest is kernel time
+in poll/recvmsg/sendmsg; and the RPM must stay portable); `MADV_HUGEPAGE` on the SHM buffer
+(`shmem_enabled = never` on this kernel, and a huge page would map 2 MB per touched sample → more
+RSS); `MAP_POPULATE` (maps all 19.8 MB → RSS up, nothing saved per frame).
