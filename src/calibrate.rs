@@ -347,9 +347,16 @@ fn line_loop(sess: &mut dyn Session, streams: &mut Streams, ctl: &mut Ctl) -> Re
         let now = runtime::now_ns();
         if pfds[2].revents != 0 {
             while let Some(s) = ctl.sig.read() {
-                if s == Sig::Stop {
-                    println!();
-                    return Ok(false);
+                match s {
+                    Sig::Stop => {
+                        println!();
+                        return Ok(false);
+                    }
+                    Sig::Pause | Sig::Resume => {
+                        println!(
+                            "\n(gowl pause/resume don't apply to calibrate; q or `gowl stop` ends it)"
+                        );
+                    }
                 }
             }
         }

@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use super::bands::{Analyzer, AutoGain, SAMPLE_RATE};
 use super::fft::N;
-use super::pulse::{Capture, Hook, Pulse, ReadError};
+use super::pulse::{Capture, HOOK_ALL, Hook, Pulse, ReadError};
 use super::render::{Palette, Reaction, Renderer};
 use crate::Error;
 use crate::color::{self, Rgb, Smoother};
@@ -228,10 +228,25 @@ pub fn cmd_music(args: &[String]) -> Result<(), Error> {
 
 const MS: u64 = 1_000_000;
 // Hook slots.
-const H_SIG: usize = 0;
-const H_TIMER: usize = 1;
-const H_NET: usize = 2;
-const H_VERIFY: usize = 3;
+pub const H_SIG: usize = 0;
+pub const H_TIMER: usize = 1;
+pub const H_NET: usize = 2;
+pub const H_VERIFY: usize = 3;
+
+/// Open the monitor stream with only the signal slot of `hook` polled. A ready
+/// timerfd or netlink fd must not abort a half-made connection (they are
+/// level-triggered, so the loop sees them right after the open returns);
+/// `Interrupted` therefore always means "a signal is pending" (D-042, review fix).
+pub fn open_capture<'a>(
+    pulse: &'a Pulse,
+    hook: &'a Hook,
+    source: &std::ffi::CStr,
+) -> Result<Capture<'a>, ReadError> {
+    hook.set_active(1 << H_SIG);
+    let r = pulse.open(source, SAMPLE_RATE, (N * 4) as u32, hook);
+    hook.set_active(HOOK_ALL);
+    r
+}
 
 /// The music loop. States: streaming (blocked in the mainloop's poll, which also
 /// watches our fds), stream down (retry every second, keepalive the last frame) and
@@ -256,18 +271,26 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
 
     loop {
         hook.set_fd(H_VERIFY, music.streams.verify_fd());
-        // The timer carries network work always; while the stream is down (not
-        // paused) also the reopen retry and the keepalive of the last frame.
+        let opening = stream.is_none() && !paused && retry_at.is_some_and(|t| t <= now_ns());
+        // The timer carries network work always. Stream down (not paused, not
+        // opening right now): also the reopen retry and the keepalive of the last
+        // rendered frame. Stream open: a stall guard a quarter interval after a
+        // missed keepalive — windows normally send the keepalive first, so it only
+        // fires if the monitor stops delivering (sink suspended, device gone).
         let mut dl = ctl.net_deadline(&music.streams);
-        if stream.is_none() && !paused {
+        let ka = music.streams.keepalive_due_ms();
+        if stream.is_some() {
+            let grace = music.streams.keepalive_ms() / 4;
+            dl = min_opt(dl, ka.map(|t| (t + grace) * MS));
+        } else if !paused && !opening {
             dl = min_opt(dl, retry_at);
-            dl = min_opt(dl, music.streams.keepalive_due_ms().map(|t| t * MS));
+            dl = min_opt(dl, ka.map(|t| t * MS));
         }
         ctl.timer.arm(dl)?;
 
-        if stream.is_none() && !paused && retry_at.is_some_and(|t| t <= now_ns()) {
+        if opening {
             retry_at = None;
-            match pulse.open(SOURCE, SAMPLE_RATE, (N * 4) as u32, &hook) {
+            match open_capture(pulse, &hook, SOURCE) {
                 Ok(st) => {
                     if warned {
                         warn!("audio capture is back");
@@ -287,6 +310,7 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
                     silent = 0;
                     continue;
                 }
+                // A signal is pending: handle it below, then retry (unless paused/stopped).
                 Err(ReadError::Interrupted) => retry_at = Some(now_ns()),
                 Err(ReadError::Failed(e)) => {
                     if !warned {
@@ -374,7 +398,7 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
                         debug!("paused: stream closed, razer off");
                         paused = true;
                         stream = None;
-                        music.streams.razer(false);
+                        music.streams.off();
                     }
                     Sig::Resume if paused => {
                         debug!("resumed");
@@ -398,7 +422,8 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
             ctl.timer.drain();
             // Rebound devices got razer ON (gate reset): the next render sends.
             ctl.service_net(&mut music.streams, now);
-            if stream.is_none() && !paused {
+            if !paused {
+                // Only frames that were actually rendered are kept alive.
                 music.streams.keepalive(now / MS);
             }
         }

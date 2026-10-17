@@ -2,8 +2,8 @@
 //! tests/mock_wl (a fake compositor on a Unix socket given as WAYLAND_DISPLAY) and
 //! streams to a UDP receiver on loopback test ports. Checks the runtime contract:
 //! razer ON first, frames while the screen changes, keepalive only while it is
-//! static, pause = razer OFF + silence, resume = razer ON, output unplugged =
-//! razer OFF (once, like pause) + silence, replugged = razer ON + frames,
+//! static, pause = razer OFF ×2 + silence, resume = razer ON, output unplugged =
+//! razer OFF ×2 (like pause) + silence, replugged = razer ON + frames,
 //! SIGTERM = razer OFF ×2. Runtime control through the CLI: one instance per
 //! pidfile, `gowl pause|resume|stop`, `gowl toggle` (start and stop).
 
@@ -229,8 +229,8 @@ fn screen_against_mock_compositor() {
     // Static phase: keepalive only (500 ms) — about 2 datagrams per second.
     let ka = h.frames(1.4, 2.4);
     assert!((1..=3).contains(&ka), "static phase sent {ka}: {:?}", h.log);
-    // Pause: one razer OFF, then silence.
-    assert_eq!(h.kinds(2.5, 3.3), [&Kind::Off], "{:?}", h.log);
+    // Pause: razer OFF ×2, then silence.
+    assert_eq!(h.kinds(2.5, 3.3), [&Kind::Off, &Kind::Off], "{:?}", h.log);
     // Resume: razer ON and the current colors again.
     let resumed = h.kinds(3.3, 3.6);
     assert_eq!(resumed.first(), Some(&&Kind::On), "{:?}", h.log);
@@ -255,8 +255,8 @@ fn output_unplug_and_replug() {
     assert!(err.contains("output gone"), "{err}");
     assert!(err.contains("is back"), "{err}");
     assert!(h.frames(0.0, 1.5) >= 5, "{:?}", h.log);
-    // Unplugged: exactly one razer OFF, then nothing — no keepalives, no fade steps.
-    assert_eq!(h.kinds(1.5, 3.0), [&Kind::Off], "{:?}", h.log);
+    // Unplugged: razer OFF ×2, then nothing — no keepalives, no fade steps.
+    assert_eq!(h.kinds(1.5, 3.0), [&Kind::Off, &Kind::Off], "{:?}", h.log);
     // Replugged: razer ON first, then frames from the new output.
     let back = h.kinds(3.0, 4.0);
     assert_eq!(back.first(), Some(&&Kind::On), "{:?}", h.log);
@@ -280,7 +280,7 @@ fn cli_pause_resume_stop_and_one_instance() {
     let (code, _) = h.cli(&["pause"]); // idempotent: no second OFF
     assert_eq!(code, 0);
     h.collect(2.4);
-    assert_eq!(h.kinds(1.2, 2.4), [&Kind::Off], "{:?}", h.log);
+    assert_eq!(h.kinds(1.2, 2.4), [&Kind::Off, &Kind::Off], "{:?}", h.log);
     let (code, err) = h.cli(&["resume"]);
     assert_eq!(code, 0, "{err}");
     h.collect(2.8);

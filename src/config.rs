@@ -250,6 +250,30 @@ pub fn parse_layout(v: &str) -> Result<Vec<u8>, String> {
     Ok(cells)
 }
 
+/// What `parse` makes of a line that starts with `[`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Header<'a> {
+    /// `[device ALIAS]`: keys below belong to ALIAS.
+    Device(&'a str),
+    /// A well-formed header that isn't a device section: keys below are global.
+    Other,
+    /// No closing `]`: ignored, the current section continues.
+    Malformed,
+}
+
+fn header(line: &str) -> Option<Header<'_>> {
+    let l = line.split('#').next().unwrap_or("").trim();
+    let inner = l.strip_prefix('[')?;
+    let Some(inner) = inner.strip_suffix(']') else {
+        return Some(Header::Malformed);
+    };
+    let mut w = inner.split_whitespace();
+    Some(match (w.next(), w.next(), w.next()) {
+        (Some("device"), Some(alias), None) => Header::Device(alias),
+        _ => Header::Other,
+    })
+}
+
 /// The key of a `key = value` line (comment stripped), if it is one.
 fn line_key(line: &str) -> Option<&str> {
     let l = line.split('#').next()?.trim();
@@ -259,45 +283,79 @@ fn line_key(line: &str) -> Option<&str> {
     l.split_once('=').map(|(k, _)| k.trim())
 }
 
-/// Is this line the header `[device ALIAS]`?
-fn is_header_for(line: &str, alias: &str) -> bool {
-    let l = line.split('#').next().unwrap_or("").trim();
-    let Some(inner) = l.strip_prefix('[').and_then(|l| l.strip_suffix(']')) else {
-        return false;
+/// For each line, the device section it belongs to (`None` = global), exactly as
+/// `parse` sees it.
+fn sections(lines: &[String]) -> Vec<Option<&str>> {
+    let mut cur: Option<&str> = None;
+    lines
+        .iter()
+        .map(|l| {
+            match header(l) {
+                Some(Header::Device(a)) => cur = Some(a),
+                Some(Header::Other) => cur = None,
+                Some(Header::Malformed) | None => {}
+            }
+            cur
+        })
+        .collect()
+}
+
+/// The file's line ending: CRLF if any line uses it.
+fn eol_of(lines: &[String]) -> &'static str {
+    if lines.iter().any(|l| l.ends_with("\r\n")) {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+/// `key = value` with the line ending of the line it replaces (or the file's).
+fn key_line(key: &str, value: &str, old: Option<&str>, eol: &str) -> String {
+    let e = match old {
+        Some(o) if o.ends_with("\r\n") => "\r\n",
+        Some(o) if o.ends_with('\n') => "\n",
+        _ => eol,
     };
-    let mut w = inner.split_whitespace();
-    (w.next(), w.next(), w.next()) == (Some("device"), Some(alias), None)
+    format!("{key} = {value}{e}")
+}
+
+/// Insert `new` at `at`, giving an unterminated previous line its line ending.
+fn insert_line(lines: &mut Vec<String>, at: usize, new: String, eol: &str) {
+    if let Some(prev) = lines.get_mut(at.wrapping_sub(1))
+        && !prev.ends_with('\n')
+    {
+        prev.push_str(eol);
+    }
+    lines.insert(at, new);
 }
 
 /// Set `keys` in the `[device ALIAS]` section of config `text`, leaving every
 /// other byte as it was: an existing `key =` line is replaced in place, a missing
 /// one goes after the section's last non-blank line. The last header for ALIAS
-/// wins, like `parse`. `None` if there is no such section.
+/// wins, like `parse`; the section ends at the next well-formed header (a
+/// malformed one doesn't end it, as in `parse`). `None` if there is no such section.
 pub fn set_device_keys(text: &str, alias: &str, keys: &[(&str, String)]) -> Option<String> {
     let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
-    let head = lines.iter().rposition(|l| is_header_for(l, alias))?;
+    let eol = eol_of(&lines);
+    let head = lines
+        .iter()
+        .rposition(|l| header(l) == Some(Header::Device(alias)))?;
     let end = lines[head + 1..]
         .iter()
-        .position(|l| l.trim_start().starts_with('['))
+        .position(|l| matches!(header(l), Some(Header::Device(_) | Header::Other)))
         .map_or(lines.len(), |p| head + 1 + p);
     let mut insert_at = lines[head + 1..end]
         .iter()
         .rposition(|l| !l.trim().is_empty())
         .map_or(head + 1, |p| head + 2 + p);
     for (k, v) in keys {
-        let new = format!("{k} = {v}\n");
         match (head + 1..end)
             .rev()
             .find(|&i| line_key(&lines[i]) == Some(k))
         {
-            Some(i) => lines[i] = new,
+            Some(i) => lines[i] = key_line(k, v, Some(&lines[i]), eol),
             None => {
-                if let Some(prev) = lines.get_mut(insert_at.wrapping_sub(1))
-                    && !prev.ends_with('\n')
-                {
-                    prev.push('\n');
-                }
-                lines.insert(insert_at, new);
+                insert_line(&mut lines, insert_at, key_line(k, v, None, eol), eol);
                 insert_at += 1;
             }
         }
@@ -306,29 +364,30 @@ pub fn set_device_keys(text: &str, alias: &str, keys: &[(&str, String)]) -> Opti
 }
 
 /// Set the global `key = value` in config `text`, leaving every other byte as it
-/// was: the last `key =` line before the first section is replaced in place; if
-/// there is none, the line goes after the last non-blank global line (before the
-/// first `[device …]` section, or at the end of a file without sections).
+/// was. "Global" is what `parse` treats as global: lines before the first device
+/// section and lines after a non-device section header. The last such `key =`
+/// line (the one `parse` keeps) is replaced in place; if there is none, the line
+/// goes after the last non-blank line before the first `[device …]` section (or
+/// at the end of a file without one). Line endings (LF/CRLF) are kept.
 pub fn set_global_key(text: &str, key: &str, value: &str) -> String {
     let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
-    let end = lines
-        .iter()
-        .position(|l| l.trim_start().starts_with('['))
-        .unwrap_or(lines.len());
-    let new = format!("{key} = {value}\n");
-    match (0..end).rev().find(|&i| line_key(&lines[i]) == Some(key)) {
-        Some(i) => lines[i] = new,
+    let eol = eol_of(&lines);
+    let sec = sections(&lines);
+    let found = (0..lines.len())
+        .rev()
+        .find(|&i| sec[i].is_none() && line_key(&lines[i]) == Some(key));
+    match found {
+        Some(i) => lines[i] = key_line(key, value, Some(&lines[i]), eol),
         None => {
+            let end = lines
+                .iter()
+                .position(|l| matches!(header(l), Some(Header::Device(_))))
+                .unwrap_or(lines.len());
             let at = lines[..end]
                 .iter()
                 .rposition(|l| !l.trim().is_empty())
                 .map_or(0, |p| p + 1);
-            if let Some(prev) = lines.get_mut(at.wrapping_sub(1))
-                && !prev.ends_with('\n')
-            {
-                prev.push('\n');
-            }
-            lines.insert(at, new);
+            insert_line(&mut lines, at, key_line(key, value, None, eol), eol);
         }
     }
     lines.concat()
@@ -344,14 +403,34 @@ pub fn read_text(path: &std::path::Path) -> Result<String, crate::Error> {
 }
 
 /// Write the config through a sibling file + rename: a crash never leaves a
-/// half-written config.
+/// half-written config. A symlinked config stays a symlink (the target is
+/// written), and the file keeps its permissions.
 pub fn write_atomic(path: &std::path::Path, text: &str) -> Result<(), crate::Error> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| crate::Error::Io("create config dir", e))?;
+    use crate::Error;
+    let target = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => match std::fs::canonicalize(path) {
+            Ok(t) => t,
+            // Dangling link: write where it points.
+            Err(_) => {
+                let l = std::fs::read_link(path).map_err(|e| Error::Io("read config link", e))?;
+                match path.parent() {
+                    Some(d) if l.is_relative() => d.join(l),
+                    _ => l,
+                }
+            }
+        },
+        _ => path.to_path_buf(),
+    };
+    if let Some(dir) = target.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| Error::Io("create config dir", e))?;
     }
-    let tmp = path.with_extension("gowl-tmp");
-    std::fs::write(&tmp, text).map_err(|e| crate::Error::Io("write config", e))?;
-    std::fs::rename(&tmp, path).map_err(|e| crate::Error::Io("rename config", e))
+    let perms = std::fs::metadata(&target).ok().map(|m| m.permissions());
+    let tmp = target.with_extension("gowl-tmp");
+    std::fs::write(&tmp, text).map_err(|e| Error::Io("write config", e))?;
+    if let Some(p) = perms {
+        std::fs::set_permissions(&tmp, p).map_err(|e| Error::Io("chmod config", e))?;
+    }
+    std::fs::rename(&tmp, &target).map_err(|e| Error::Io("rename config", e))
 }
 
 #[cfg(test)]
@@ -451,5 +530,72 @@ mod tests {
         let c = parse(&k(text), &mut |_, _| {}); // unknown keys only warn
         assert_eq!(c.keepalive_ms, 2100);
         assert_eq!(c.devices.len(), 1);
+    }
+
+    #[test]
+    fn rewrites_follow_parse_sections_and_keep_crlf() {
+        let k = |t: &str| set_global_key(t, "keepalive_ms", "2100");
+        // Keys after an unknown section are global for parse, so they are found.
+        let text = "fps = 30\n[device a]\nip = 1.2.3.4\n[extras]\nkeepalive_ms = 9\n";
+        let out = k(text);
+        assert_eq!(
+            out,
+            "fps = 30\n[device a]\nip = 1.2.3.4\n[extras]\nkeepalive_ms = 2100\n"
+        );
+        assert_eq!(parse(&out, &mut |_, _| {}).keepalive_ms, 2100);
+        // A malformed header doesn't end the device section: its keys stay the device's.
+        let text = "[device a]\n[oops\nkeepalive_ms = 9\n";
+        let out = k(text);
+        assert_eq!(
+            out,
+            "keepalive_ms = 2100\n[device a]\n[oops\nkeepalive_ms = 9\n"
+        );
+        assert_eq!(parse(&out, &mut |_, _| {}).keepalive_ms, 2100);
+        let d = set_device_keys(text, "a", &[("segments", "4".into())]).unwrap();
+        assert_eq!(d, "[device a]\n[oops\nkeepalive_ms = 9\nsegments = 4\n");
+        // CRLF: replaced and inserted lines keep CRLF, the rest is untouched.
+        let text = "fps = 30\r\nkeepalive_ms = 5\r\n\r\n[device a]\r\nip = 1.2.3.4\r\n";
+        assert_eq!(
+            k(text),
+            "fps = 30\r\nkeepalive_ms = 2100\r\n\r\n[device a]\r\nip = 1.2.3.4\r\n"
+        );
+        assert_eq!(
+            k("fps = 30\r\n[device a]\r\n"),
+            "fps = 30\r\nkeepalive_ms = 2100\r\n[device a]\r\n"
+        );
+        assert_eq!(
+            set_device_keys("[device a]\r\nip = 1.2.3.4", "a", &[("layout", "5".into())]),
+            Some("[device a]\r\nip = 1.2.3.4\r\nlayout = 5\r\n".into())
+        );
+    }
+
+    #[test]
+    fn write_atomic_keeps_symlinks_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("gowl-cfg-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("dotfiles")).unwrap();
+        let real = d.join("dotfiles/gowl.conf");
+        std::fs::write(&real, "fps = 30\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = d.join("config");
+        std::os::unix::fs::symlink("dotfiles/gowl.conf", &link).unwrap();
+        write_atomic(&link, "fps = 20\n").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "fps = 20\n");
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // A new file is created normally.
+        write_atomic(&d.join("new/config"), "x = 1\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.join("new/config")).unwrap(),
+            "x = 1\n"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

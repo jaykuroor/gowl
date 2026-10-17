@@ -636,7 +636,10 @@ pub fn scan(
             };
             fire(&socks[si], SocketAddrV4::new(Ipv4Addr::from(host), port));
             sweep_i += 1;
-            next_fire += pace;
+            // Paced by deadline, but never more than one slot behind: after a stall
+            // (slow poll wakeup) the sweep resumes at 1/ms instead of bursting.
+            let now = Instant::now();
+            next_fire = (next_fire + pace).max(now.checked_sub(pace).unwrap_or(now));
             if sweep_i == sweep_total {
                 deadline = Instant::now() + timeout;
             }

@@ -62,13 +62,21 @@ const NO_FD: libc::pollfd = libc::pollfd {
 /// same thread while the caller holds a shared reference.
 pub struct Hook {
     fds: Cell<[libc::pollfd; HOOK_FDS]>,
+    /// Bit i set = slot i is polled. Slots outside the mask are left alone, so a
+    /// level-triggered fd that is ready (an expired timerfd) can't make the
+    /// mainloop spin or abort a connect that only cares about signals.
+    active: Cell<u8>,
     fired: Cell<bool>,
 }
+
+/// Every slot polled.
+pub const HOOK_ALL: u8 = (1 << HOOK_FDS) - 1;
 
 impl Default for Hook {
     fn default() -> Self {
         Hook {
             fds: Cell::new([NO_FD; HOOK_FDS]),
+            active: Cell::new(HOOK_ALL),
             fired: Cell::new(false),
         }
     }
@@ -79,6 +87,11 @@ impl Hook {
         let mut f = self.fds.get();
         f[i].fd = fd;
         self.fds.set(f);
+    }
+
+    /// Poll only the slots in `mask` (bit i = slot i) until changed again.
+    pub fn set_active(&self, mask: u8) {
+        self.active.set(mask & HOOK_ALL);
     }
 
     /// One of our fds was ready during the last poll.
@@ -98,9 +111,39 @@ impl Hook {
         ev
     }
 
-    /// Block on our fds alone (no stream open). EINTR counts as "nothing ready".
-    pub fn wait(&self, timeout_ms: c_int) -> std::io::Result<()> {
+    /// The active slots as pollfds (inactive ones as fd -1, which poll ignores).
+    fn polled(&self) -> [libc::pollfd; HOOK_FDS] {
         let mut f = self.fds.get();
+        let mask = self.active.get();
+        for (i, p) in f.iter_mut().enumerate() {
+            if mask & (1 << i) == 0 {
+                p.fd = -1;
+            }
+            p.revents = 0;
+        }
+        f
+    }
+
+    /// Record the revents of a poll over `polled()`; true if any slot fired.
+    fn record(&self, got: &[libc::pollfd]) -> c_int {
+        let mut f = self.fds.get();
+        let mut hits = 0;
+        for (p, g) in f.iter_mut().zip(got) {
+            if g.fd >= 0 && g.revents != 0 {
+                p.revents = g.revents;
+                hits += 1;
+            }
+        }
+        if hits > 0 {
+            self.fds.set(f);
+            self.fired.set(true);
+        }
+        hits
+    }
+
+    /// Block on our active fds alone (no stream open). EINTR = nothing ready.
+    pub fn wait(&self, timeout_ms: c_int) -> std::io::Result<()> {
+        let mut f = self.polled();
         // SAFETY: valid pollfd array of HOOK_FDS entries.
         let r = unsafe { libc::poll(f.as_mut_ptr(), HOOK_FDS as libc::nfds_t, timeout_ms) };
         if r < 0 {
@@ -111,36 +154,43 @@ impl Hook {
                 Err(e)
             };
         }
-        if r > 0 {
-            self.fired.set(true);
-        }
-        self.fds.set(f);
+        self.record(&f);
         Ok(())
     }
 }
 
-/// `pa_poll_func`: poll libpulse's fds and the hook's in one call. Returns the
-/// number of *libpulse* fds with events (its dispatch counts down from that).
+/// `pa_poll_func`: poll libpulse's fds and the hook's active ones in one call.
+/// Returns the number of *libpulse* fds with events (its dispatch counts down
+/// from that).
 unsafe extern "C" fn hook_poll(
     ufds: *mut libc::pollfd,
     nfds: c_ulong,
     timeout: c_int,
     ud: *mut c_void,
 ) -> c_int {
-    const MAX: usize = 32;
     // SAFETY: `ud` is the `&Hook` registered with this mainloop; the Capture that
     // owns the mainloop borrows it, so it outlives every call.
     let hook = unsafe { &*(ud as *const Hook) };
-    let n = nfds as usize;
+    let theirs: &mut [libc::pollfd] = if nfds == 0 || ufds.is_null() {
+        &mut []
+    } else {
+        // SAFETY: libpulse passes `nfds` valid pollfds.
+        unsafe { std::slice::from_raw_parts_mut(ufds, nfds as usize) }
+    };
+    poll_both(hook, theirs, timeout)
+}
+
+/// The body of [`hook_poll`], on safe slices (tested directly).
+fn poll_both(hook: &Hook, theirs: &mut [libc::pollfd], timeout: c_int) -> c_int {
+    const MAX: usize = 32;
+    let n = theirs.len();
     if n + HOOK_FDS > MAX {
         // Never seen (libpulse uses a handful of fds); stay correct without ours.
-        // SAFETY: forwarding libpulse's own array.
-        return unsafe { libc::poll(ufds, nfds as libc::nfds_t, timeout) };
+        // SAFETY: libpulse's own array, `n` entries.
+        return unsafe { libc::poll(theirs.as_mut_ptr(), n as libc::nfds_t, timeout) };
     }
     let mut all = [NO_FD; MAX];
-    all[..HOOK_FDS].copy_from_slice(&hook.fds.get());
-    // SAFETY: libpulse passes `nfds` valid pollfds.
-    let theirs = unsafe { std::slice::from_raw_parts_mut(ufds, n) };
+    all[..HOOK_FDS].copy_from_slice(&hook.polled());
     all[HOOK_FDS..HOOK_FDS + n].copy_from_slice(theirs);
     // SAFETY: `all` holds HOOK_FDS + n valid entries.
     let r = unsafe { libc::poll(all.as_mut_ptr(), (HOOK_FDS + n) as libc::nfds_t, timeout) };
@@ -150,14 +200,7 @@ unsafe extern "C" fn hook_poll(
     for (t, a) in theirs.iter_mut().zip(&all[HOOK_FDS..]) {
         t.revents = a.revents;
     }
-    let mut ours = [NO_FD; HOOK_FDS];
-    ours.copy_from_slice(&all[..HOOK_FDS]);
-    let hits = ours.iter().filter(|p| p.revents != 0).count() as c_int;
-    if hits > 0 {
-        hook.fds.set(ours);
-        hook.fired.set(true);
-    }
-    r - hits
+    r - hook.record(&all[..HOOK_FDS])
 }
 
 /// Declares the function table and its loader together, so each C signature is
@@ -477,6 +520,60 @@ impl Drop for Capture<'_> {
                 (f.context_unref)(self.c);
             }
             (f.mainloop_free)(self.m);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pipe_with_data() -> (c_int, c_int) {
+        let mut fds = [0; 2];
+        // SAFETY: valid 2-int array; then 1 byte written so the read end is readable.
+        unsafe {
+            assert_eq!(libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC), 0);
+            assert_eq!(libc::write(fds[1], b"x".as_ptr().cast(), 1), 1);
+        }
+        (fds[0], fds[1])
+    }
+
+    #[test]
+    fn inactive_slots_neither_fire_nor_wake() {
+        let (ready, w1) = pipe_with_data(); // stands in for an expired timerfd
+        let mut quiet = [0; 2];
+        // SAFETY: valid array.
+        unsafe { libc::pipe2(quiet.as_mut_ptr(), libc::O_CLOEXEC) };
+        let hook = Hook::default();
+        hook.set_fd(0, quiet[0]); // "signalfd": nothing pending
+        hook.set_fd(1, ready);
+        // Signal-only (what an open uses): the ready timer is ignored, poll times out.
+        hook.set_active(1 << 0);
+        let mut theirs: [libc::pollfd; 0] = [];
+        let t = std::time::Instant::now();
+        assert_eq!(poll_both(&hook, &mut theirs, 50), 0);
+        assert!(!hook.fired(), "a ready timer must not interrupt an open");
+        assert!(t.elapsed() >= std::time::Duration::from_millis(45));
+        // All slots: the timer fires and is reported, not counted as libpulse's.
+        hook.set_active(HOOK_ALL);
+        let (lp, w2) = pipe_with_data();
+        let mut theirs = [libc::pollfd {
+            fd: lp,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        assert_eq!(poll_both(&hook, &mut theirs, 50), 1);
+        assert!(hook.fired());
+        assert_ne!(theirs[0].revents, 0);
+        let ev = hook.take();
+        assert_ne!(ev[1], 0);
+        assert_eq!(ev[0], 0);
+        assert!(!hook.fired());
+        // SAFETY: closing fds we created.
+        unsafe {
+            for fd in [ready, w1, quiet[0], quiet[1], lp, w2] {
+                libc::close(fd);
+            }
         }
     }
 }

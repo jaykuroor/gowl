@@ -50,7 +50,7 @@ pub fn now_ns() -> u64 {
 /// What a signal asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sig {
-    /// SIGINT / SIGTERM / SIGHUP.
+    /// SIGINT / SIGTERM / SIGHUP / SIGQUIT.
     Stop,
     /// SIGUSR1.
     Pause,
@@ -58,7 +58,7 @@ pub enum Sig {
     Resume,
 }
 
-/// signalfd for INT/TERM/HUP/USR1/USR2 (blocked for normal delivery).
+/// signalfd for INT/TERM/HUP/QUIT/USR1/USR2 (blocked for normal delivery).
 pub struct Signals {
     fd: OwnedFd,
 }
@@ -75,6 +75,7 @@ impl Signals {
                 libc::SIGHUP,
                 libc::SIGUSR1,
                 libc::SIGUSR2,
+                libc::SIGQUIT,
             ] {
                 libc::sigaddset(&mut set, s);
             }
@@ -113,7 +114,9 @@ impl Signals {
                 return None;
             }
             match si.ssi_signo as i32 {
-                libc::SIGINT | libc::SIGTERM | libc::SIGHUP => return Some(Sig::Stop),
+                libc::SIGINT | libc::SIGTERM | libc::SIGHUP | libc::SIGQUIT => {
+                    return Some(Sig::Stop);
+                }
                 libc::SIGUSR1 => return Some(Sig::Pause),
                 libc::SIGUSR2 => return Some(Sig::Resume),
                 _ => continue,
@@ -352,6 +355,10 @@ impl Streams {
                 no_lan: false,
             });
         }
+        emergency::install();
+        for (i, s) in devs.iter().enumerate() {
+            emergency::set(i, s.sock.as_raw_fd(), s.sender.dst);
+        }
         Ok(Streams {
             devs,
             keepalive_ms: u64::from(keepalive_ms),
@@ -379,11 +386,16 @@ impl Streams {
         }
     }
 
-    /// Shutdown contract (SPEC.md): razer OFF twice, 10 ms apart.
-    pub fn shutdown(&mut self) {
+    /// Razer OFF twice, 10 ms apart (UDP): stop, pause and output-lost alike.
+    pub fn off(&mut self) {
         self.razer(false);
         std::thread::sleep(Duration::from_millis(10));
         self.razer(false);
+    }
+
+    /// Shutdown contract (SPEC.md): razer OFF ×2.
+    pub fn shutdown(&mut self) {
+        self.off();
     }
 
     /// Keepalive interval for every device (`calibrate --keepalive` steps).
@@ -404,12 +416,21 @@ impl Streams {
         self.after_send(r, now_ms)
     }
 
-    /// Resend to devices whose keepalive is due.
+    /// Resend to devices whose keepalive is due. A device that has no frame since
+    /// razer ON is skipped: a keepalive only repeats what was really sent (rule 7).
     pub fn keepalive(&mut self, now_ms: u64) {
         for i in 0..self.devs.len() {
+            if self.devs[i].last_ms.is_none() {
+                continue;
+            }
             let r = self.devs[i].maybe_send(now_ms);
             self.after_send(r, now_ms);
         }
+    }
+
+    /// The keepalive interval (ms; 0 = off).
+    pub fn keepalive_ms(&self) -> u64 {
+        self.keepalive_ms
     }
 
     fn after_send(&mut self, r: Sent, now_ms: u64) -> bool {
@@ -525,6 +546,7 @@ impl Streams {
             } else {
                 debug!("{}: sends failed; new socket on {}", s.label, sel.iface);
             }
+            emergency::set(i, sock.as_raw_fd(), s.sender.dst);
             s.sock = sock;
             s.no_lan = false;
             s.net_down = false;
@@ -571,6 +593,7 @@ impl Streams {
                 s.label, m.to, m.from
             );
             s.sender.dst.set_ip(m.to);
+            emergency::set(m.dev, s.sock.as_raw_fd(), s.sender.dst);
             if live {
                 s.razer(true);
             }
@@ -585,6 +608,92 @@ impl Streams {
             }
         }
         !moved.is_empty()
+    }
+}
+
+impl Drop for Streams {
+    fn drop(&mut self) {
+        for (i, s) in self.devs.iter().enumerate() {
+            emergency::clear(i, s.sock.as_raw_fd());
+        }
+    }
+}
+
+/// Razer OFF from a panic hook: `panic = "abort"` skips `shutdown()`, so the
+/// devices' fds and addresses live in a static table the hook reads (D-048).
+mod emergency {
+    use std::net::SocketAddrV4;
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicI32, AtomicU16, AtomicU32, Ordering};
+
+    const MAX: usize = 16;
+    static FD: [AtomicI32; MAX] = [const { AtomicI32::new(-1) }; MAX];
+    static IP: [AtomicU32; MAX] = [const { AtomicU32::new(0) }; MAX];
+    static PORT: [AtomicU16; MAX] = [const { AtomicU16::new(0) }; MAX];
+
+    pub fn set(i: usize, fd: i32, dst: SocketAddrV4) {
+        if i < MAX {
+            IP[i].store(u32::from(*dst.ip()), Ordering::SeqCst);
+            PORT[i].store(dst.port(), Ordering::SeqCst);
+            FD[i].store(fd, Ordering::SeqCst);
+        }
+    }
+
+    /// Forget slot `i` if it still holds `fd` (a newer Streams may own it).
+    pub fn clear(i: usize, fd: i32) {
+        if i < MAX {
+            let _ = FD[i].compare_exchange(fd, -1, Ordering::SeqCst, Ordering::SeqCst);
+        }
+    }
+
+    pub fn send_off() {
+        send_off_slots(0..MAX);
+    }
+
+    pub fn send_off_slots(slots: std::ops::Range<usize>) {
+        let mut m = [0u8; 64];
+        let n = crate::proto::razer_msg(&crate::proto::razer_mode_frame(false), &mut m);
+        for _ in 0..2 {
+            for i in slots.clone() {
+                let fd = FD[i].load(Ordering::SeqCst);
+                if fd < 0 {
+                    continue;
+                }
+                let addr = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as libc::sa_family_t,
+                    sin_port: PORT[i].load(Ordering::SeqCst).to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: IP[i].load(Ordering::SeqCst).to_be(),
+                    },
+                    sin_zero: [0; 8],
+                };
+                // SAFETY: fd is a live UDP socket of a Streams (or a stale number:
+                // EBADF/ENOTSOCK, harmless); buffer and address are valid.
+                unsafe {
+                    libc::sendto(
+                        fd,
+                        m.as_ptr().cast(),
+                        n,
+                        0,
+                        (&raw const addr).cast(),
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    );
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Chain a hook that sends razer OFF ×2 before the default panic report.
+    pub fn install() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                send_off();
+                prev(info);
+            }));
+        });
     }
 }
 
@@ -896,7 +1005,7 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
                         paused = true;
                         cap.cancel()?;
                         next_capture = None;
-                        pipe.streams.razer(false);
+                        pipe.streams.off();
                     }
                     Sig::Resume if paused => {
                         debug!("resumed");
@@ -926,7 +1035,7 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
                 waiting = true;
                 next_capture = None;
                 if !paused {
-                    pipe.streams.razer(false);
+                    pipe.streams.off();
                 }
             }
             if st.found {
@@ -1034,6 +1143,7 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
 mod tests {
     use super::*;
     use crate::devices::SegSource;
+    use std::net::SocketAddr;
 
     fn razer_on() -> Vec<u8> {
         let mut m = [0u8; 64];
@@ -1120,5 +1230,26 @@ mod tests {
         // The netlink debounce asks for an earlier reselect: the earlier one wins.
         s.request_reselect(10 * MS);
         assert_eq!(s.net_deadline(), Some(10 * MS));
+    }
+
+    #[test]
+    fn panic_path_sends_razer_off_twice_from_the_static_table() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let SocketAddr::V4(dst) = rx.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        emergency::set(15, tx.as_raw_fd(), dst);
+        emergency::send_off_slots(15..16); // only our slot: other tests run in parallel
+        emergency::clear(15, tx.as_raw_fd());
+        let mut off = [0u8; 64];
+        let n = crate::proto::razer_msg(&crate::proto::razer_mode_frame(false), &mut off);
+        let mut buf = [0u8; 128];
+        for _ in 0..2 {
+            let k = rx.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..k], &off[..n]);
+        }
     }
 }
