@@ -15,8 +15,8 @@ threshold = 3            # min channel change that triggers a send
 keepalive_ms = 500       # resend interval on a static screen (tune per device in Phase 4)
 
 # ---- music sync ----
-reaction = flow          # flow | pulse | energy_fill | band_split | center_burst | wave | bass_bounce | chase | twinkle
-palette = rgb            # rgb | rainbow | aurora | sunset | ocean | neon | jewel | fire | spectrum | warm | cool | mono
+reaction = flow          # flow | pulse | energy_fill | band_split | center_burst | wave | bass_bounce | chase | twinkle | auto
+palette = rgb            # rgb | auto | rainbow | aurora | sunset | ocean | neon | jewel | fire | spectrum | warm | cool | mono
 music_fps = 60
 music_gain = 1.7
 music_brightness = 0.85

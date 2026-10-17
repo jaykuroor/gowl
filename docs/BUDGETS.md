@@ -49,6 +49,9 @@ build with `CARGO_PROFILE_RELEASE_DEBUG=true CARGO_PROFILE_RELEASE_STRIP=false` 
 ## Results log (append; newest first)
 | Date | Commit | Scenario | CPU % | Wakeups/s | RSS MB | Pkts/s | niri Δ CPU % | Notes |
 |---|---|---|---|---|---|---|---|---|
+| 2026-10-17 | 544d0b5 | music, playback paused (silence) | 0.167 | 48.2 | 5.87 | 1.97 | 7.63 abs | fake; keepalive only (gate); 1 thread; binary 587,336 B |
+| 2026-10-17 | 35f59eb | **S3** music (flow/rgb, browser playing) | 0.400 | 52.0 (47 voluntary = 1/window + ~4 involuntary preemptions) | 5.95 | 39.77 | 12.33 abs | fake; libpulse non-threaded mainloop (D-030); 1 thread; 92 B/frame; libpulse mapped (music only) |
+| 2026-10-17 | 6ef38ca | S3 music, pa_simple variant (superseded) | 0.500 | 100.5 | 6.05 | 40.00 | 15.80 abs | fake; 2 threads (pa_simple mainloop thread) → replaced, D-030 |
 | 2026-10-17 | phase1 review fixes | — | — | — | — | — | — | release binary 529,960 B after review fixes |
 | 2026-10-17 | b5f9b15 | one-shot | — | — | 2.7 (maxrss) | 1 | — | stripped release binary **538,152 B** (target ≤ 800 KB); deps: libc only; `gowl color` / `status` to fake device < 10 ms wall (`/usr/bin/time` resolution 10 ms) |
 | 2026-10-17 | recon | — | — | — | — | — | — | hello-world release binary 296,480 B (release profile from ARCHITECTURE.md) |

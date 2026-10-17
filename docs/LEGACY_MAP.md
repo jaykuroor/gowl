@@ -9,7 +9,7 @@ Paths relative to `legacy/lumisync/`. Read only the files marked **port**.
 | `led_mapping.py` (`generate_screen_mapping`, `_largest_remainder_counts`, `normalize_rect`) | **port** | `color.rs` — settings/legacy-mapping parsers dropped |
 | `sync/processing.py` | **port** | `color.rs` + `capture/sample.rs` (fixed-point) |
 | `sync/monitor.py` (loop only) | **port** | `runtime.rs` — capture code replaced by `capture/` |
-| `sync/music.py` (loop only) | **port** | `audio/mod.rs` |
+| `sync/music.py` (loop only) | **port** | `audio/run.rs` (+ `audio/pulse.rs` capture) |
 | `sync/audio.py` | **port** (subset, see AUDIO.md) | `audio/{fft,bands,render}.rs` |
 | `sku_catalog.py` (`BUILTIN` table only) | **port** | `devices.rs` — Govee Desktop cache import dropped (Windows-only) |
 | `config/options.py` | **port values** | defaults in `config.rs` |

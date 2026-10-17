@@ -128,3 +128,77 @@ and uses the payload `ip` only if it is on the receiving interface's subnet; the
 `zone_bounds`, alloc test asserts frames were actually sent.
 Evidence: tests 30/30, netns `--bin` PASS, binary 529,960 B.
 Revisit-if: devices on a different subnet behind a router are ever needed (they are out of scope).
+
+## D-030 — Music capture: libpulse's non-threaded mainloop on our thread, not pa_simple (2026-10-17, phase 3, audio agent)
+Context: AUDIO.md/CLAUDE.md name `libpulse-simple` (4 symbols). Measured with it (commit 6ef38ca):
+`tools/measure.py music 20 --fake` → 100.5 ctx switches/s, 2 threads — pa_simple runs its own
+`pa_threaded_mainloop`, so each 21.3 ms fragment wakes two threads (budget S3: ≤ 50/s). Its read also
+waits on a condition variable, which a signal cannot interrupt (only the next fragment ends it).
+Decision: `dlopen("libpulse.so.0")` (same `pulseaudio-libs` package; libpulse-simple is a thin wrapper
+around it and loads it anyway) and drive a non-threaded `pa_mainloop` with `pa_mainloop_iterate(block)`
+from the main thread: 18 hand-declared symbols, no callbacks (state polled after each iteration, audio
+via `pa_stream_peek`/`pa_stream_drop`). Stream flags: ADJUST_LATENCY only (no auto timing updates).
+A signal makes the mainloop's `poll()` return EINTR → loop sees the stop flag. A 1 s `alarm` watchdog
+(sendto razer OFF + `_exit` from the handler) covers the race of a signal landing just before `poll()`
+while no audio flows. Still `dlopen` only in music mode; no crate added.
+Evidence: same scenario → 52.0 ctx/s of which 47 voluntary (= 48000/1024 windows/s, the floor for N=1024
+at 48 kHz) + ~4 involuntary preemptions; 1 thread; CPU 0.50 → 0.40 %; RSS 6.05 → 5.95 MB; SIGINT → exit
+in 11–21 ms, also while blocked in connect. Needs orchestrator sign-off: CLAUDE.md's whitelist says
+"libpulse-simple"; this is libpulse proper (no new crate, same package).
+Revisit-if: wakeups must go below 47/s (option: record at 40960 Hz → exactly 40 windows/s = render cap,
+at the cost of 40 Hz bins instead of 46.875 Hz), or integrating netlink into the music loop (then use
+`pa_mainloop_set_poll_func` to add our fds to its poll).
+
+## D-031 — FFT: N=1024 real via packed 512-point complex radix-2 (2026-10-17, phase 3, audio agent)
+Context: prompt asked to pick packed-real vs plain complex-1024 by measured speed.
+Decision: pack `z[n] = x[2n] + i·x[2n+1]`, 512-point iterative radix-2 DIT (bit-reversal and twiddles
+tabled once; Hann multiply fused into the bit-reversed load), split to bins 0..512 on demand. Only bins
+1..341 are evaluated (bands need ≤ 16 kHz); band RMS uses Σ|X|² (one sqrt per band, not per bin). f32.
+Evidence: `cargo test --release -- --ignored bench_real_vs_complex`: window+FFT+341 bins 3.28 µs packed vs
+6.13 µs complex-1024. vs naive DFT (f64) on random [-1,1) input: max abs error 6.9e-6 (limit 1e-4).
+audio.json spectral_bands (n=1024): worst relative error 4.1e-7. The 1104-sample vectors are not used.
+Revisit-if: profiles ever show the FFT (they won't: ~0.015 % of a core at 47 windows/s).
+
+## D-032 — Music pacing: render at min(music_fps, 40 Hz) with a deadline accumulator (2026-10-17, phase 3, audio agent)
+Context: windows arrive at 46.875/s; the device cap is 40 Hz. A plain min-gap cap (≥ 25 ms since last
+send) would yield only ~23 Hz with 21.3 ms windows. Legacy's loop ran at 1/min(music_fps, 40) = 25 ms
+per frame, with renderer/AutoGain per-frame constants tuned for that (AutoGain dt = 1/music_fps, as legacy).
+Decision: every window is read (keeps the stream flowing); a window is analysed and rendered only when
+`now ≥ next`, then `next += interval` (or `now + interval` after a stall > 1 interval: no bursts). Average
+render/send rate = exactly min(music_fps, 40); renderer animation speed and smoothing per frame match legacy's
+40 Hz. Dropped windows (~1 in 7) skip FFT work entirely. Legacy music sent every frame; gowl adds the delta
+gate + keepalive (rule 7) → silence costs 2 datagrams/s instead of 40.
+Evidence: debug counter "47 windows, 40 renders, 40 datagrams"/s with music; measure.py 39.77 dgrams/s;
+silent: 1.97 dgrams/s.
+Revisit-if: the human sees missed beats (then analyse every window and render the max of the bands seen
+since the last render).
+
+## D-033 — Renderer port: f64 + float32 emulation, all reactions and palettes (2026-10-17, phase 3, audio agent)
+Context: AUDIO.md suggested f32; rule 8 wants ±1/channel; legacy mixes Python floats (f64) with numpy
+float32 inside `bands_to_color`/`_spectral_complexity` (NumPy 2.4, NEP 50 weak scalars, left-to-right sum).
+Decision: scalar f64 where legacy uses Python floats, f32 exactly where numpy uses float32, Python `round`
+= `round_ties_even`. Ported the required set plus the cheap optional ones — reactions wave, bass_bounce,
+chase, twinkle, auto (Auto Director, inner renderer boxed once and reset in place) and the `auto` palette —
+since they cost nothing unless selected. `album_art` rejected with a usage error; unknown names are usage
+errors (legacy silently fell back to flow).
+Evidence: tests/vectors/render.json (87 cases: 13 palettes × flow, 9 reactions × {rgb, rainbow, fire}@10 +
+{rgb, mono}@14, 1–3 segment strips, mid-stream reaction switches, 420-frame Auto Director): 89,928 channels,
+worst error 0. AutoGain sequence: bit-exact. Music hot path: 0 allocations over 130 reaction×palette
+combinations × 400 windows (tests/alloc_music.rs).
+Revisit-if: legacy changes its renderer (regenerate vectors).
+
+## D-034 — Music idle: keep the monitor stream active; reopen after 30 s of digital silence (2026-10-17, phase 3, audio agent)
+Context: with nothing playing, could the stream sleep? Tested gowl-side only (temporary, uncommitted env
+override of the source name/flags; no system audio settings touched) on the idle S/PDIF sink's monitor.
+Decision: default stream (inhibits auto-suspend of the monitored sink): silence keeps arriving as zeros, the
+renderer fades to black, the gate cuts sends to the keepalive (2/s). PA_STREAM_DONT_INHIBIT_AUTO_SUSPEND
+(passive) is NOT used: then the stream does not even become ready while the sink is suspended — zero
+wakeups, but also zero keepalives, and the device's razer-starvation timeout is unknown (PROTOCOL.md; Phase 4
+measures it), so the light could fall back to its pre-stream state mid-silence. After 1406 consecutive
+all-zero windows (30 s) the stream is reopened, so a changed default sink is picked up.
+Evidence: idle monitor, default flags: 47 voluntary wakeups/s, 2 dgrams/s, ~0 CPU ticks in 5 s;
+measure.py with playback paused: 0.167 % CPU, 48.2 ctx/s, 5.87 MB, 1.97 dgrams/s. Passive flag: 0 wakeups,
+stream stuck in CREATING; SIGINT still exits in 11 ms. Could not test passive resume (no playback tool
+installed: no pw-play/paplay/aplay).
+Revisit-if: Phase 4 knows the razer timeout — then passive + a keepalive deadline in the mainloop poll could
+make idle music mode cost only keepalive wakeups.

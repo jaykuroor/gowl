@@ -22,8 +22,9 @@ src/
     shm.rs         memfd + mmap + wl_shm_pool buffer, reused across frames
     sample.rs      precomputed per-zone sample offsets, pixel-format readers, damage→zone mask
   audio/
-    mod.rs       pulse-simple FFI via dlopen, read loop
-    fft.rs       radix-2 real FFT, N=1024, precomputed twiddles + Hann table
+    pulse.rs     libpulse FFI via dlopen (non-threaded pa_mainloop, peek/drop; D-030)
+    run.rs       `gowl music`: read loop, render pacing, signals, razer ON/OFF
+    fft.rs       radix-2 real FFT, N=1024 (packed 512-pt complex), twiddles + Hann table
     bands.rs     band RMS (precomputed bin ranges), AutoGain
     render.rs    reactions × palettes (port of MusicPatternRenderer)
   runtime.rs     poll loop (wayland fd, timerfd, signalfd), pidfile, pause/stop, keepalive
@@ -81,12 +82,14 @@ One timerfd armed to the nearest deadline (absolute, CLOCK_MONOTONIC). No period
 tick. Static screen ⇒ wakeups = keepalive rate only. Paused ⇒ zero wakeups.
 
 ## Music mode
-`pa_simple_new(NULL, "gowl", PA_STREAM_RECORD, "@DEFAULT_MONITOR@", …, float32le,
-48000 Hz, mono, buffer_attr{fragsize = 1024*4})`. Loop: blocking read of 1024 samples
-(~21 ms) → FFT → bands → AutoGain → render → smooth → send. Signals set an
-`AtomicBool` via `sigaction` (no SA_RESTART) so the blocking read returns. `libpulse-simple`
-is `dlopen`ed so screen mode never maps it. PipeWire on Fedora serves this through
-`pipewire-pulse`. Details: `AUDIO.md`.
+Record stream on `"@DEFAULT_MONITOR@"` (float32le, 48000 Hz, mono, fragsize 1024·4) via
+libpulse's *non-threaded* `pa_mainloop`, iterated (blocking) on the main thread — one
+thread, one wakeup per 21.3 ms window (D-030; `pa_simple` would add a thread and double
+the wakeups). Loop: read 1024 samples → if due under min(music_fps, 40 Hz): FFT → bands →
+AutoGain → render → smooth → brightness → reverse/offset → delta check → send. Signals
+set an `AtomicBool` via `sigaction` (no SA_RESTART), so the mainloop's `poll()` returns
+EINTR; a 1 s `alarm` watchdog covers the race before `poll()`. libpulse is `dlopen`ed so
+other modes never map it. Details: `AUDIO.md`.
 
 ## Numbers & formats
 - Linear light: `LUT_LIN16[256]: u16` (sRGB8 → linear × 65535). Zone sum in `u32`
