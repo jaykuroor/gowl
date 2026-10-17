@@ -390,6 +390,17 @@ pub fn cmd_music(args: &[String]) -> Result<(), Error> {
     let pulse = Pulse::load()?;
     install_signals(&lanes)?;
     let mut music = Music::new(s, lanes);
+    // From the first razer ON on, every exit path below runs the OFF rounds.
+    let r = razer_on_all(&music).and_then(|()| stream_loop(&pulse, &mut music));
+    razer_off_all(&music);
+    disarm_watchdog();
+    drop(music);
+    r
+}
+
+/// Razer ON to every lane; the first failure is returned (the caller still sends
+/// OFF to all lanes, so lanes that did switch on are switched off again).
+fn razer_on_all(music: &Music) -> Result<(), Error> {
     for l in &music.lanes {
         l.razer(true).map_err(|e| {
             if net::is_blocked(&e) {
@@ -402,8 +413,11 @@ pub fn cmd_music(args: &[String]) -> Result<(), Error> {
             }
         })?;
     }
-    let r = stream_loop(&pulse, &mut music);
-    // Shutdown contract: razer OFF twice, 10 ms apart.
+    Ok(())
+}
+
+/// Shutdown contract: razer OFF to every lane, twice, 10 ms apart.
+fn razer_off_all(music: &Music) {
     for round in 0..2 {
         if round == 1 {
             std::thread::sleep(Duration::from_millis(10));
@@ -414,7 +428,17 @@ pub fn cmd_music(args: &[String]) -> Result<(), Error> {
             }
         }
     }
-    r
+}
+
+/// Cancel a pending watchdog and forget the lane sockets before they are closed,
+/// so the SIGALRM handler can never write to a recycled fd.
+fn disarm_watchdog() {
+    // SAFETY: alarm(0) only cancels a pending SIGALRM.
+    unsafe { libc::alarm(0) };
+    EMERG_N.store(0, Ordering::SeqCst);
+    for fd in &EMERG_FD {
+        fd.store(-1, Ordering::SeqCst);
+    }
 }
 
 fn open_stream(pulse: &Pulse) -> Option<Capture<'_>> {
