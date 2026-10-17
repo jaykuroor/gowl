@@ -49,6 +49,7 @@ build with `CARGO_PROFILE_RELEASE_DEBUG=true CARGO_PROFILE_RELEASE_STRIP=false` 
 ## Results log (append; newest first)
 | Date | Commit | Scenario | CPU % | Wakeups/s | RSS MB | Pkts/s | niri Δ CPU % | Notes |
 |---|---|---|---|---|---|---|---|---|
+| 2026-10-17 | phase1 review fixes | — | — | — | — | — | — | release binary 529,960 B after review fixes |
 | 2026-10-17 | b5f9b15 | one-shot | — | — | 2.7 (maxrss) | 1 | — | stripped release binary **538,152 B** (target ≤ 800 KB); deps: libc only; `gowl color` / `status` to fake device < 10 ms wall (`/usr/bin/time` resolution 10 ms) |
 | 2026-10-17 | recon | — | — | — | — | — | — | hello-world release binary 296,480 B (release profile from ARCHITECTURE.md) |
 

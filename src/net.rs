@@ -201,15 +201,21 @@ fn better(a: &Iface, b: &Iface) -> std::cmp::Ordering {
 /// is not VPN-named contains it, use that (with a warning in `why`).
 pub fn select_for(ifaces: &[Iface], ip: Ipv4Addr, lan_if: Option<&str>) -> Result<Selected, Error> {
     if let Some(name) = lan_if {
-        let mut c: Vec<&Iface> = ifaces.iter().filter(|i| i.name == name).collect();
-        c.sort_by_key(|i| !i.contains(ip));
-        return match c.first() {
+        let named: Vec<&Iface> = ifaces.iter().filter(|i| i.name == name).collect();
+        if named.is_empty() {
+            return Err(Error::NoLanIf(format!(
+                "lan_if = {name} from the config has no IPv4 address (is it up?)"
+            )));
+        }
+        // Forcing an interface never lets traffic leave the LAN (CLAUDE.md rule 7):
+        // the device must be on that interface's subnet.
+        return match named.iter().find(|i| i.contains(ip)) {
             Some(i) => Ok(Selected {
                 iface: (*i).clone(),
                 why: format!("lan_if = {name} in config"),
             }),
             None => Err(Error::NoLanIf(format!(
-                "lan_if = {name} from the config has no IPv4 address (is it up?)"
+                "{ip} is not on the subnet of lan_if = {name}; gowl only talks to devices on the LAN"
             ))),
         };
     }
@@ -599,6 +605,10 @@ pub fn scan(
                     continue;
                 };
                 debug!("rx {n} B from {from} on {}", targets[si].iface.name);
+                let iface = &targets[si].iface;
+                if !iface.contains(*from.ip()) {
+                    continue; // not from this LAN: ignore
+                }
                 let Some(r) = proto::parse_scan(&buf[..n]) else {
                     continue;
                 };
@@ -606,8 +616,11 @@ pub fn scan(
                 if found.iter().any(|f| f.mac == mac) {
                     continue;
                 }
+                // The payload's "ip" is only a hint; a LAN host could claim any
+                // address. Never cache an address outside this interface's subnet.
                 let ip =
                     r.ip.and_then(|b| std::str::from_utf8(b).ok()?.parse().ok())
+                        .filter(|ip| iface.contains(*ip))
                         .unwrap_or(*from.ip());
                 found.push(Found {
                     mac,
@@ -704,24 +717,29 @@ pub fn status(
     }
 }
 
-/// Kernel counter `Icmp: OutDestUnreachs` (/proc/net/snmp, unprivileged). firewalld
-/// zones answer unsolicited inbound datagrams with an ICMP unreachable, so a rise while
-/// we wait for a reply that never arrives means the reply reached this machine and
-/// was rejected by the firewall. Read only on the no-reply path.
-pub fn icmp_unreach_sent() -> Option<u64> {
+/// Kernel counters `Icmp: OutDestUnreachs − InDestUnreachs` (/proc/net/snmp,
+/// unprivileged). firewalld zones answer unsolicited inbound datagrams with an ICMP
+/// unreachable, so a rise while we wait for a reply that never arrives means the
+/// reply likely reached this machine and was rejected by the firewall. Unreachables
+/// the kernel sends to itself (ARP failure for an offline host) count as both sent
+/// and received, so subtracting `In` keeps "light offline" from looking like
+/// "firewall". The counters are system-wide, so this is a hint, not proof.
+/// Read only on the no-reply path.
+pub fn icmp_unreach_sent() -> Option<i64> {
     let text = std::fs::read_to_string("/proc/net/snmp").ok()?;
     let mut lines = text.lines().filter(|l| l.starts_with("Icmp:"));
     let (head, vals) = (lines.next()?, lines.next()?);
-    let col = head
-        .split_whitespace()
-        .position(|k| k == "OutDestUnreachs")?;
-    vals.split_whitespace().nth(col)?.parse().ok()
+    let col = |key: &str| -> Option<i64> {
+        let i = head.split_whitespace().position(|k| k == key)?;
+        vals.split_whitespace().nth(i)?.parse().ok()
+    };
+    Some(col("OutDestUnreachs")? - col("InDestUnreachs")?)
 }
 
-/// Replies rejected since `before` (see [`icmp_unreach_sent`]).
-pub fn rejected_since(before: Option<u64>) -> u64 {
+/// Replies likely rejected since `before` (see [`icmp_unreach_sent`]).
+pub fn rejected_since(before: Option<i64>) -> u64 {
     match (before, icmp_unreach_sent()) {
-        (Some(a), Some(b)) => b.saturating_sub(a),
+        (Some(a), Some(b)) => (b - a).max(0) as u64,
         _ => 0,
     }
 }
@@ -866,8 +884,12 @@ mod tests {
             select_for(&machine(), Ipv4Addr::new(10, 9, 9, 9), None),
             Err(Error::NoLanIf(_))
         ));
-        let s = select_for(&machine(), Ipv4Addr::new(10, 9, 9, 9), Some("enp5s0")).unwrap();
+        let s = select_for(&machine(), Ipv4Addr::new(192, 168, 1, 3), Some("enp5s0")).unwrap();
         assert_eq!(s.iface.name, "enp5s0");
+        assert!(matches!(
+            select_for(&machine(), Ipv4Addr::new(10, 9, 9, 9), Some("enp5s0")),
+            Err(Error::NoLanIf(_))
+        ));
         let d = discovery_ifaces(&machine(), None);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].name, "enp5s0");

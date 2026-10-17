@@ -11,6 +11,8 @@ use gowl::net::{self, Sender};
 struct Counting;
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
+// SAFETY: every method forwards unchanged to `System`, which upholds the GlobalAlloc
+// contract; the counter is a relaxed atomic with no effect on the returned memory.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
@@ -53,6 +55,8 @@ fn hot_path_allocates_nothing() {
     let mut smooth: [Rgb; 255] = [[0; 3]; 255];
     let mut seg: [Rgb; 255] = [[0; 3]; 255];
 
+    let mut sent = 0usize;
+
     let mut step = |t: u64, frame: &[u8]| {
         let src = Rgb8Frame {
             data: frame,
@@ -67,6 +71,7 @@ fn hot_path_allocates_nothing() {
         if gate.needs_send(&seg[..n], t) {
             sender.send_colors(&sock, &seg[..n]).unwrap();
             gate.mark_sent(&seg[..n], t);
+            sent += 1;
         }
     };
     step(0, &frame); // warm-up
@@ -83,6 +88,8 @@ fn hot_path_allocates_nothing() {
         step(t * 33, &frame);
     }
     let after = ALLOCS.load(Ordering::Relaxed);
+    drop(step);
+    assert!(sent > 100, "only {sent} frames were sent");
     assert_eq!(
         after - before,
         0,

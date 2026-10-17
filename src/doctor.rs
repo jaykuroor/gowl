@@ -165,7 +165,7 @@ pub fn run(dev: Option<&Device>, lan_if: Option<&str>, ports: Ports) -> Result<(
     );
     if rejected > 0 {
         println!(
-            "cause:     the light DID answer, but this machine rejected {rejected} repl{} (the kernel sent ICMP",
+            "cause:     the light likely answered, but this machine rejected {rejected} repl{} (the kernel sent ICMP",
             if rejected == 1 { "y" } else { "ies" }
         );
         println!(

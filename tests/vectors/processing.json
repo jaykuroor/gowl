@@ -1743,7 +1743,7 @@
     ]
    ]
   ],
-  "note": "first frame snaps to target"
+  "note": "state starts at black; first frame fades in (alpha applied from zero)"
  },
  "frame_needs_send": [
   {

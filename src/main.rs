@@ -218,7 +218,7 @@ fn cmd_status(r: &[String]) -> Result<(), Error> {
             Ok(())
         }
         None if net::rejected_since(icmp_before) > 0 => Err(Error::Runtime(format!(
-            "{} answered, but the firewall rejected the reply (inbound UDP {} blocked) — run `gowl doctor`",
+            "{} likely answered, but the firewall rejected the reply (inbound UDP {} blocked) — run `gowl doctor`",
             d.ip, c.ports.reply
         ))),
         None => Err(Error::Runtime(format!(
@@ -358,7 +358,7 @@ fn cmd_scan(rest: &[String]) -> Result<(), Error> {
         let rejected = net::rejected_since(icmp_before);
         if rejected > 0 {
             eprintln!(
-                "gowl: {rejected} repl{} reached this machine but the firewall rejected them (inbound UDP {} blocked; `gowl doctor` prints a LAN-scoped rule). A known IP works without replies: GOWL_DEVICE=IP or ip= in the config.",
+                "gowl: {rejected} repl{} likely reached this machine but the firewall rejected them (inbound UDP {} blocked; `gowl doctor` prints a LAN-scoped rule). A known IP works without replies: GOWL_DEVICE=IP or ip= in the config.",
                 if rejected == 1 { "y" } else { "ies" },
                 c.ports.reply
             );

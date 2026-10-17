@@ -190,7 +190,7 @@ def main() -> None:
         "resample": [{"in": palette(10), "count": c, "out": colors.resample_colors_to_count(palette(10), c)}
                      for c in (4, 10, 14, 20)],
         "smoother_alpha_0_55": {"in": smooth_seq_in, "out": smooth_seq_out,
-                                "note": "first frame snaps to target"},
+                                "note": "state starts at black; first frame fades in (alpha applied from zero)"},
         "frame_needs_send": [
             {"prev": None, "cur": [[1, 1, 1]], "threshold": 3, "last_sent_at": None, "now": 0.0,
              "expect": processing.frame_needs_send(None, [(1, 1, 1)], 3, last_sent_at=None, now=0.0)},

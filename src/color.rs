@@ -212,6 +212,9 @@ pub struct Zone {
 
 /// Pixel bounds `(x1, y1, x2, y2)` of a rect, exact port of legacy `_zone_bounds`.
 pub fn zone_bounds(r: Rect, width: u32, height: u32) -> (u32, u32, u32, u32) {
+    if width == 0 || height == 0 {
+        return (0, 0, 0, 0); // empty frame: empty zone (avoids clamp(0, -1) panic)
+    }
     let r = normalize_rect(r);
     let (w, h) = (f64::from(width), f64::from(height));
     let x1 = ((r.x * w) as i64).clamp(0, i64::from(width) - 1);

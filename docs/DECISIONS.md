@@ -116,3 +116,15 @@ datagram each) and merges results into the cache instead of overwriting it (a sc
 device keeps its entry). Compact JSON on the wire (PROTOCOL.md allows it): legacy strings minus
 json.dumps spaces, byte-equal.
 Revisit-if: the human captures the reply port (tcpdump) and it turns out to be fixed.
+
+## D-015 — Phase 1 review fixes: LAN-only addresses, ICMP heuristic (2026-10-17, phase 1 gate, orchestrator)
+Context: code review found two ways gowl could address a non-LAN IP (rule 7): `lan_if` returned the
+forced interface even when its subnet didn't contain the device; `scan` cached the reply's `ip` field
+unchecked. Also the firewall hint (ΔOutDestUnreachs) counted ICMP the kernel sends to itself when ARP
+fails, so an offline light could be reported as "firewall".
+Decision: `lan_if` must contain the device IP (else exit 5); scan ignores replies from off-subnet senders
+and uses the payload `ip` only if it is on the receiving interface's subnet; the hint uses
+Δ(OutDestUnreachs − InDestUnreachs) and messages say "likely". Also: zero-size frame guard in
+`zone_bounds`, alloc test asserts frames were actually sent.
+Evidence: tests 30/30, netns `--bin` PASS, binary 529,960 B.
+Revisit-if: devices on a different subnet behind a router are ever needed (they are out of scope).
