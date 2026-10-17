@@ -1,8 +1,9 @@
 //! CLAUDE.md rule 4 for music mode: after warm-up, window → FFT → bands → AutoGain
 //! → render → EMA → brightness → reorder → gate → encode → send allocates nothing,
-//! for every reaction (incl. the Auto Director) and palette. Counting global
-//! allocator; one test in this binary. (The pulse read itself is C code in libpulse;
-//! on our side it is a memcpy into a fixed buffer.)
+//! from the very first window, for every reaction (incl. the Auto Director) and
+//! palette. Counting global allocator; one test in this binary. Not covered:
+//! `Capture::read` / `stream_loop` (libpulse peek + memcpy into a fixed buffer; Strings
+//! only on error paths) — they need a live sound server.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
@@ -100,16 +101,10 @@ fn music_hot_path_allocates_nothing() {
     let mut buf = [0f32; N];
     let mut drain = [0u8; 2048];
     let mut sent = 0usize;
-    // Warm-up: the Auto Director boxes its inner renderer on its first frame.
-    window(0, &mut buf);
-    for m in &mut musics {
-        sent += m.tick(&buf, 0);
-    }
-    while rx.recv(&mut drain).is_ok() {}
 
-    // ---- steady state: 400 windows (~10 s of music at 40 renders/s) per combination
+    // ---- from the first window on: 400 windows (~10 s at 40 renders/s) per combination
     let before = ALLOCS.load(Ordering::Relaxed);
-    for t in 1..400usize {
+    for t in 0..400usize {
         window(t, &mut buf);
         for m in &mut musics {
             sent += m.tick(&buf, t as u64 * 25);

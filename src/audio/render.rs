@@ -3,7 +3,7 @@
 //! where legacy computes in numpy float32 (`bands_to_color`, `_spectral_complexity`)
 //! are mirrored in f32, and Python's `round()` is `round_ties_even`. Renders into a
 //! fixed `[Rgb; 255]`; no allocation per frame (the Auto Director's inner renderer
-//! is boxed once, on first use, and reset in place afterwards).
+//! is boxed in `Renderer::new` and reset in place afterwards).
 
 use std::f64::consts::PI;
 
@@ -355,7 +355,15 @@ pub struct Renderer {
 
 impl Renderer {
     /// `segments` is clamped to 1..=255; `fps` only sets the Auto Director's clock.
+    /// Allocates the Auto Director's inner renderer here (setup), never per frame.
     pub fn new(segments: usize, fps: u32) -> Renderer {
+        let mut r = Self::bare(segments, fps);
+        r.inner = Some(Box::new(Self::bare(segments, fps)));
+        r
+    }
+
+    /// A renderer without an inner Auto Director renderer (the inner one itself).
+    fn bare(segments: usize, fps: u32) -> Renderer {
         let fps = fps.max(1);
         Renderer {
             n: segments.clamp(1, MAX_SEGMENTS),
@@ -383,7 +391,7 @@ impl Renderer {
     /// Back to a freshly constructed renderer, keeping the boxed inner renderer.
     fn renew(&mut self) {
         let inner = self.inner.take();
-        *self = Renderer::new(self.n, self.fps);
+        *self = Renderer::bare(self.n, self.fps);
         self.inner = inner;
     }
 
@@ -676,9 +684,11 @@ impl Renderer {
         if total > 1e-9 {
             a.hold_s = (a.hold_s - self.frame_dt).max(0.0);
         }
+        // Boxed in `new` (setup); the fallback only runs for an inner renderer used as
+        // an Auto Director itself, which `render` never does.
         let inner = self
             .inner
-            .get_or_insert_with(|| Box::new(Renderer::new(n, self.fps)));
+            .get_or_insert_with(|| Box::new(Renderer::bare(n, self.fps)));
         if a.inner_stale {
             inner.renew();
             a.inner_stale = false;
@@ -709,6 +719,33 @@ mod tests {
             assert_eq!(p.name(), n);
         }
         assert_eq!(Palette::parse("album_art"), None);
+    }
+
+    /// Per-frame cost of the f64 renderer (+ AutoGain), DECISIONS D-035:
+    /// `cargo test --release -- --ignored bench_render --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_render() {
+        use crate::audio::bands::AutoGain;
+        use std::hint::black_box;
+        use std::time::Instant;
+        let iters = 200_000u32;
+        for (name, re, p) in [
+            ("flow/rgb", Reaction::Flow, Palette::Rgb),
+            ("wave/rainbow (sin)", Reaction::Wave, Palette::Rainbow),
+            ("auto/auto", Reaction::Auto, Palette::Auto),
+        ] {
+            let mut r = Renderer::new(10, 60);
+            let mut g = AutoGain::new(60);
+            let t = Instant::now();
+            for i in 0..iters {
+                let x = f64::from(i % 97) / 97.0;
+                let b = g.process([0.2 * x, 0.1 * (1.0 - x), 0.03]);
+                black_box(r.render(black_box(b), re, 1.7, p));
+            }
+            let ns = t.elapsed().as_nanos() as f64 / f64::from(iters);
+            eprintln!("render+autogain {name}, 10 segments: {ns:.0} ns/frame");
+        }
     }
 
     #[test]
