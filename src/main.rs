@@ -23,7 +23,11 @@ usage:
   gowl outputs                         list Wayland outputs (name, mode, scale, transform)
   gowl screen [--output NAME] [--fps N] [--depth 0.10-0.50] [DEV...]
                                        sync the lights to the screen edges (Ctrl+C stops)
-  gowl music | calibrate | pause | resume | stop | toggle
+  gowl music [--reaction R] [--palette P] [--fps N] [DEV...]
+                                       sync to what you hear (default sink monitor)
+      reactions: flow pulse energy_fill band_split center_burst wave bass_bounce chase twinkle auto
+      palettes:  rgb auto rainbow aurora sunset ocean neon jewel fire spectrum warm cool mono
+  gowl calibrate | pause | resume | stop | toggle
                                        not yet implemented
   gowl --version | --help
 
@@ -148,7 +152,8 @@ fn run(args: &[String]) -> Result<(), Error> {
             Ok(())
         }
         "screen" => cmd_screen(rest),
-        "music" | "calibrate" | "pause" | "resume" | "stop" | "toggle" => {
+        "music" => gowl::audio::cmd_music(rest),
+        "calibrate" | "pause" | "resume" | "stop" | "toggle" => {
             Err(usage(format!("{cmd}: not yet implemented")))
         }
         other => Err(usage(format!("unknown command {other:?}"))),

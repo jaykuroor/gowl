@@ -5,6 +5,7 @@
 
 #[macro_use]
 pub mod log;
+pub mod audio;
 pub mod capture;
 pub mod color;
 pub mod config;
