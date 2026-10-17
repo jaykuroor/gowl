@@ -143,8 +143,9 @@ A signal makes the mainloop's `poll()` return EINTR → loop sees the stop flag.
 while no audio flows. Still `dlopen` only in music mode; no crate added.
 Evidence: same scenario → 52.0 ctx/s of which 47 voluntary (= 48000/1024 windows/s, the floor for N=1024
 at 48 kHz) + ~4 involuntary preemptions; 1 thread; CPU 0.50 → 0.40 %; RSS 6.05 → 5.95 MB; SIGINT → exit
-in 11–21 ms, also while blocked in connect. Needs orchestrator sign-off: CLAUDE.md's whitelist says
-"libpulse-simple"; this is libpulse proper (no new crate, same package).
+in 11–21 ms, also while blocked in connect. CLAUDE.md's whitelist says "libpulse-simple"; this is
+libpulse proper (no new crate, same package). **Orchestrator sign-off 2026-10-17** (full libpulse via
+dlopen, single-threaded mainloop approved against the whitelist).
 Revisit-if: wakeups must go below 47/s (option: record at 40960 Hz → exactly 40 windows/s = render cap,
 at the cost of 40 Hz bins instead of 46.875 Hz), or integrating netlink into the music loop (then use
 `pa_mainloop_set_poll_func` to add our fds to its poll).
@@ -202,3 +203,20 @@ stream stuck in CREATING; SIGINT still exits in 11 ms. Could not test passive re
 installed: no pw-play/paplay/aplay).
 Revisit-if: Phase 4 knows the razer timeout — then passive + a keepalive deadline in the mainloop poll could
 make idle music mode cost only keepalive wakeups.
+
+## D-035 — Two acknowledged rule deviations in music mode (2026-10-17, phase 3 review, audio agent)
+Context: the Phase 3 review asked to record where music mode bends CLAUDE.md rules 5 and 6.
+Decision / evidence:
+(a) Rule 5 (no sleeps in loops): while the sound server is unreachable, `open_stream` retries every 1 s
+    with `nanosleep`, which a stop signal interrupts (EINTR; no SA_RESTART), so shutdown stays prompt (measured
+    14 ms with pulse unreachable). Costs 1 wakeup/s only during an outage. Gap: no keepalives go out
+    while pulse is down, so the device may drop out of razer mode (timeout unknown). Phase 4 should revisit:
+    replace the sleep with a timed `poll()` that also drives the keepalive deadline (and netlink).
+(b) Rule 6 (integer/fixed-point in hot paths): the renderer and AutoGain use scalar f64 with `sin` (wave),
+    `sqrt`, `exp` (setup only), `ln` (f32, complexity), mirroring legacy's Python floats/numpy float32 for
+    bit-exact parity (render.json worst error 0 over 89,928 channels; AutoGain exact). Measured
+    (`cargo test --release -- --ignored bench_render`): render+AutoGain per frame at 10 segments — flow/rgb
+    31 ns, wave/rainbow (sin) 182 ns, auto/auto 132 ns; at ≤ 40 frames/s that is ≤ 7.3 µs/s ≈ 0.0007 % of a
+    core, against 0.40 % for the whole process. A fixed-point port would save nothing measurable and lose
+    exactness. The FFT is f32 (float is explicitly allowed there).
+Revisit-if: (a) Phase 4 integrates timers/netlink into the music loop; (b) never, unless profiles show it.

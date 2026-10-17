@@ -49,6 +49,7 @@ build with `CARGO_PROFILE_RELEASE_DEBUG=true CARGO_PROFILE_RELEASE_STRIP=false` 
 ## Results log (append; newest first)
 | Date | Commit | Scenario | CPU % | Wakeups/s | RSS MB | Pkts/s | niri Δ CPU % | Notes |
 |---|---|---|---|---|---|---|---|---|
+| 2026-10-17 | phase3 review | music allocations | — | — | — | — | — | tests/alloc_music.rs: 0 allocations from the first window (render→send, 130 reaction×palette combos × 400 windows). Not covered: `Capture::read`/`stream_loop` (libpulse peek + memcpy into a fixed buffer; Strings only on error paths) — needs a live sound server |
 | 2026-10-17 | 544d0b5 | music, playback paused (silence) | 0.167 | 48.2 | 5.87 | 1.97 | 7.63 abs | fake; keepalive only (gate); 1 thread; binary 587,336 B |
 | 2026-10-17 | 35f59eb | **S3** music (flow/rgb, browser playing) | 0.400 | 52.0 (47 voluntary = 1/window + ~4 involuntary preemptions) | 5.95 | 39.77 | 12.33 abs | fake; libpulse non-threaded mainloop (D-030); 1 thread; 92 B/frame; libpulse mapped (music only) |
 | 2026-10-17 | 6ef38ca | S3 music, pa_simple variant (superseded) | 0.500 | 100.5 | 6.05 | 40.00 | 15.80 abs | fake; 2 threads (pa_simple mainloop thread) → replaced, D-030 |
