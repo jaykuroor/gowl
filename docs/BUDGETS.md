@@ -49,6 +49,9 @@ build with `CARGO_PROFILE_RELEASE_DEBUG=true CARGO_PROFILE_RELEASE_STRIP=false` 
 ## Results log (append; newest first)
 | Date | Commit | Scenario | CPU % | Wakeups/s | RSS MB | Pkts/s | niri Δ CPU % | Notes |
 |---|---|---|---|---|---|---|---|---|
+| 2026-10-17 | phase 4 review fixes | binary size | | | | | | **743,016 B** stripped (+8,256 B: OFD-lock pidfile, hook mask, panic hook table, parse-faithful config rewrite); libc only |
+| 2026-10-17 | phase 4 review fixes | S4 paused (`measure.py paused 20 --fake`) | 0.000 | 0.0 | 8.74 | 0.00 | 1.25 abs | a first run read 0.2/s (4 switches in 20 s, most likely compositor events on the Wayland fd, which stays open while paused); rerun 0.0, and a 30 s `GOWL_LOG=debug` paused run had 0 context switches |
+| 2026-10-17 | phase 4 review fixes | music on live PipeWire (D-048) | 0.20–0.40 | 49–50 | — | keepalive ~2 (silence) | — | stream really opens now ("capturing" logged); paused 0 switches in 5 s; stop 14 ms. Supersedes the "music paused" row below, which measured a stream that never opened |
 | 2026-10-17 | phase 4 (7947711+) | binary size | | | | | | **734,760 B** stripped (+32,736 B vs 702,024: pidfile/control, netwatch + verify, music poll hook, keepalive walk); `cargo tree` = libc only |
 | 2026-10-17 | 7947711 | **S4 paused** (`measure.py paused 20 --fake`, netlink fd in the poll set) | 0.000 | 0.0 | 8.81 | 0.00 | 26.70 abs | fake=True; 20 s window: 0 CPU ticks, 0 context switches, 0 datagrams → S4 met, and netlink adds 0 wakeups on a stable network. niri absolute was high from the human's desktop (gowl captures nothing while paused) |
 | 2026-10-17 | 7947711 | S1 screen 30 fps (regression check after Phase 4) | 0.250 | 70.3 | 8.63 | 4.35 | 36.00 abs | fake=True; desktop partly static (~12 frames/s captured). `GOWL_LOG=debug` per-second line: `netlink 0 verify 0` in all 11 s |

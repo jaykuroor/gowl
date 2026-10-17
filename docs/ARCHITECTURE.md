@@ -78,7 +78,7 @@ behind a cargo feature without touching `color.rs`/`net.rs`. Not in v1.
 poll([wayland_fd, timerfd, signalfd, netlink_fd], -1)
   wayland readable → prepare_read/read/dispatch → on frame ready: process + send
   timerfd          → either "issue next capture request" or "keepalive resend"
-  signalfd         → SIGTERM/SIGINT/SIGHUP: razer OFF, exit; SIGUSR1: pause; SIGUSR2: resume
+  signalfd         → SIGTERM/SIGINT/SIGHUP/SIGQUIT: razer OFF ×2, exit; SIGUSR1: pause; SIGUSR2: resume
   netlink          → link/addr/route changed: debounce 500 ms, re-select LAN interface, rebind if changed
 ```
 One timerfd armed to the nearest deadline (absolute, CLOCK_MONOTONIC). No periodic
@@ -110,7 +110,9 @@ other modes never map it. Details: `AUDIO.md`.
 netlink and the verify socket (`pulse::Hook`), so music honours pause/resume/stop and
 rebinds exactly like screen mode. Paused = stream closed, timer disarmed (0 wakeups). Sound
 server down = retry every 1 s on the timerfd while keepalives hold the last frame.
-Sending goes through the same `runtime::Streams` as screen mode.
+Sending goes through the same `runtime::Streams` as screen mode. While a connect is in
+progress only the signalfd is polled (D-048), so a ready timer can't abort it; while streaming
+the timer holds only a stall guard (keepalive + ¼) for a monitor that stops delivering.
 
 ## Numbers & formats
 - Linear light: `LUT_LIN16[256]: u16` (sRGB8 → linear × 65535). Zone sum in `u32`

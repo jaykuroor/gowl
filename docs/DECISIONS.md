@@ -355,6 +355,8 @@ Live PipeWire, loopback receiver: pause → 1 razer OFF, **0 context switches in
 `pa_mainloop_api->io_new` per fd (callbacks, re-registered on every reopen); a second
 thread (rule 5). **Revisit-if.** libpulse ever needs > 28 pollfds (then the hook falls back
 to polling libpulse's fds alone, losing ours until the next window — never seen).
+**Corrected by D-048:** the evidence above was wrong — the stream never opened (an expired
+timerfd aborted every connect; the "frames" were black keepalives). Fixed and re-measured there.
 
 ## D-043 — Pidfile + control commands (2026-10-17, phase 4, runtime agent)
 `$XDG_RUNTIME_DIR/gowl.pid`, created `O_EXCL`, content `PID\n`. Stale = pid dead
@@ -370,6 +372,8 @@ running exit 1 ("no gowl sync is running"). `toggle [screen|music] [ARGS]` passe
 the mode it starts (`gowl toggle music --reaction pulse` works as a keybind). Signals are
 blocked (signalfd) *before* the pidfile is claimed, so a `stop` racing startup is queued.
 Without XDG_RUNTIME_DIR a sync runs unclaimed with a warning.
+**Superseded in part by D-048:** the claim is now an OFD lock on the pidfile, not O_EXCL +
+kill/comm guessing.
 
 ## D-044 — netwatch: rebind only on interface change or send errors; non-blocking re-verify (2026-10-17, phase 4, runtime agent)
 **Decision.** rtnetlink groups `RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV4_ROUTE`; content
@@ -438,3 +442,54 @@ H6609's value goes here once the human has run it (it also unblocks D-034's pass
 - Fake-device tests fail without python3 unless `GOWL_TEST_NO_PYTHON=1` opts out.
 - New tests: status source-IP filter and scan end to end (tests/net_e2e.rs, loopback).
 Still open (Phase 5): per-device port override (legacy `Device_Port`).
+
+## D-048 — Phase 4 review fixes (2026-10-17, phase 4 review, runtime agent)
+1. **Blocking: `gowl music` never opened its stream on a live PipeWire.** While the stream was
+   down the timerfd was armed to `retry_at`, which had always passed by the time the open
+   ran; inside `pa_context_connect` the first mainloop iteration hit our poll hook, saw the
+   expired timer, flagged it, and the open returned `Interrupted` → retry now → forever (the
+   reviewer counted ~880k connections in 0.7 s). My D-042 check missed it: it never looked
+   for the "capturing" line and counted keepalive frames as renders. **Fix:** `pulse::Hook`
+   has an active-slot mask; `run::open_capture` polls *only the signalfd* during an open
+   (timer/netlink are level-triggered and handled right after the open returns), the timer
+   is no longer armed to the retry time while opening, and `Interrupted` from an open now
+   always means "signal pending". **Test:** tests/music_open.rs drives the real libpulse open
+   through the hook against a silent fake server (PULSE_SERVER) with always-ready timer and
+   netlink stand-ins: the open waits for the server (fails at ~400 ms when it hangs up) and is
+   interrupted only by the signal stand-in; with the mask removed it fails (Interrupted after
+   0.27 ms). Plus a unit test of the hook's mask. **Evidence (fixed build, live PipeWire,
+   loopback receiver):** "capturing @DEFAULT_MONITOR@" logged at start and after resume;
+   streaming idle 0.20–0.40 % CPU, 49–50 context switches/s (= one per 21.3 ms window, as S3);
+   pause → razer OFF ×2, **0 context switches in 5 s**; resume → razer ON + frames, stream
+   reopened; `gowl stop` → razer OFF ×2, exit in 14 ms; second instance → exit 1.
+2. **Pidfile claim race** (two starts both removing a stale file and both winning): the claim
+   is now an exclusive open-file-description lock (`F_OFD_SETLK`) held for the session; the
+   file only carries the pid. Starts open/create, lock (held → "already running (pid N)",
+   exit 1), check the locked inode is still the one at the path (a holder that just exited
+   unlinks it → retry), then write the pid. `pause|resume|stop` believe the pid only while
+   the file is locked (`F_OFD_GETLK`) and it isn't their own pid, so a stale file — even one
+   naming our own pid — is never signalled and `stop` can't SIGTERM itself. Test: 20 rounds of
+   8 threads racing `acquire_at` → exactly one winner each round.
+3. **Exits without razer OFF:** SIGQUIT joins the signalfd (→ stop). Pause and output-lost now
+   send razer OFF ×2 (10 ms apart) like stop, in screen and music. `panic = "abort"` skips
+   `shutdown()`, so every `Streams` registers its sockets/addresses in a static table and a
+   chained panic hook sends razer OFF ×2 from it before the report (unit-tested on a private
+   slot).
+4. **No black keepalive before the first frame** (rule 7): `Streams::keepalive` skips devices
+   with nothing sent since razer ON, so music no longer sends black while the stream opens.
+5. **Config rewrites follow `parse`:** keys after a non-device section are global, a
+   malformed header doesn't end a section, CRLF line endings are kept on replaced and
+   inserted lines; `write_atomic` writes through a symlinked config (the link stays a link)
+   and keeps the file mode. Tests for each.
+6. Small: hook poll guards `nfds == 0`; `gowl pause/resume` during calibrate prints that they
+   don't apply (q or `gowl stop` ends it); the sweep never falls more than one slot behind, so
+   a stall doesn't cause a burst.
+**Question from the review — keepalive while the music stream is open.** Before this fix:
+nothing kept the light in stream mode if the monitor stopped delivering. Not intended: D-034
+keeps the stream *active* precisely so PipeWire keeps delivering (measured 47 windows/s on an
+idle monitor), but a suspended/removed sink would stall it. Now the timerfd carries a stall
+guard at `last send + keepalive + keepalive/4` while streaming: when windows flow the gate
+sends the keepalive first and moves the deadline (timerfd_settime only on a send, no extra
+wakeup — idle streaming stayed at 49 ctx/s), when they stop the timer resends the last
+rendered frame every 1.25 keepalive intervals (≤ 87.5 % of the hold time once keepalive_ms
+is 70 % of it).

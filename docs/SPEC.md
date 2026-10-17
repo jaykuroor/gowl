@@ -55,7 +55,8 @@ All diagnostics to stderr, one line each; `GOWL_LOG=debug` for verbose.
 See `config.example`. Env overrides: `GOWL_DEVICE`, `GOWL_LOG`, `GOWL_CONFIG`.
 
 Device cache (written by `scan`): `$XDG_STATE_HOME/gowl/devices`, one device per line:
-`mac ip sku`. Pidfile: `$XDG_RUNTIME_DIR/gowl.pid` (O_EXCL; stale = dead pid or not gowl).
+`mac ip sku`. Pidfile: `$XDG_RUNTIME_DIR/gowl.pid`, claimed by an exclusive OFD lock held for the
+session (the file carries the pid; an unlocked file is stale, D-048).
 `calibrate` rewrites the config byte-for-byte except the keys it sets (`segments`/`layout`
 in the device section, global `keepalive_ms`).
 
@@ -78,8 +79,9 @@ per-device `reverse`/`offset` or a calibrated `layout` (D-040), multi-device fan
 interface-bound sockets with automatic rebind on network changes.
 
 ## Shutdown contract
-On SIGINT/SIGTERM/SIGHUP or `stop`: send razer OFF to every streaming device (twice,
+On SIGINT/SIGTERM/SIGHUP/SIGQUIT or `stop` (or a panic, via a hook): send razer OFF to every streaming device (twice,
 10 ms apart — UDP), remove pidfile, exit 0 within 100 ms. On `pause`: razer OFF, stop
-capture requests (zero wakeups except signalfd), keep Wayland connection. Music mode on
+capture requests (zero wakeups except signalfd), keep Wayland connection. Pause and
+output-lost send razer OFF twice too. Music mode on
 `pause` closes the monitor stream (zero wakeups) and reopens it on `resume`. Both are
 idempotent. A network change while paused rebinds silently; razer ON waits for `resume`.
