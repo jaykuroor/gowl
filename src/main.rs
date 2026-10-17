@@ -20,7 +20,11 @@ usage:
   gowl temp KELVIN [DEV]               2000-9000
   gowl status [DEV]
   gowl doctor [DEV]                    network diagnostics (LAN interface, VPN, firewall)
-  gowl outputs | screen | music | calibrate | pause | resume | stop | toggle
+  gowl music [--reaction R] [--palette P] [--fps N] [DEV...]
+                                       sync to what you hear (default sink monitor)
+      reactions: flow pulse energy_fill band_split center_burst wave bass_bounce chase twinkle auto
+      palettes:  rgb auto rainbow aurora sunset ocean neon jewel fire spectrum warm cool mono
+  gowl outputs | screen | calibrate | pause | resume | stop | toggle
                                        not yet implemented
   gowl --version | --help
 
@@ -113,7 +117,8 @@ fn run(args: &[String]) -> Result<(), Error> {
         }
         "status" => cmd_status(positionals(cmd, rest, 1)?),
         "doctor" => cmd_doctor(positionals(cmd, rest, 1)?),
-        "outputs" | "screen" | "music" | "calibrate" | "pause" | "resume" | "stop" | "toggle" => {
+        "music" => gowl::audio::cmd_music(rest),
+        "outputs" | "screen" | "calibrate" | "pause" | "resume" | "stop" | "toggle" => {
             Err(usage(format!("{cmd}: not yet implemented")))
         }
         other => Err(usage(format!("unknown command {other:?}"))),
