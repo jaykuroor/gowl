@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+libc = { version = "0.2.191", default-features = false }
 
 [profile.release]
 opt-level = 3
