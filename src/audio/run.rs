@@ -31,6 +31,13 @@ pub const DEVICE_CAP_HZ: u32 = 40;
 /// have changed; `@DEFAULT_MONITOR@` doesn't follow an open stream everywhere).
 const SILENCE_REOPEN_WINDOWS: u32 = 30 * SAMPLE_RATE / N as u32;
 const SOURCE: &std::ffi::CStr = c"@DEFAULT_MONITOR@";
+/// No audio this long after the stream opened (passive stream on a suspended sink,
+/// D-052): send black once, as silence would render, so the light is in stream mode
+/// and dark like legacy's idle music mode; keepalives repeat it.
+const BLACK_AFTER_NS: u64 = 1_000_000_000;
+/// No window at all for this long (sink suspended, or the default sink moved and the
+/// passive stream still watches the old one): reopen, like 30 s of digital silence.
+const QUIET_REOPEN_NS: u64 = 30_000_000_000;
 
 // ------------------------------------------------------------------ pipeline
 
@@ -151,6 +158,15 @@ impl Music {
         }
         sent
     }
+
+    /// Black on every device that has nothing yet (what silence renders to).
+    pub fn blank(&mut self, now_ms: u64) {
+        let black = [[0u8; 3]; MAX_SEGMENTS];
+        for i in 0..self.voices.len() {
+            let n = self.streams.segments(i);
+            self.streams.push(i, &black[..n], now_ms);
+        }
+    }
 }
 
 // ------------------------------------------------------------------ command
@@ -266,6 +282,8 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
     let start = Instant::now();
     let mut next_us = 0u64;
     let mut silent = 0u32;
+    let mut black_at: Option<u64> = None;
+    let mut heard_at = 0u64; // last window (or open), ns
     let verbose = crate::log::enabled(crate::log::DEBUG);
     let (mut windows, mut renders, mut sends, mut stat_at) = (0u32, 0u32, 0u32, 0u64);
 
@@ -282,6 +300,10 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
         if stream.is_some() {
             let grace = music.streams.keepalive_ms() / 4;
             dl = min_opt(dl, ka.map(|t| (t + grace) * MS));
+            dl = min_opt(dl, black_at);
+            // Whole seconds, so a window arriving doesn't re-arm the timerfd each time.
+            let quiet = (heard_at / 1_000_000_000) * 1_000_000_000 + QUIET_REOPEN_NS;
+            dl = min_opt(dl, Some(quiet));
         } else if !paused && !opening {
             dl = min_opt(dl, retry_at);
             dl = min_opt(dl, ka.map(|t| t * MS));
@@ -308,10 +330,12 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
                     );
                     stream = Some(st);
                     silent = 0;
+                    heard_at = now_ns();
+                    black_at = Some(heard_at + BLACK_AFTER_NS);
                     continue;
                 }
                 // A signal is pending: handle it below, then retry (unless paused/stopped).
-                Err(ReadError::Interrupted) => retry_at = Some(now_ns()),
+                Err(ReadError::Interrupted | ReadError::Expired) => retry_at = Some(now_ns()),
                 Err(ReadError::Failed(e)) => {
                     if !warned {
                         warn!(
@@ -331,6 +355,12 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
             match st.read(&mut samples) {
                 Ok(()) => {}
                 Err(ReadError::Interrupted) => {}
+                Err(ReadError::Expired) => {
+                    debug!("passive stream never started (sink suspended): reopening");
+                    stream = None;
+                    retry_at = Some(now_ns());
+                    continue;
+                }
                 Err(ReadError::Failed(e)) => {
                     warn!("audio read failed: {e}; reopening");
                     stream = None;
@@ -342,6 +372,8 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
             if !hook.fired() {
                 // A full window.
                 windows += 1;
+                black_at = None;
+                heard_at = now_ns();
                 if samples.iter().all(|&v| v == 0.0) {
                     silent += 1;
                     if silent >= SILENCE_REOPEN_WINDOWS {
@@ -423,6 +455,18 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
             // Rebound devices got razer ON (gate reset): the next render sends.
             ctl.service_net(&mut music.streams, now);
             if !paused {
+                if stream.is_some()
+                    && now >= heard_at.saturating_add(QUIET_REOPEN_NS - 1_000_000_000)
+                {
+                    debug!("no audio for 30 s: reopening (the default sink may have changed)");
+                    stream = None;
+                    retry_at = Some(now);
+                }
+                if stream.is_some() && black_at.is_some_and(|t| t <= now) {
+                    debug!("no audio yet (sink suspended?): black until something plays");
+                    black_at = None;
+                    music.blank(now / MS);
+                }
                 // Only frames that were actually rendered are kept alive.
                 music.streams.keepalive(now / MS);
             }

@@ -25,10 +25,12 @@ const PA_CONTEXT_NOAUTOSPAWN: c_int = 1;
 const PA_CONTEXT_READY: c_int = 4;
 const PA_CONTEXT_FAILED: c_int = 5;
 const PA_CONTEXT_TERMINATED: c_int = 6;
+const PA_STREAM_CREATING: c_int = 1;
+const PA_ERR_TIMEOUT: c_int = 8;
 const PA_STREAM_READY: c_int = 2;
-const PA_STREAM_FAILED: c_int = 3;
-const PA_STREAM_TERMINATED: c_int = 4;
 const PA_STREAM_ADJUST_LATENCY: c_int = 0x2000;
+/// Passive stream: don't keep the monitored sink awake (D-052).
+const PA_STREAM_DONT_INHIBIT_AUTO_SUSPEND: c_int = 0x8000;
 
 #[repr(C)]
 struct SampleSpec {
@@ -269,6 +271,9 @@ pub enum ReadError {
     Interrupted,
     /// Stream or connection failed; reopen.
     Failed(String),
+    /// A passive stream that never started (sink suspended the whole time) hit
+    /// libpulse's request timeout; reopen quietly (D-052).
+    Expired,
 }
 
 impl Pulse {
@@ -314,6 +319,9 @@ impl Pulse {
     /// Connect and start a record stream on `source` (e.g. `@DEFAULT_MONITOR@`):
     /// float32 LE, mono (server downmixes), `rate` Hz, fragments of `frag_bytes`.
     /// The hook's fds are polled while waiting, so a signal aborts the connect.
+    /// The stream is passive (D-052): it doesn't keep the sink from suspending, and
+    /// on a suspended sink it stays CREATING until something plays, so this returns
+    /// once the context is up and the stream is requested; `read` waits for data.
     pub fn open<'a>(
         &'a self,
         source: &CStr,
@@ -340,6 +348,7 @@ impl Pulse {
             off: 0,
             filled: 0,
             iterations: 0,
+            started: false,
         };
         // SAFETY: `m` is live; the API pointer lives as long as `m`.
         cap.c = unsafe { (f.context_new)((f.mainloop_get_api)(m), c"gowl".as_ptr()) };
@@ -387,21 +396,17 @@ impl Pulse {
         }
         // SAFETY: live stream; `source` and `attr` valid for the call (copied).
         if unsafe {
-            (f.stream_connect_record)(cap.s, source.as_ptr(), &attr, PA_STREAM_ADJUST_LATENCY)
+            (f.stream_connect_record)(
+                cap.s,
+                source.as_ptr(),
+                &attr,
+                PA_STREAM_ADJUST_LATENCY | PA_STREAM_DONT_INHIBIT_AUTO_SUSPEND,
+            )
         } < 0
         {
             return Err(ReadError::Failed(cap.context_error()));
         }
-        loop {
-            // SAFETY: live stream.
-            match unsafe { (f.stream_get_state)(cap.s) } {
-                PA_STREAM_READY => return Ok(cap),
-                PA_STREAM_FAILED | PA_STREAM_TERMINATED => {
-                    return Err(ReadError::Failed(cap.context_error()));
-                }
-                _ => cap.iterate()?,
-            }
-        }
+        Ok(cap)
     }
 }
 
@@ -418,12 +423,29 @@ pub struct Capture<'a> {
     filled: usize,
     /// Mainloop iterations (≈ wakeups) since the last `take_iterations` (debug stat).
     iterations: u32,
+    /// The stream has been READY at least once.
+    started: bool,
 }
 
 impl Capture<'_> {
     /// Mainloop iterations since the last call.
     pub fn take_iterations(&mut self) -> u32 {
         std::mem::take(&mut self.iterations)
+    }
+
+    /// The stream left READY/CREATING (or the context died): why, as a ReadError.
+    fn broken(&self) -> ReadError {
+        // SAFETY: live context.
+        let (cs, errno) = unsafe {
+            (
+                (self.p.f.context_get_state)(self.c),
+                (self.p.f.context_errno)(self.c),
+            )
+        };
+        if !self.started && cs == PA_CONTEXT_READY && errno == PA_ERR_TIMEOUT {
+            return ReadError::Expired;
+        }
+        ReadError::Failed(self.context_error())
     }
 
     fn context_error(&self) -> String {
@@ -454,6 +476,16 @@ impl Capture<'_> {
     pub fn read(&mut self, buf: &mut [f32]) -> Result<(), ReadError> {
         let f = &self.p.f;
         loop {
+            // SAFETY: live stream.
+            match unsafe { (f.stream_get_state)(self.s) } {
+                PA_STREAM_CREATING => {
+                    // Passive stream on a suspended sink (D-052): nothing to peek yet.
+                    self.iterate()?;
+                    continue;
+                }
+                PA_STREAM_READY => self.started = true,
+                _ => return Err(self.broken()),
+            }
             while self.filled < buf.len() {
                 let mut data: *const c_void = std::ptr::null();
                 let mut nbytes = 0usize;
@@ -498,7 +530,7 @@ impl Capture<'_> {
             // SAFETY: live stream / context.
             let (ss, cs) = unsafe { ((f.stream_get_state)(self.s), (f.context_get_state)(self.c)) };
             if ss != PA_STREAM_READY || cs != PA_CONTEXT_READY {
-                return Err(ReadError::Failed(self.context_error()));
+                return Err(self.broken());
             }
             self.iterate()?;
         }

@@ -529,3 +529,27 @@ timer (slow compositor), the copy goes out on `buffer_done` as before (3 wakeups
 frame's pixels and damage intact, cancel while held).
 **Revisit-if.** A compositor sends something time-critical on the Wayland socket (none of the
 interfaces gowl binds has a ping).
+
+## D-052 — Passive music stream (auto-suspend friendly) (2026-10-17, phase 5, perf agent)
+Supersedes D-034's "keep the monitor stream active". **Context.** D-034 kept the stream active
+because the light's razer timeout was unknown; D-046 measured it: the H6609 holds stream mode for at
+least 8 s, keepalive_ms = 5600, and the D-048 stall guard resends every 1.25 × keepalive (7 s) when
+windows stop. **Decision.** Record with `PA_STREAM_DONT_INHIBIT_AUTO_SUSPEND`. On a suspended sink
+the stream stays CREATING (D-034's observation), so `Pulse::open` returns once the stream is
+requested and `Capture::read` waits in the hooked mainloop (signals, timer, netlink stay live; no
+`pa_stream_peek` while CREATING — it returns "Bad state"). libpulse times the pending create out
+after ~30 s → `ReadError::Expired` → quiet reopen (not a warning, no razer re-ON). No window within
+1 s of opening → one black frame (what silence renders to: the light is in stream mode and dark, as
+in legacy's idle music mode); keepalives repeat it. No window for 30 s → reopen, so a changed default
+sink is still picked up although a suspended sink delivers no zero windows to count (deadline
+quantised to whole seconds so windows don't re-arm the timerfd).
+**Evidence** (live PipeWire 1.6.9, loopback receiver, nothing playing): `measure.py music 30 --fake`
+**0.3 ctx switches/s** (was 47–50), CPU 0.000 %, RSS 6.13 MB, 0.12–0.20 dgrams/s (black + keepalive);
+65 s run: reopen every ~30 s, no warnings. Playing 5–6 s of digital silence to the default sink
+from a separate client (inaudible) woke the stream: 47–48 windows/s, 40 renders/s; it went quiet
+again when that client stopped. Sink running (silent playback) S3-like: 47.6 ctx/s, 0.44 % CPU,
+6.26 MB. Pause → stream closed, razer OFF ×2; resume → reopen; stop → exit in 14 ms.
+System-wide: the USB DAC and the PipeWire graph can now suspend while `gowl music` idles.
+**Not verified here:** reaction to real music (the human: `gowl music`, start/stop a song).
+**Revisit-if.** A PipeWire update keeps passive streams from resuming (music would stay dark);
+the fix is to drop the flag (one constant in pulse.rs).

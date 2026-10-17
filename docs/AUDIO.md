@@ -21,8 +21,11 @@ Golden numbers: `tests/vectors/audio.json` (bands, AutoGain) and `tests/vectors/
 - If the default sink changes, `@DEFAULT_MONITOR@` doesn't follow an open stream: on
   read error, reopen (1 s back-off while the server is unreachable, then razer ON again);
   additionally reopen after 30 s of continuous all-zero windows (cheap check).
-- The stream inhibits auto-suspend of the monitored sink, so silence keeps arriving as zeros
-  (47 wakeups/s, 2 keepalive datagrams/s). The passive alternative and why it waits: D-034.
+- The stream is passive (`PA_STREAM_DONT_INHIBIT_AUTO_SUSPEND`, D-052): it never keeps the
+  monitored sink awake. With nothing playing the sink suspends, no windows arrive and gowl
+  sleeps (0.2 wakeups/s: one keepalive every 1.25 × keepalive_ms); playback anywhere resumes the
+  sink and windows flow again. No audio within 1 s of opening → one black frame (what silence
+  renders to); no window for 30 s → reopen (follows a changed default sink).
 
 Alternative considered: native libpipewire. Rejected for v1 (bindgen/clang build dep,
 larger API surface). Phase 5 may benchmark it if pulse overhead shows up in profiles.
