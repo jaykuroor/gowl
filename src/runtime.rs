@@ -433,17 +433,24 @@ impl Pipeline {
         if self.groups.iter().all(|g| g.settled) {
             return;
         }
-        // At most one step per frame interval (2 ms slack for timer jitter).
-        let due = self.last_step.map_or(0, |t| t + self.interval_ns);
-        if now + 2 * MS >= due {
-            self.step(now);
+        // Frames come one interval apart give or take the compositor's render phase
+        // (10 ms at 100 Hz), so allow steps 3/4 of an interval apart — but never
+        // closer than the 40 Hz device cap — instead of deferring to a timer wakeup.
+        let gap = (self.interval_ns * 3 / 4).max(1_000_000_000 / u64::from(DEVICE_MAX_HZ));
+        let due = self.last_step.map_or(0, |t| t + gap);
+        if now >= due {
+            self.step(now, true);
         } else {
             self.step_at = Some(due);
         }
     }
 
-    /// One EMA step for unsettled groups, then send what changed.
-    fn step(&mut self, now: u64) {
+    /// One EMA step for unsettled groups, then send what changed. After a step
+    /// driven by a frame, the fallback timer step waits 1.5 intervals: on a busy
+    /// screen the next frame arrives about one interval later and steps instead
+    /// (no extra wakeup); on a static screen the copy blocks and the timer
+    /// finishes the fade at the frame rate.
+    fn step(&mut self, now: u64, from_frame: bool) {
         let now_ms = now / MS;
         for g in &mut self.groups {
             if g.settled {
@@ -459,14 +466,14 @@ impl Pipeline {
         self.step_at = if self.groups.iter().all(|g| g.settled) {
             None
         } else {
-            Some(now + self.interval_ns)
+            Some(now + self.interval_ns + if from_frame { self.interval_ns / 2 } else { 0 })
         };
     }
 
     /// Timer expired: smoothing step and/or keepalive if due.
     pub fn on_timer(&mut self, now: u64) {
         if self.step_at.is_some_and(|t| t <= now) {
-            self.step(now);
+            self.step(now, false);
         }
         if self
             .streams
@@ -526,6 +533,7 @@ fn screen_loop(
     let mut waiting = false; // output gone
     let mut report_at = now_ns() + 1000 * MS;
     let (mut frames0, mut sent0, mut allocs0) = (0u64, 0u64, ALLOCS.load(Ordering::Relaxed));
+    let mut wakes = [0u32; 3]; // wayland, timer, signal (debug line)
     let mut pfds = [
         libc::pollfd {
             fd: cap.fd(),
@@ -565,6 +573,9 @@ fn screen_loop(
             return Err(Error::Io("poll", e));
         }
         let now = now_ns();
+        for (w, p) in wakes.iter_mut().zip(&pfds) {
+            *w += u32::from(p.revents != 0);
+        }
 
         if pfds[2].revents != 0 {
             while let Some(s) = sig.read() {
@@ -643,7 +654,16 @@ fn screen_loop(
                     pipe.on_frame(&f, now);
                 }
                 if !paused && !waiting {
-                    next_capture = Some(now.max(last_request + interval));
+                    let at = last_request + interval;
+                    if at <= now {
+                        // Slow copy: the slot has passed, ask now (saves a timer wakeup).
+                        next_capture = None;
+                        if cap.request_next()? {
+                            last_request = now;
+                        }
+                    } else {
+                        next_capture = Some(at);
+                    }
                 }
             }
         }
@@ -664,10 +684,13 @@ fn screen_loop(
         if now >= report_at && crate::log::enabled(crate::log::DEBUG) {
             let allocs = ALLOCS.load(Ordering::Relaxed);
             debug!(
-                "last {:.1} s: {} frames, {} datagrams{}",
+                "last {:.1} s: {} frames, {} datagrams, wakeups wayland {} timer {} signal {}{}",
                 (now - report_at + 1000 * MS) as f64 / 1e9,
                 pipe.frames - frames0,
                 pipe.streams.sent - sent0,
+                wakes[0],
+                wakes[1],
+                wakes[2],
                 if cfg!(feature = "count-alloc") {
                     format!(", {} heap allocations", allocs - allocs0)
                 } else {
@@ -680,6 +703,7 @@ fn screen_loop(
                 pipe.streams.sent,
                 ALLOCS.load(Ordering::Relaxed),
             );
+            wakes = [0; 3];
             report_at = now + 1000 * MS;
         }
     }
