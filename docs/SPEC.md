@@ -29,7 +29,7 @@ gowl color RRGGBB | R,G,B [DEV]
 gowl temp KELVIN [DEV]               2000-9000
 gowl status [DEV]                    devStatus query (falls back to "status")
 gowl outputs                         list Wayland outputs: name, size, scale, transform
-gowl screen [--output NAME] [--fps N] [--depth 0.10-0.50] [DEV...]
+gowl screen [--output NAME] [--fps 1-40] [--depth 0.10-0.50] [DEV...]
 gowl music  [--reaction R] [--palette P] [--fps N] [DEV...]
 gowl calibrate [DEV]                 segment walk: 1 red segment at a time, Enter to step
 gowl pause | resume | stop           signal the running sync (pidfile)

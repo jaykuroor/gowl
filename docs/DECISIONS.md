@@ -145,6 +145,7 @@ allocation per frame, against rule 4; wire.rs allocates nothing per frame (tests
 200 frames, 0 allocations; live niri with `--features count-alloc`: 0 per second after warm-up).
 Revisit-if: gowl needs many more protocols (e.g. DMA-BUF feedback tables, ext-image-copy-capture
 sessions) and the hand-written surface becomes a maintenance burden.
+Orchestrator sign-off 2026-10-17 (Phase 2 review): approved.
 
 ## D-017 — Smoothing on a static screen: timer steps until the EMA is settled (2026-10-17, phase 2, capture agent)
 Context: legacy captures and steps the EMA every frame forever; gowl captures only on damage, so
@@ -177,6 +178,33 @@ Decision: not fixed in Phase 2 (functional phase); flagged for Phase 5: DMA-BUF 
 (CAPTURE_NIRI.md), `capture_output_region` per edge band, and/or a lower default fps. Default fps
 unchanged (30, D-004) until the human weighs responsiveness vs niri CPU.
 Revisit-if: Phase 5.
+
+## D-020 — Screen fps is 1-40, rejected above the device cap (2026-10-17, phase 2 review, capture agent)
+Context: `--fps`/`fps =` accepted 1-240 but the pipeline silently capped at 40 Hz (legacy
+`max_update_hz`), so `--fps 60` looked accepted and did nothing.
+Decision: reject instead of silently capping: `--fps` outside 1-40 is a usage error (exit 2) whose
+message names the 40 Hz device cap; config `fps` outside 1-40 warns and keeps the default (like every
+other bad config value). Help text, SPEC and config.example say 1-40. `music_fps` is unchanged.
+Revisit-if: a device with a higher safe update rate shows up (make the cap per device).
+
+## D-021 — Phase 2 review fixes: flipped transforms, unplug silence, stuck sends (2026-10-17, phase 2 review, capture agent)
+Context: code review of the Phase 2 branch.
+Decision:
+- `Geometry::to_buffer` is now an explicit 8-entry table, the inverse of wlroots `wlr_box_transform` /
+  smithay `transform_point_in`; FLIPPED_90 (pure transpose) and FLIPPED_270 (anti-transpose) were
+  swapped. The test checks fixed corner values and an independent buffer→logical reference table.
+  The earlier "matches grim" claim was wrong for the flipped rotations; the vector test was
+  self-consistent and could not catch it.
+- Output unplugged = one razer OFF (same as pause; the double OFF is only for exit), then no
+  keepalives and no fade steps until it is back (both were still running); replug = razer ON + resend
+  + capture. Covered by tests/screen_mock.rs `output_unplug_and_replug` (fails on the old code).
+- A send to a compositor that stops reading now waits at most 2 s and aborts as soon as the signalfd
+  is readable (Ctrl+C still sends razer OFF and exits 0).
+- After `failed` and after a cancel (pause), the next frame counts as fully damaged; a y-inverted frame
+  is always fully damaged (the protocol doesn't say whether damage rows are stored or displayed order;
+  niri never sets y_invert). "More than 32 rects → everything" is decided by the backend's overflow
+  flag; `Sampler::mark` no longer also treats exactly 32 as overflow.
+Revisit-if: hardware rotation test (human) disagrees with the table.
 
 ## D-030 — Music capture: libpulse's non-threaded mainloop on our thread, not pa_simple (2026-10-17, phase 3, audio agent)
 Context: AUDIO.md/CLAUDE.md name `libpulse-simple` (4 symbols). Measured with it (commit 6ef38ca):

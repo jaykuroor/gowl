@@ -19,7 +19,8 @@ optionally `zwp_linux_dmabuf_v1` (v4, DMA-BUF phase only). Track `wl_output` `na
 
 Output selection: `--output` / config `output` by name (`DP-1`, `HDMI-A-1`, … — same
 names as `niri msg outputs`). Default: the first output announced. If the chosen output
-disappears: razer OFF, wait for it to reappear (no busy loop), resume.
+disappears: razer OFF (once, like pause), no keepalives or fade steps, wait for it to reappear
+(no busy loop), then razer ON and resume (D-021).
 
 ## wlr-screencopy frame cycle (per frame)
 ```
@@ -112,7 +113,7 @@ Goal: replace niri's GPU→CPU readback with a GPU→GPU blit into a LINEAR buff
 - [x] damage rect granularity niri reports — **always one full-output rect (0,0,3440,1440)**, even for frames whose pixels are byte-identical to the previous frame (every second frame in a 12-frame probe). So on niri 26.04 the damage → dirty-zone filter never skips work; it is kept because it costs nothing and helps on compositors with tight damage. (2026-10-17, probe that diffed consecutive frames.)
 - [x] y_invert ever set? — **no** (flags = 0 on every frame observed, SHM, transform normal).
 - [ ] behaviour on output power-off (`niri msg action power-off-monitors`) and on lock screen — not tested (would blank the human's live session). Code path: `failed` → back-off 100 ms then 1 s, logged once; `global_remove` of the output → razer OFF, wait for it to come back, razer ON. Ask the human.
-- [ ] rotated output (`niri msg output HDMI-A-1 transform 90`): logical→buffer mapping follows grim (flip in buffer space, then rotate; unit-tested as a bijection and against the vectors in all 8 transforms) but the absolute direction on niri needs the human's eyes.
+- [ ] rotated output (`niri msg output HDMI-A-1 transform 90`): logical→buffer mapping is the inverse of the wlroots/smithay transform table (D-021; unit-tested against fixed values and against the vectors in all 8 transforms) but the absolute direction on niri needs the human's eyes.
 
 ## Measured on the machine (Phase 2, 2026-10-17)
 - niri CPU: S0 baseline 5.7–6.4 % of a core; with `gowl screen` (30 fps, 3440x1440 SHM) 19.4–20.1 % → **Δ ≈ 14 %** (target ≤ 3 %). At `--fps 15`: 12.8 % → Δ ≈ 6.5 %. This is niri's full-output GPU→CPU readback (19.8 MB per frame); gowl itself is 0.27 %. Phase 5 must look at the DMA-BUF variant, `capture_output_region`, or a lower default fps.
