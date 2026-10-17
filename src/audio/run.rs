@@ -380,6 +380,7 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
                         debug!("resumed");
                         paused = false;
                         music.streams.razer(true);
+                        failed = false; // razer ON just went out
                         retry_at = Some(now);
                     }
                     _ => {}

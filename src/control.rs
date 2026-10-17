@@ -47,6 +47,17 @@ fn is_gowl(pid: i32) -> bool {
     comm(pid).is_some_and(|c| c == "gowl" || Some(&c) == comm(me).as_ref())
 }
 
+/// An empty pidfile younger than a second (a claim in progress).
+fn just_created_empty(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| {
+        m.len() == 0
+            && m.modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age < std::time::Duration::from_secs(1))
+    })
+}
+
 fn read_pid(path: &Path) -> Option<i32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
@@ -104,6 +115,12 @@ impl Pidfile {
                         return Err(Error::Runtime(format!(
                             "gowl is already running (pid {p}); `gowl stop` or `gowl toggle` stops it"
                         )));
+                    }
+                    // Empty and brand new: another gowl is between create and write.
+                    if just_created_empty(path) {
+                        return Err(Error::Runtime(
+                            "another gowl is starting right now; try again".into(),
+                        ));
                     }
                     // Stale: remove it only if nobody replaced it meanwhile.
                     if read_pid(path) == old {
@@ -287,12 +304,7 @@ mod tests {
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let dead = child.id() as i32;
         child.wait().unwrap();
-        for stale in [
-            format!("{dead}\n"),
-            "1\n".into(),
-            "garbage".into(),
-            String::new(),
-        ] {
+        for stale in [format!("{dead}\n"), "1\n".into(), "garbage".into()] {
             // pid 1 is alive but not gowl.
             std::fs::write(&p, &stale).unwrap();
             assert_eq!(running_at(&p), None, "{stale:?}");
@@ -300,6 +312,19 @@ mod tests {
             drop(held);
             assert!(!p.exists());
         }
+        // Empty: a claim in progress while fresh, stale once it is old.
+        std::fs::write(&p, "").unwrap();
+        let e = Pidfile::acquire_at(&p).unwrap_err();
+        assert!(e.to_string().contains("starting"), "{e}");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        drop(Pidfile::acquire_at(&p).unwrap());
+        assert!(!p.exists());
     }
 
     #[test]
