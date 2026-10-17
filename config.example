@@ -6,7 +6,7 @@ device = desk
 
 # ---- screen sync ----
 output = DP-1            # niri output name (`niri msg outputs`); default: first output
-fps = 30                 # capture/send cap; frames are only taken when the screen changes
+fps = 30                 # capture/send cap, 1-40 (device limit); frames only when the screen changes
 depth = 0.28             # how far edge zones reach into the screen (0.10-0.50)
 saturation = 1.15
 screen_brightness = 0.75 # channel multiplier, 0-1

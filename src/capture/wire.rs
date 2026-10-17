@@ -18,6 +18,8 @@ pub const DISPLAY: u32 = 1;
 const RBUF: usize = 16 * 1024;
 const WBUF: usize = 4096;
 const MAX_FDS: usize = 4;
+/// Longest wait for a compositor that doesn't drain its socket.
+const SEND_WAIT_MS: i32 = 2000;
 /// Wayland caps one message at 4096 bytes.
 const MAX_MSG: usize = 4096;
 
@@ -108,6 +110,9 @@ pub struct Conn {
     server: bool,
     rfds: [RawFd; MAX_FDS],
     nrfds: usize,
+    /// Polled alongside the socket while a send waits (the runtime's signalfd), so
+    /// a compositor that stops reading can't swallow Ctrl+C. -1 = none.
+    interrupt_fd: RawFd,
 }
 
 fn sock_path() -> Result<Vec<u8>, Error> {
@@ -189,6 +194,7 @@ impl Conn {
             server: false,
             rfds: [-1; MAX_FDS],
             nrfds: 0,
+            interrupt_fd: -1,
         }
     }
 
@@ -312,7 +318,7 @@ impl Conn {
                 match e.kind() {
                     io::ErrorKind::Interrupted => continue,
                     io::ErrorKind::WouldBlock => {
-                        wait_fd(self.fd.as_raw_fd(), libc::POLLOUT)?;
+                        self.wait_writable()?;
                         continue;
                     }
                     _ => return Err(Error::Capture(format!("Wayland connection lost: {e}"))),
@@ -465,6 +471,50 @@ impl Conn {
         Ok(cb)
     }
 
+    /// Also watch `fd` (readable = give up) whenever a send has to wait.
+    pub fn set_interrupt_fd(&mut self, fd: RawFd) {
+        self.interrupt_fd = fd;
+    }
+
+    /// The compositor's socket buffer is full: wait at most `SEND_WAIT_MS` for it
+    /// to drain, and not at all once the interrupt fd (signals) is readable.
+    fn wait_writable(&self) -> Result<(), Error> {
+        let mut p = [
+            libc::pollfd {
+                fd: self.fd.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: self.interrupt_fd, // poll ignores negative fds
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        loop {
+            // SAFETY: valid pollfd array.
+            let r = unsafe { libc::poll(p.as_mut_ptr(), 2, SEND_WAIT_MS) };
+            if r < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(Error::Io("poll", e));
+            }
+            if r == 0 {
+                return Err(Error::Capture(format!(
+                    "the Wayland compositor stopped reading requests for {SEND_WAIT_MS} ms"
+                )));
+            }
+            if p[1].revents != 0 {
+                return Err(Error::Capture(
+                    "interrupted while waiting for the Wayland compositor".into(),
+                ));
+            }
+            return Ok(());
+        }
+    }
+
     /// Block until the socket is readable (setup roundtrips only).
     pub fn wait_readable(&self) -> Result<(), Error> {
         wait_fd(self.fd.as_raw_fd(), libc::POLLIN)
@@ -477,7 +527,7 @@ fn put(b: &mut [u8], p: &mut usize, v: u32) {
     *p += 4;
 }
 
-/// Block until `fd` is ready for `events` (setup paths and a full send buffer only).
+/// Block until `fd` is ready for `events` (setup roundtrips only).
 fn wait_fd(fd: RawFd, events: libc::c_short) -> Result<(), Error> {
     let mut p = libc::pollfd {
         fd,
@@ -515,6 +565,34 @@ mod tests {
         assert_eq!(r, 0);
         // SAFETY: fresh fds from socketpair.
         unsafe { (OwnedFd::from_raw_fd(sv[0]), OwnedFd::from_raw_fd(sv[1])) }
+    }
+
+    #[test]
+    fn stuck_compositor_cannot_swallow_a_signal() {
+        let (a, _server_never_reads) = pair();
+        let mut c = Conn::from_fd(a);
+        let mut p = [0; 2];
+        // SAFETY: pipe fills two fds; we make the read end readable.
+        unsafe {
+            assert_eq!(libc::pipe(p.as_mut_ptr()), 0);
+            assert_eq!(libc::write(p[1], b"x".as_ptr().cast(), 1), 1);
+        }
+        c.set_interrupt_fd(p[0]);
+        let t = std::time::Instant::now();
+        let big = [b'x'; 1000];
+        let err = loop {
+            if let Err(e) = c.request(5, 0, &[Arg::Str(&big)]) {
+                break e;
+            }
+            assert!(t.elapsed().as_secs() < 5, "never blocked");
+        };
+        assert!(err.to_string().contains("interrupted"), "{err}");
+        assert!(t.elapsed().as_millis() < 1000);
+        // SAFETY: closing the pipe we created.
+        unsafe {
+            libc::close(p[0]);
+            libc::close(p[1]);
+        }
     }
 
     #[test]

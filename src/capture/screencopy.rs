@@ -461,7 +461,12 @@ impl Screencopy {
             }
             EV_FRAME_READY => {
                 // No damage events (copy without damage, v1) = everything changed.
-                self.frame_full = self.fresh || self.damage_all || self.ndamage == 0;
+                // y_invert: the protocol says damage is in "buffer coordinates" but not
+                // whether that means rows as stored (bottom-up) or as displayed, and
+                // compositors disagree; niri never sets y_invert (CAPTURE_NIRI.md), so
+                // rather than guess we treat a y-inverted frame as fully damaged.
+                self.frame_full =
+                    self.fresh || self.damage_all || self.ndamage == 0 || self.y_invert;
                 self.fresh = false;
                 self.frame_transform = self.selected().map_or(0, |o| o.transform);
                 self.have_frame = true;
@@ -471,6 +476,8 @@ impl Screencopy {
             EV_FRAME_FAILED => {
                 self.destroy_frame()?;
                 self.have_frame = false;
+                // Whatever changed meanwhile wasn't seen: next frame is full damage.
+                self.fresh = true;
                 st.failed = true;
             }
             _ => {}
@@ -557,6 +564,8 @@ impl Capture for Screencopy {
     }
 
     fn cancel(&mut self) -> Result<(), Error> {
+        // Damage accumulated for the abandoned frame is lost: next frame is full.
+        self.fresh = true;
         self.destroy_frame()
     }
 
@@ -580,5 +589,9 @@ impl Capture for Screencopy {
 
     fn output_name(&self) -> Option<&str> {
         self.selected().map(|o| o.name.as_str())
+    }
+
+    fn set_interrupt_fd(&mut self, fd: RawFd) {
+        self.g.conn.set_interrupt_fd(fd);
     }
 }

@@ -551,10 +551,23 @@ fn screen_loop(
             revents: 0,
         },
     ];
+    cap.set_interrupt_fd(sig.fd());
     loop {
-        cap.flush()?;
+        if let Err(e) = cap.flush() {
+            // A stop signal aborts a send stuck on a compositor that stopped reading.
+            if sig.read() == Some(Sig::Stop) {
+                debug!("stop signal while the compositor was not reading: razer off, exit");
+                return Ok(());
+            }
+            return Err(e);
+        }
         let cap_dl = next_capture.filter(|_| !paused && !waiting);
-        let pipe_dl = if paused { None } else { pipe.deadline() };
+        // Paused or output gone: razer is OFF, so no fade steps and no keepalives.
+        let pipe_dl = if paused || waiting {
+            None
+        } else {
+            pipe.deadline()
+        };
         let dl = match (cap_dl, pipe_dl) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -676,7 +689,7 @@ fn screen_loop(
                     last_request = now;
                 }
             }
-            if !paused {
+            if !paused && !waiting {
                 pipe.on_timer(now);
             }
         }

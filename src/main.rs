@@ -21,7 +21,7 @@ usage:
   gowl status [DEV]
   gowl doctor [DEV]                    network diagnostics (LAN interface, VPN, firewall)
   gowl outputs                         list Wayland outputs (name, mode, scale, transform)
-  gowl screen [--output NAME] [--fps N] [--depth 0.10-0.50] [DEV...]
+  gowl screen [--output NAME] [--fps 1-40] [--depth 0.10-0.50] [DEV...]
                                        sync the lights to the screen edges (Ctrl+C stops)
   gowl music [--reaction R] [--palette P] [--fps N] [DEV...]
                                        sync to what you hear (default sink monitor)
@@ -458,8 +458,8 @@ fn cmd_screen(rest: &[String]) -> Result<(), Error> {
                 fps = it
                     .next()
                     .and_then(|v| v.parse().ok())
-                    .filter(|f| (1..=240).contains(f))
-                    .ok_or_else(|| usage("screen: --fps expects 1-240"))?;
+                    .filter(|f| (1..=gowl::runtime::DEVICE_MAX_HZ).contains(f))
+                    .ok_or_else(|| usage("screen: --fps expects 1-40 (40 Hz is the device cap)"))?;
             }
             "--depth" => {
                 depth = it

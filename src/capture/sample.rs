@@ -91,23 +91,25 @@ impl Geometry {
         }
     }
 
-    /// Logical pixel → buffer pixel: undo the rotation, then the flips (the
-    /// compositor flips in buffer space first, then rotates — same as grim).
+    /// Logical (as-seen) pixel → buffer pixel. The table is the inverse of the
+    /// buffer → logical mapping of wlroots `wlr_box_transform` / smithay
+    /// `Transform::transform_point_in` (pixel-index form): FLIPPED_90 is the pure
+    /// transpose, FLIPPED_270 the anti-transpose. `y_invert` (rows stored bottom-up)
+    /// is applied last, to the buffer row.
     #[inline]
     pub fn to_buffer(&self, lx: u32, ly: u32) -> (u32, u32) {
         let (w, h) = (self.width, self.height);
-        let (fx, fy) = match self.transform & 3 {
+        let (bx, by) = match self.transform & 7 {
             0 => (lx, ly),
             1 => (ly, h - 1 - lx),
             2 => (w - 1 - lx, h - 1 - ly),
-            _ => (w - 1 - ly, lx),
+            3 => (w - 1 - ly, lx),
+            4 => (w - 1 - lx, ly),
+            5 => (ly, lx),
+            6 => (lx, h - 1 - ly),
+            _ => (w - 1 - ly, h - 1 - lx),
         };
-        let bx = if self.transform & 4 != 0 {
-            w - 1 - fx
-        } else {
-            fx
-        };
-        let by = if self.y_invert { h - 1 - fy } else { fy };
+        let by = if self.y_invert { h - 1 - by } else { by };
         (bx, by)
     }
 }
@@ -190,7 +192,8 @@ impl Sampler {
     }
 
     /// Mark zones touched by `damage` (buffer coordinates) dirty. More than
-    /// `MAX_DAMAGE` rects or one rect over half the output → everything.
+    /// `MAX_DAMAGE` rects (the capture backend then sets `full`) or one rect over
+    /// half the output → everything.
     pub fn mark(&mut self, damage: &[DamageRect], full: bool) {
         let Some(geo) = self.geo else {
             self.dirty = [u64::MAX; 4];
@@ -198,7 +201,6 @@ impl Sampler {
         };
         let half = u64::from(geo.width) * u64::from(geo.height) / 2;
         if full
-            || damage.len() >= super::MAX_DAMAGE
             || damage
                 .iter()
                 .any(|d| u64::from(d.w) * u64::from(d.h) > half)
@@ -307,17 +309,62 @@ mod tests {
         }
     }
 
+    /// Buffer pixel → logical pixel per wlroots/smithay (buffer size w×h), written
+    /// out independently of `to_buffer`.
+    fn reference_to_logical(t: u32, w: u32, h: u32, bx: u32, by: u32) -> (u32, u32) {
+        match t {
+            0 => (bx, by),
+            1 => (h - 1 - by, bx),
+            2 => (w - 1 - bx, h - 1 - by),
+            3 => (by, w - 1 - bx),
+            4 => (w - 1 - bx, by),
+            5 => (by, bx),
+            6 => (bx, h - 1 - by),
+            _ => (h - 1 - by, w - 1 - bx),
+        }
+    }
+
     #[test]
-    fn rotation_directions_match_grim() {
-        // transform 90: logical top-left comes from the buffer's bottom-left.
-        let g = geo(7, 4, 1, false);
-        assert_eq!(g.to_buffer(0, 0), (0, 3));
-        // transform 270: logical top-left comes from the buffer's top-right.
-        let g = geo(7, 4, 3, false);
-        assert_eq!(g.to_buffer(0, 0), (6, 0));
-        // flipped: mirrored horizontally.
-        let g = geo(7, 4, 4, false);
-        assert_eq!(g.to_buffer(0, 0), (6, 0));
+    fn transforms_match_wlroots_smithay_tables() {
+        let (w, h) = (7u32, 4u32);
+        // Buffer pixel holding logical (1, 0), per transform — fixed values.
+        let want_1_0 = [
+            (1, 0),
+            (0, 2),
+            (5, 3),
+            (6, 1),
+            (5, 0),
+            (0, 1),
+            (1, 3),
+            (6, 2),
+        ];
+        // Buffer pixel holding logical (0, 0).
+        let want_0_0 = [
+            (0, 0),
+            (0, 3),
+            (6, 3),
+            (6, 0),
+            (6, 0),
+            (0, 0),
+            (0, 3),
+            (6, 3),
+        ];
+        for t in 0..8u32 {
+            let g = geo(w, h, t, false);
+            assert_eq!(g.to_buffer(1, 0), want_1_0[t as usize], "transform {t}");
+            assert_eq!(g.to_buffer(0, 0), want_0_0[t as usize], "transform {t}");
+            let (lw, lh) = g.logical();
+            for ly in 0..lh {
+                for lx in 0..lw {
+                    let (bx, by) = g.to_buffer(lx, ly);
+                    assert_eq!(reference_to_logical(t, w, h, bx, by), (lx, ly), "t{t}");
+                }
+            }
+            // y_invert flips the stored row only.
+            let gi = geo(w, h, t, true);
+            let (bx, by) = g.to_buffer(1, 0);
+            assert_eq!(gi.to_buffer(1, 0), (bx, h - 1 - by), "t{t} y_invert");
+        }
     }
 
     #[test]

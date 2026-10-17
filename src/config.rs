@@ -199,7 +199,7 @@ fn global_key(c: &mut Config, k: &str, v: &str) -> Result<(), String> {
     match k {
         "device" => c.device = Some(v.to_string()),
         "output" => c.output = Some(v.to_string()),
-        "fps" => c.fps = int_in(v, 1, 240)?,
+        "fps" => c.fps = int_in(v, 1, 40)?, // 40 Hz device cap (D-020)
         "depth" => c.depth = float_in(v, 0.10, 0.50)?,
         "saturation" => c.saturation = float_in(v, 0.0, 4.0)?,
         "screen_brightness" => c.screen_brightness = float_in(v, 0.0, 1.0)?,

@@ -148,6 +148,8 @@ pub trait Capture {
     fn frame(&self) -> Option<Frame<'_>>;
     /// Name of the captured output, if any.
     fn output_name(&self) -> Option<&str>;
+    /// An fd (the runtime's signalfd) that aborts a blocked send when readable.
+    fn set_interrupt_fd(&mut self, fd: RawFd);
 }
 
 /// Open the backend: `GOWL_CAPTURE=screencopy|imagecopy` forces one; otherwise

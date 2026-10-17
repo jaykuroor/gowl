@@ -8,6 +8,7 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::Receiver;
 
 use gowl::capture::wire::{Arg, Conn, DISPLAY};
 
@@ -37,9 +38,26 @@ pub fn color_of(k: usize) -> [u8; 3] {
     ]
 }
 
+/// Commands for a running mock (output hot-plug).
+#[derive(Clone, Copy, Debug)]
+pub enum Ctl {
+    /// `wl_registry.global_remove` of the output.
+    RemoveOutput,
+    /// Announce a (new) output global and answer `more_frames` further copies.
+    AddOutput { more_frames: usize },
+}
+
 /// Serve one client until it disconnects. `served` counts completed frames.
 pub fn serve(fd: OwnedFd, o: Opts, served: Arc<AtomicUsize>) {
+    serve_ctl(fd, o, served, None);
+}
+
+/// `serve`, plus hot-plug commands from `ctl` (checked every 10 ms).
+pub fn serve_ctl(fd: OwnedFd, o: Opts, served: Arc<AtomicUsize>, ctl: Option<Receiver<Ctl>>) {
     let mut c = Conn::test_server(fd);
+    let mut changing = o.changing;
+    let mut out_global = 2u32;
+    let mut next_global = 4u32;
     let (mut reg, mut shm, mut mgr) = (0u32, 0u32, 0u32);
     let mut outputs: Vec<u32> = Vec::new();
     let mut pools: Vec<Pool> = Vec::new();
@@ -84,39 +102,13 @@ pub fn serve(fd: OwnedFd, o: Opts, served: Arc<AtomicUsize>) {
                 let _v = a.uint();
                 let id = a.uint();
                 match name {
+                    n if n == out_global && n != 1 && n != 3 => {
+                        outputs.push(id);
+                        send_output(&mut c, id, &o);
+                    }
                     1 => {
                         shm = id;
                         let _ = c.request(shm, 0, &[Arg::Uint(XRGB8888)]);
-                    }
-                    2 => {
-                        outputs.push(id);
-                        let _ = c.request(
-                            id,
-                            0,
-                            &[
-                                Arg::Int(0),
-                                Arg::Int(0),
-                                Arg::Int(600),
-                                Arg::Int(340),
-                                Arg::Int(0),
-                                Arg::Str(b"Mock"),
-                                Arg::Str(b"Screen"),
-                                Arg::Int(o.transform),
-                            ],
-                        );
-                        let _ = c.request(
-                            id,
-                            1,
-                            &[
-                                Arg::Uint(1),
-                                Arg::Int(o.width as i32),
-                                Arg::Int(o.height as i32),
-                                Arg::Int(60000),
-                            ],
-                        );
-                        let _ = c.request(id, 3, &[Arg::Int(1)]);
-                        let _ = c.request(id, 4, &[Arg::Str(b"MOCK-1")]);
-                        let _ = c.request(id, 2, &[]);
                     }
                     3 => mgr = id,
                     _ => {}
@@ -182,7 +174,7 @@ pub fn serve(fd: OwnedFd, o: Opts, served: Arc<AtomicUsize>) {
                 match ev.op {
                     2 => {
                         let buf = a.uint();
-                        if k >= o.changing {
+                        if k >= changing {
                             continue; // static screen: never completes
                         }
                         let &(_, pi, s) =
@@ -227,12 +219,71 @@ pub fn serve(fd: OwnedFd, o: Opts, served: Arc<AtomicUsize>) {
         }
         match c.fill() {
             Ok(true) => {}
-            Ok(false) => {
-                if c.wait_readable().is_err() {
-                    return;
+            Ok(false) => match &ctl {
+                None => {
+                    if c.wait_readable().is_err() {
+                        return;
+                    }
                 }
-            }
+                Some(rx) => {
+                    let mut p = libc::pollfd {
+                        fd: c.fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // SAFETY: one valid pollfd.
+                    unsafe { libc::poll(&mut p, 1, 10) };
+                    while let Ok(cmd) = rx.try_recv() {
+                        match cmd {
+                            Ctl::RemoveOutput => {
+                                let _ = c.request(reg, 1, &[Arg::Uint(out_global)]);
+                                out_global = 0;
+                            }
+                            Ctl::AddOutput { more_frames } => {
+                                out_global = next_global;
+                                next_global += 1;
+                                changing = k + more_frames;
+                                let _ = c.request(
+                                    reg,
+                                    0,
+                                    &[Arg::Uint(out_global), Arg::Str(b"wl_output"), Arg::Uint(4)],
+                                );
+                            }
+                        }
+                    }
+                }
+            },
             Err(_) => return,
         }
     }
+}
+
+fn send_output(c: &mut Conn, id: u32, o: &Opts) {
+    let _ = c.request(
+        id,
+        0,
+        &[
+            Arg::Int(0),
+            Arg::Int(0),
+            Arg::Int(600),
+            Arg::Int(340),
+            Arg::Int(0),
+            Arg::Str(b"Mock"),
+            Arg::Str(b"Screen"),
+            Arg::Int(o.transform),
+        ],
+    );
+    let _ = c.request(
+        id,
+        1,
+        &[
+            Arg::Uint(1),
+            Arg::Int(o.width as i32),
+            Arg::Int(o.height as i32),
+            Arg::Int(60000),
+        ],
+    );
+    let _ = c.request(id, 3, &[Arg::Int(1)]);
+    let _ = c.request(id, 4, &[Arg::Str(b"MOCK-1")]);
+    let _ = c.request(id, 2, &[]);
 }
