@@ -6,8 +6,9 @@
 //! deadline accumulator; windows in between are read and dropped.
 //!
 //! Signals: SIGINT/SIGTERM/SIGHUP set an `AtomicBool` (sigaction without
-//! SA_RESTART); the flag is checked after every read (≤ 21 ms). If the read ever
-//! stalls, a 1 s `alarm` watchdog sends razer OFF from the handler and exits.
+//! SA_RESTART), so the mainloop's `poll()` returns EINTR and the loop sees the flag.
+//! For the tiny race where a signal lands just before `poll()` while no audio
+//! flows, a 1 s `alarm` watchdog sends razer OFF from the handler and exits.
 
 use std::ffi::c_int;
 use std::net::{SocketAddrV4, UdpSocket};
@@ -16,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use super::bands::{Analyzer, AutoGain, SAMPLE_RATE};
 use super::fft::N;
-use super::pulse::{Pulse, Stream};
+use super::pulse::{Capture, Pulse, ReadError};
 use super::render::{Palette, Reaction, Renderer};
 use crate::Error;
 use crate::color::{self, Rgb, SendGate, Smoother};
@@ -416,16 +417,17 @@ pub fn cmd_music(args: &[String]) -> Result<(), Error> {
     r
 }
 
-fn open_stream(pulse: &Pulse) -> Option<Stream<'_>> {
+fn open_stream(pulse: &Pulse) -> Option<Capture<'_>> {
     let mut warned = false;
     while !stopping() {
-        match pulse.open(SOURCE, SAMPLE_RATE, (N * 4) as u32) {
+        match pulse.open(SOURCE, SAMPLE_RATE, (N * 4) as u32, &stopping) {
             Ok(st) => {
                 if warned {
                     warn!("audio capture is back");
                 }
                 return Some(st);
             }
+            Err(_) if stopping() => break,
             Err(e) => {
                 if !warned {
                     warn!(
@@ -459,7 +461,8 @@ fn stream_loop(pulse: &Pulse, music: &mut Music) -> Result<(), Error> {
     let (mut windows, mut renders, mut sends, mut stat_at) = (0u32, 0u32, 0u32, 0u64);
 
     while !stopping() {
-        if let Err(e) = stream.read(&mut samples) {
+        if let Err(e) = stream.read(&mut samples, &stopping) {
+            let ReadError::Failed(e) = e else { break };
             if stopping() {
                 break;
             }
@@ -510,8 +513,11 @@ fn stream_loop(pulse: &Pulse, music: &mut Music) -> Result<(), Error> {
         if verbose && now_us / 1000 >= stat_at + 1000 {
             let b = music.last_bands;
             debug!(
-                "music: {windows} windows, {renders} renders, {sends} datagrams in the last second; bands {:.3} {:.3} {:.3}",
-                b[0], b[1], b[2]
+                "music: {} wakeups, {windows} windows, {renders} renders, {sends} datagrams in the last second; bands {:.3} {:.3} {:.3}",
+                stream.take_iterations(),
+                b[0],
+                b[1],
+                b[2]
             );
             (windows, renders, sends, stat_at) = (0, 0, 0, now_us / 1000);
         }
