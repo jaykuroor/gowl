@@ -96,7 +96,7 @@ rects — trivial). Only dirty zones are re-summed; clean zones keep last frame'
 mean. If the compositor sends > 32 rects or one rect covers > 50% of the output,
 just mark all zones dirty.
 
-## DMA-BUF variant (Phase 5, only if measurements demand it)
+## DMA-BUF variant (Phase 5: udmabuf tried and failed on NVIDIA; GBM pending sign-off, D-050)
 Goal: replace niri's GPU→CPU readback with a GPU→GPU blit into a LINEAR buffer we mmap.
 - Get the render node from `zwp_linux_dmabuf_v1` default feedback `main_device` (dev_t → `/dev/dri/renderD*`).
 - `gbm_create_device` → `gbm_bo_create_with_modifiers2(…, [DRM_FORMAT_MOD_LINEAR], GBM_BO_USE_LINEAR)`
@@ -110,10 +110,24 @@ Goal: replace niri's GPU→CPU readback with a GPU→GPU blit into a LINEAR buff
 - [x] screencopy version advertised; ext-image-copy-capture present? — **screencopy v3; ext-image-copy-capture and ext-output-image-capture-source absent on niri 26.04** (2026-10-17, wayland-info). The imagecopy backend stays a seam only.
 - [x] which SHM formats niri offers on this output — **one `buffer` offer per frame: XRGB8888 (`XR24`), 3440x1440, stride 13760**, plus a `linux_dmabuf` offer and `buffer_done` (v3). `wl_shm` itself advertises XR24/AR24/XB24/AB24, no 10-bit (2026-10-17, `GOWL_LOG=debug gowl screen`: "shm buffer 3440x1440 stride 13760 format XR24 (1 offers)").
 - [ ] does `copy_with_damage` really block on a static screen (gowl CPU ≈ 0)? — **not verifiable by the agent**: this desktop never went static (an animated background layer / focused browser repaint the whole output; ~98% of pixels change on every other frame, mean Δ 15/channel). Copies completed 8–38 ms after the request, every time. On the mock compositor (tests/screen_mock.rs) the loop drops to keepalive-only when copies block. Needs the human: idle desktop, then `python3 tools/measure.py screen 30 --fake` (S2).
-- [x] damage rect granularity niri reports — **always one full-output rect (0,0,3440,1440)**, even for frames whose pixels are byte-identical to the previous frame (every second frame in a 12-frame probe). So on niri 26.04 the damage → dirty-zone filter never skips work; it is kept because it costs nothing and helps on compositors with tight damage. (2026-10-17, probe that diffed consecutive frames.)
+- [x] damage rect granularity niri reports — **Phase 5 update (2026-10-17): tight rects now**, e.g.
+  `(3416, 68, 24, 1330)` for a scrollbar-sized change on the right edge (first frame into a new
+  buffer: full). The dirty-zone filter now skips work on niri too. Phase 2 saw:
+  **always one full-output rect (0,0,3440,1440)**, even for frames whose pixels are byte-identical to the previous frame (every second frame in a 12-frame probe). So on niri 26.04 the damage → dirty-zone filter never skips work; it is kept because it costs nothing and helps on compositors with tight damage. (2026-10-17, probe that diffed consecutive frames.)
 - [x] y_invert ever set? — **no** (flags = 0 on every frame observed, SHM, transform normal).
 - [ ] behaviour on output power-off (`niri msg action power-off-monitors`) and on lock screen — not tested (would blank the human's live session). Code path: `failed` → back-off 100 ms then 1 s, logged once; `global_remove` of the output → razer OFF, wait for it to come back, razer ON. Ask the human.
 - [ ] rotated output (`niri msg output HDMI-A-1 transform 90`): logical→buffer mapping is the inverse of the wlroots/smithay transform table (D-021; unit-tested against fixed values and against the vectors in all 8 transforms) but the absolute direction on niri needs the human's eyes.
+
+## Measured on the machine (Phase 5, 2026-10-17) — details in DECISIONS D-050
+- Busy desktop (niri S0 27–28 %): niri Δ ≈ 21 % at 30 fps. Δ vs fps: 1 → 2.7, 5 → 12.7, 10 → 16,
+  15 → 17, 20 → 20, 30 → 21 (saturating; per capture, not per byte). Δ vs region: full 21,
+  3440x400 20, 3440x100 17.4. A pending-but-static damage copy: Δ 5.5–7.9 while niri redraws for
+  other reasons.
+- DMA-BUF via `/dev/udmabuf` (system memory, LINEAR, no libgbm): niri imports it, but NVIDIA's EGL
+  can't bind it as a framebuffer (`EGLImage not supported`) → every copy fails. Not usable on this
+  GPU; GBM (VRAM BO) would need libgbm and a niri profile first (D-050).
+- Capture loop: 2 wakeups per frame (D-051): the next frame is negotiated on `ready`, its offers wait
+  in the socket (Wayland fd not polled while held) and the timer sends the copy.
 
 ## Measured on the machine (Phase 2, 2026-10-17)
 - niri CPU: S0 baseline 5.7–6.4 % of a core; with `gowl screen` (30 fps, 3440x1440 SHM) 19.4–20.1 % → **Δ ≈ 14 %** (target ≤ 3 %). At `--fps 15`: 12.8 % → Δ ≈ 6.5 %. This is niri's full-output GPU→CPU readback (19.8 MB per frame); gowl itself is 0.27 %. Phase 5 must look at the DMA-BUF variant, `capture_output_region`, or a lower default fps.

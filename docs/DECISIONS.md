@@ -567,3 +567,47 @@ Not tried, with reasons: `target-cpu=native` (user code is ~20 % of gowl's CPU, 
 in poll/recvmsg/sendmsg; and the RPM must stay portable); `MADV_HUGEPAGE` on the SHM buffer
 (`shmem_enabled = never` on this kernel, and a huge page would map 2 MB per touched sample → more
 RSS); `MAP_POPULATE` (maps all 19.8 MB → RSS up, nothing saved per frame).
+
+## D-050 — Capture path for D-019: stay on wlr-screencopy SHM; DMA-BUF needs libgbm sign-off (2026-10-17, phase 5, perf agent)
+**Context.** D-019: niri pays ≈ 14 % of a core (Phase 2) for 30 fps SHM screencopy of 3440x1440;
+budget ≤ 3 %. Today's desktop was busier (niri S0 27.0–28.2 %) and the Δ reads **≈ 21 %** at 30 fps.
+Options from PROGRESS: DMA-BUF, region capture, lower fps, ext-image-copy-capture.
+**Evidence** (fake device, 20–60 s windows, S0 re-measured between runs; probes were temporary knobs,
+reverted):
+- *What niri's cost scales with.* Capture area (`capture_output_region`): full output Δ 19.7–21,
+  3440x400 (28 % of the pixels) Δ 20.0, 3440x100 (7 %) Δ 17.4. Readback *volume* explains only ≈ 3.5
+  of the ≈ 21 points; the rest is per capture. Capture rate: 1 fps Δ 2.7, 5 → 12.7, 10 → 16, 15 → 17,
+  20 → 20, 30 → 21 — strongly saturating, and niri's own context switches fall from 400/s to 285/s as
+  the rate rises (it sleeps less: a synchronous render + download per capture). A copy that is
+  pending but never completes (static 64x64 / 1000x400 regions on this animated desktop) still costs
+  Δ 5.5–7.9 (niri checks damage for the pending copy on every redraw), with gowl at 1.1–1.4 wakeups/s.
+- *Region capture:* rejected. The zones at the default depth 0.28 cover ≈ 80 % of the screen (their
+  bounding box is the whole output), and the cost barely depends on area anyway.
+- *Lower fps:* only ≤ 2 fps gets near the target; 30 → 15 fps saves ≈ 4 points. The human chose 30
+  (D-004), so the default stays; it is a human trade-off, listed in the Phase 5 report.
+- *ext-image-copy-capture:* not advertised by niri 26.04 (D-006); nothing to measure.
+- *DMA-BUF without libgbm (tried):* sealed memfd → `/dev/udmabuf` (the user has an ACL on it) →
+  `zwp_linux_dmabuf_v1` v3 (`create`, not `create_immed`, so a refusal is an event) as XR24 LINEAR
+  (niri lists LINEAR for XR24/AR24), stride 256-aligned and tight. niri **imported** the buffer
+  (`created`) but every copy failed; niri's journal: `[GL] GL_INVALID_OPERATION … EGLImage not
+  supported` → `error binding dmabuf: Failed to bind Framebuffer`. NVIDIA 615.71.09's EGL cannot render
+  into a foreign system-memory dma-buf. After 3 failed frames gowl fell back to SHM, so the code was
+  safe, but it can never help on this machine; reverted (≈ 300 lines not worth carrying untested on
+  Mesa). It would likely work on AMD/Intel.
+- *DMA-BUF via GBM (not tried, needs libgbm → orchestrator sign-off):* NVIDIA's GBM backend
+  (`/usr/lib64/gbm/nvidia-drm_gbm.so`) would allocate a LINEAR BO in VRAM that niri can render into.
+  The catch is reading it: 6,423 scattered samples per frame through an uncached BAR mapping (~µs each
+  → milliseconds per frame in gowl), or `gbm_bo_map`, which on NVIDIA blits the whole BO to a staging
+  copy (the readback moves into gowl). Expected niri saving is the readback + synchronous-wait share,
+  which the area probe bounds from below at ≈ 3.5 points and which only a niri profile can size.
+**Decision.** Keep wlr-screencopy SHM at 30 fps, now 2 wakeups per frame (D-051). The S1 niri target
+(≤ 3 %) is **missed and justified** by the curves above: on this NVIDIA machine even 1 fps costs 2.7 %.
+No libgbm added. Before a GBM experiment: the human profiles niri user space (own process,
+`perf_event_paranoid = 2`, `ptrace_scope = 0`) with and without `gowl screen` running —
+`perf record -e cycles:u -g --call-graph dwarf -p $(pgrep -x niri) -o /tmp/niri-gowl.perf -- sleep 20` —
+and `perf report -i /tmp/niri-gowl.perf --no-children --sort dso,sym --stdio | head -60`. If
+`glReadPixels`/`map_texture`/memcpy/driver spin-waits dominate, GBM is worth a sign-off request
+(measure: niri Δ, gowl CPU and RSS with the BO mapped); if scene rendering dominates, no buffer type
+will help and only a lower or adaptive capture rate does.
+**Revisit-if.** niri ships ext-image-copy-capture, the GPU/driver changes (Mesa: retry udmabuf — the
+reverted patch is described above), or the human accepts a slower idle capture rate.

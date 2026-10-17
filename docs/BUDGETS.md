@@ -43,12 +43,74 @@ It prints a ready-to-paste row for the results log below.
 For real devices, count datagrams with `sudo tcpdump -i any -n udp dst port 4003` (ask
 first), or run with `GOWL_LOG=debug`, which prints a once-per-second send counter.
 Allocation count: `cargo test --release --features count-alloc -- --ignored alloc_steady_state`.
+Frame → sendto latency: `cargo test --release --test latency -- --ignored --nocapture`.
+S2 on the gowl side (mock compositor that stops completing copies):
+`cargo test --release --test screen_mock -- --ignored s2 --nocapture`.
+Precise CPU without tick rounding: `perf stat -e task-clock,context-switches -p $(pgrep -x gowl) -- sleep 30`
+(own processes are allowed at `perf_event_paranoid = 2`).
 Profiling: `perf record -g ./target/release/gowl screen` (needs `perf`, ask first);
 build with `CARGO_PROFILE_RELEASE_DEBUG=true CARGO_PROFILE_RELEASE_STRIP=false` for symbols.
+
+## Phase 5 summary (2026-10-17, final code = commit f997638 + docs; fake device, temp config with the
+human's keepalive_ms = 5600 and calibrated layout; same desktop for every row — it was *not* idle: niri
+S0 = 27.0–28.2 % of a core, an animation kept it redrawing; numbers from `tools/measure.py` unless noted)
+
+| Scenario | gowl CPU % | Wakeups/s | RSS MB (PSS) | Pkts/s | niri Δ % | Budget verdict |
+|---|---|---|---|---|---|---|
+| S0 baseline | — | — | — | — | (27.0–28.2 abs) | — |
+| S1 screen 30 fps (60 s) | **0.25** (perf task-clock 0.32) | **60.6** (= 2·fps + keepalive) | **8.43** (3.6) | 0.18 | **≈ 21** | CPU ✔ · wakeups ✔ (was 90.7) · RSS target ✘ / ceiling ✔ · niri ✘ (justified, D-050) |
+| S2 static (gowl side, mock compositor, `screen_mock -- --ignored s2`) | ≈ 0 | **2.00** at keepalive 500 → 0.18 at 5600 | — | 1000/keepalive | 5.5–7.9 *if niri keeps redrawing* (static-region probe, D-050); ≈ 0 on a truly idle niri (not measurable here) | gowl ✔ · real-desktop S2 → human |
+| S3 music, sink running (inaudible silent playback from a 2nd client; real music → human) | **0.47** | **47.9** | **6.15** | 0.13 (silence) | — | ✔ (CPU target 0.7, ≤ 50/s) |
+| S3 music, nothing playing (passive stream, D-052) | 0.000 | **0.2–0.3** (was 47–50) | 6.13 | 0.12–0.20 | — | ✔ |
+| S4 paused (30 s) | 0.000 | **0.0** | 8.41 | 0.00 | 0 (27.27 abs = S0) | ✔ |
+| one-shot `gowl color` (20 runs) | — | — | — | 1 | — | median **1.5 ms**, max 2.0 (≤ 20 ✔) |
+| `gowl screen` start → razer ON / first frame (5 runs) | — | — | — | — | — | 1.7–5.8 ms / **47–79 ms** (≤ 150 ✔) |
+| frame ready → sendto (`latency -- --ignored`, 3440x1440, all zones dirty) | — | — | — | — | — | p50 23.6 µs, **p99 39.2 µs** (≤ 1 ms ✔) |
+| heap allocations after warm-up | — | — | — | — | — | **0**: `alloc_steady_state` (300 frames, counted from 10); live niri `--features count-alloc` 0/s; music 0 (alloc_music) ✔ |
+| binary (stripped) | — | — | — | — | — | **640,616 B** (≤ 800 KB target ✔; was 743,016 at `opt-level = 3`) |
+
+RSS: 8.4–8.8 MB = 5.7 MB of the compositor-shared capture memfd (fault-around around ~6.4k sampled
+pixels; PSS 2.85 MB, shared with niri) + 2.4 MB shared libraries (libc 1.6, libm 0.5, ld 0.2) + 0.56 MB
+binary text + **0.2 MB private dirty**. PSS 3.6 MB. The 6 MB target counts pages gowl does not own;
+static linking would drop the library pages but breaks `dlopen` for music; MADV_RANDOM does not stop
+shmem fault-around (Phase 2); MADV_HUGEPAGE has no effect (`shmem_enabled = never`). Ceiling met.
+
+### Profile (prompt step 3) — `perf record -e cycles:u --call-graph dwarf` on gowl, S1, 60 s (515 samples)
+`perf stat`: task-clock 194 ms / 60 s (0.32 %), user cycles 163M → **user code ≈ 20 % of gowl's CPU; the
+rest is kernel time** (poll / recvmsg / sendmsg / timerfd, 2 wakeups per frame). Top user symbols:
+1. `Sampler::run::<Xrgb8888>` (inlined into `run_screen`) — 63–75 % of user samples (≈ 6.4k scattered
+   pixel loads per fully dirty frame; 23.6 µs p50 in the latency bench)
+2. `screen_loop` body — 5 %
+3. `__libc_recvmsg` — 3.6 %
+4. `Ctl::service_net` — 2.7 %
+5. `Streams::keepalive_due_ms` — 2.7 % (then `Ctl::net_deadline` 2.0 %, `memmove` 2.0 %)
+No candidate from prompt step 5 that targets user code (coarser grid, direct inv-LUT, target-cpu=native)
+is justified: the whole sampler is ≈ 0.07 % of a core at 30 fps. Kernel time scales with wakeups → D-051.
+
+### Attempts (one change at a time; kept or reverted)
+| Change | Before → after | Kept? |
+|---|---|---|
+| D-051 prepare next frame on `ready` + leave the Wayland fd out of poll while the frame is held | wakeups 90.7 → 60.5/s; task-clock 107.2 → 90.2 ms/30 s | **kept** |
+| prepare only (fd still polled) | wayland wakeups 60/s → no change (offers arrive after we sleep) | superseded by the row above |
+| D-052 passive music stream | idle music 47–50 → 0.2–0.3 wakeups/s, CPU → 0.000 | **kept** |
+| D-053 `opt-level = "s"` | task-clock 62.5/62.8 → 58.2/59.4 ms/20 s; binary 743,016 → 640,616 B | **kept** |
+| DMA-BUF via `/dev/udmabuf` (no libgbm) | niri imports the buffer but every copy fails (NVIDIA EGL: "EGLImage not supported" as a framebuffer) → falls back to SHM | **reverted** (D-050) |
+| `capture_output_region` (probe knob) | niri Δ: full 21, 3440x400 20, 3440x100 17.4 | **reverted** (D-050) |
+| lower fps (probe, `--fps`) | niri Δ: 30 → 21, 20 → 20, 15 → 17, 10 → 16, 5 → 12.7, 1 → 2.7 | not changed (human: 30 fps, D-004) |
 
 ## Results log (append; newest first)
 | Date | Commit | Scenario | CPU % | Wakeups/s | RSS MB | Pkts/s | niri Δ CPU % | Notes |
 |---|---|---|---|---|---|---|---|---|
+| 2026-10-17 | f997638 | S1 screen 30 fps, 60 s (final) | 0.250 | 60.6 | 8.43 | 0.18 | 20.9 (48.08 vs S0 27.03/27.40) | fake; perf task-clock 0.32 %; binary 640,616 B |
+| 2026-10-17 | f997638 | S4 paused 30 s (final) | 0.000 | 0.0 | 8.41 | 0.00 | 0 (27.27 abs) | fake |
+| 2026-10-17 | 196acf7+ | S3 music, sink running (silent playback), 30 s | 0.467 | 47.9 | 6.15 | 0.13 | — | fake; passive stream |
+| 2026-10-17 | 196acf7 | music idle, nothing playing (passive, D-052), 30–40 s | 0.000 | 0.2–0.3 | 6.13–6.30 | 0.12–0.20 | — | fake; was 47–50 wakeups/s |
+| 2026-10-17 | 48ee7f0 | opt-level "s" vs 3 (perf stat S1 20 s ×2) | task-clock 58.2/59.4 vs 62.5/62.8 ms | | 8.55 vs 8.84 | | | binary 640,616 vs 743,016 B (D-053) |
+| 2026-10-17 | 975cfda | S1 30 fps after D-051 (×2) | 0.267 / 0.300 | 60.5 / 60.7 | 8.64 / 8.57 | 0.17 | 20.4 / 21.2 | fake; perf task-clock 90.2 ms/30 s |
+| 2026-10-17 | 121aa8d | S1 30 fps baseline (×2) | 0.333 / 0.333 | 90.7 / 90.7 | 8.70 / 8.87 | 0.17 | 20.9 / 20.8 | fake; perf task-clock 107.2 ms/30 s |
+| 2026-10-17 | 121aa8d | S0 baseline (this session, animated desktop) | — | — | — | — | 27.0–28.2 abs | earlier sessions read 5.7–6.4 (different desktop state) |
+| 2026-10-17 | probe (reverted) | niri Δ vs capture region (S1, 20 s each) | | | | | full 19.7, 3440x400 20.0, 3440x100 17.4, static regions 5.5–7.9 | D-050 |
+| 2026-10-17 | probe | niri Δ vs fps (S1, 20 s each) | | 2.1 / 10.3 / 20.2 / 30.5 / 40.6 / 60.7 | | | 1 fps 2.7, 5 fps 12.7, 10 fps 16, 15 fps 17, 20 fps 20, 30 fps 21 | D-050 |
 | 2026-10-17 | phase 4 review fixes | binary size | | | | | | **743,016 B** stripped (+8,256 B: OFD-lock pidfile, hook mask, panic hook table, parse-faithful config rewrite); libc only |
 | 2026-10-17 | phase 4 review fixes | S4 paused (`measure.py paused 20 --fake`) | 0.000 | 0.0 | 8.74 | 0.00 | 1.25 abs | a first run read 0.2/s (4 switches in 20 s, most likely compositor events on the Wayland fd, which stays open while paused); rerun 0.0, and a 30 s `GOWL_LOG=debug` paused run had 0 context switches |
 | 2026-10-17 | phase 4 review fixes | music on live PipeWire (D-048) | 0.20–0.40 | 49–50 | — | keepalive ~2 (silence) | — | stream really opens now ("capturing" logged); paused 0 switches in 5 s; stop 14 ms. Supersedes the "music paused" row below, which measured a stream that never opened |
