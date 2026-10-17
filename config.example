@@ -34,6 +34,7 @@ ip = 192.168.1.50        # optional; refreshed by `gowl scan`
 segments = 10            # overrides the SKU table
 reverse = 0              # 1 = strip runs the other way
 offset = 0               # rotate zone 0 to this segment
+# port = 4003            # control port override (legacy Device_Port); default 4003
 # layout = 4 4 8 8 9 6 6 2 2 1   # written by `gowl calibrate`: where each segment sits,
 #                                # numpad cells (7 8 9 / 4 5 6 / 1 2 3, 5 = whole screen,
 #                                # 0 = off); replaces reverse/offset

@@ -810,6 +810,7 @@ mod tests {
             reverse: false,
             offset: 0,
             layout: None,
+            port: None,
         }
     }
 

@@ -146,6 +146,8 @@ pub struct Pending {
     pub ip: Ipv4Addr,
     /// Upper-case, as in the device cache and scan replies.
     pub mac: String,
+    /// Control port (config override or 4003) for the devStatus probe.
+    pub port: u16,
 }
 
 /// A device that answered a scan from a different address.
@@ -184,7 +186,7 @@ impl Verify {
         let mut msg = [0u8; 64];
         let n = proto::status_query(true, &mut msg);
         for p in &pending {
-            let _ = net::send_to(&sock, &msg[..n], SocketAddrV4::new(p.ip, ports.control));
+            let _ = net::send_to(&sock, &msg[..n], SocketAddrV4::new(p.ip, p.port));
         }
         Ok(Verify {
             sock,
@@ -336,11 +338,13 @@ mod tests {
                 dev: 0,
                 ip: Ipv4Addr::LOCALHOST,
                 mac: "AA".into(),
+                port: dport,
             },
             Pending {
                 dev: 1,
                 ip: Ipv4Addr::new(127, 0, 0, 9),
                 mac: "BB".into(),
+                port: dport,
             },
         ];
         let mut v = Verify::start(&lo, ports, pending, 0).unwrap();

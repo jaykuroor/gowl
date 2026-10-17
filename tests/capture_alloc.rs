@@ -120,6 +120,7 @@ fn capture_to_send_allocates_nothing() {
         reverse: true,
         offset: 2,
         layout: None,
+        port: None,
     };
     let ports = Ports {
         scan: 1,

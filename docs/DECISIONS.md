@@ -498,3 +498,13 @@ sends the keepalive first and moves the deadline (timerfd_settime only on a send
 wakeup — idle streaming stayed at 49 ctx/s), when they stop the timer resends the last
 rendered frame every 1.25 keepalive intervals (≤ 87.5 % of the hold time once keepalive_ms
 is 70 % of it).
+
+## D-049 — Per-device control port override (2026-10-17, phase 5, perf agent)
+Last Phase 1 leftover (legacy `Device_Port`/`devicePort`/manual `port`, `connection.get_device_port`).
+**Decision.** `port = N` (1-65535) in a `[device ALIAS]` section; `Device::control_port` = the override,
+else 4003 (or the loopback `GOWL_PORT_BASE` test port — the explicit override wins over the hook). Used
+by every control path: one-shots, `status`, `doctor` (route check + devStatus), sync `Streams` and the
+netwatch re-verify devStatus (`Pending.port`). Discovery stays on 4001/4002 (legacy only overrides the
+control port). Legacy's "repair a stale auto-discovered 4001" quirk is not needed: gowl never stores a
+port from discovery. **Tests:** config parse (valid / 0 / 70000 → warning), tests/net_e2e.rs
+`device_port_override_is_used_by_one_shots` (gowl binary, temp config, receiver on 127.0.0.4).

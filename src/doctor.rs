@@ -85,7 +85,8 @@ pub fn run(dev: Option<&Device>, lan_if: Option<&str>, ports: Ports) -> Result<(
     // Route hijack check: where would an unbound socket go?
     // Any address of the LAN interface counts (secondary/labelled addresses too).
     let on_lan = |a: Ipv4Addr| ifaces.iter().any(|i| i.name == lan.name && i.addr == a);
-    match net::route_source(dev.ip, ports.control) {
+    let cport = dev.control_port(ports);
+    match net::route_source(dev.ip, cport) {
         Ok(src) if on_lan(src) => println!(
             "route:     kernel routes {} via {} (no VPN hijack)",
             dev.ip, lan.name
@@ -108,7 +109,7 @@ pub fn run(dev: Option<&Device>, lan_if: Option<&str>, ports: Ports) -> Result<(
 
     // Bound devStatus, 500 ms.
     let icmp_before = net::icmp_unreach_sent();
-    let reply = net::status(lan, ports, dev.ip, ports.control, 500);
+    let reply = net::status(lan, ports, dev.ip, cport, 500);
     match &reply {
         Ok(Some(r)) => {
             println!(

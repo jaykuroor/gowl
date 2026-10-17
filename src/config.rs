@@ -16,6 +16,8 @@ pub struct DeviceCfg {
     pub offset: u16,
     /// Calibrated position of each segment (numpad cells, `color::layout_rects`).
     pub layout: Option<Vec<u8>>,
+    /// Control port override (legacy `Device_Port`); default 4003.
+    pub port: Option<u16>,
 }
 
 /// Defaults are the legacy values (`legacy/lumisync/config/options.py`), except
@@ -229,6 +231,7 @@ fn device_key(d: &mut DeviceCfg, k: &str, v: &str) -> Result<(), String> {
         "reverse" => d.reverse = boolean(v)?,
         "offset" => d.offset = int_in(v, 0, 254)?,
         "layout" => d.layout = Some(parse_layout(v)?),
+        "port" => d.port = Some(int_in(v, 1, 65535)?),
         _ => return Err("unknown key (ignored)".into()),
     }
     Ok(())
@@ -464,6 +467,18 @@ mod tests {
         assert_eq!(c.fps, 30);
         assert_eq!(c.depth, 0.28);
         assert!(!c.devices[0].reverse);
+    }
+
+    #[test]
+    fn device_port_override() {
+        let mut n = 0;
+        let c = parse(
+            "[device a]\nport = 4010\n[device b]\nport = 0\n[device c]\nport = 70000\n",
+            &mut |_, _| n += 1,
+        );
+        assert_eq!(n, 2);
+        assert_eq!(c.devices[0].port, Some(4010));
+        assert_eq!((c.devices[1].port, c.devices[2].port), (None, None));
     }
 
     #[test]

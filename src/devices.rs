@@ -111,9 +111,17 @@ pub struct Device {
     pub offset: u16,
     /// Calibrated segment positions (`gowl calibrate`); replaces reverse/offset.
     pub layout: Option<Vec<u8>>,
+    /// Control port override from the config (`port =`, legacy `Device_Port`).
+    pub port: Option<u16>,
 }
 
 impl Device {
+    /// UDP port this device takes control datagrams on: the config override, else
+    /// 4003 (or the loopback `GOWL_PORT_BASE` test port).
+    pub fn control_port(&self, ports: crate::net::Ports) -> u16 {
+        self.port.unwrap_or(ports.for_ip(self.ip).control)
+    }
+
     /// Short human label: alias, else IP.
     pub fn label(&self) -> String {
         match &self.alias {
@@ -173,6 +181,7 @@ fn finish(ip: Ipv4Addr, mac: Option<String>, cfg: Option<&DeviceCfg>, cache: &[C
         reverse: cfg.is_some_and(|d| d.reverse),
         offset: cfg.map_or(0, |d| d.offset),
         layout,
+        port: cfg.and_then(|d| d.port),
     }
 }
 

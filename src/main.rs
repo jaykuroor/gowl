@@ -247,8 +247,7 @@ fn send_one(spec: Option<&String>, msg: &[u8]) -> Result<(), Error> {
     let d = resolve(&c, spec)?;
     let lan = lan_for(&c, &d)?;
     let sock = net::bound_socket(&lan, None)?;
-    let ports = c.ports.for_ip(d.ip);
-    net::send_to(&sock, msg, SocketAddrV4::new(d.ip, ports.control)).map_err(|e| {
+    net::send_to(&sock, msg, SocketAddrV4::new(d.ip, d.control_port(c.ports))).map_err(|e| {
         if net::is_blocked(&e) {
             Error::Runtime(format!(
                 "sending to {} was refused ({e}): a VPN kill switch blocks LAN traffic; allow LAN access in the VPN (see `gowl doctor`)",
@@ -266,7 +265,7 @@ fn cmd_status(r: &[String]) -> Result<(), Error> {
     let lan = lan_for(&c, &d)?;
     let icmp_before = net::icmp_unreach_sent();
     let ports = c.ports.for_ip(d.ip);
-    match net::status(&lan, ports, d.ip, ports.control, 1000)? {
+    match net::status(&lan, ports, d.ip, d.control_port(c.ports), 1000)? {
         Some(rep) => {
             let s = rep.status;
             let power = match s.on {

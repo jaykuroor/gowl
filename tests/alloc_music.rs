@@ -75,6 +75,7 @@ fn music_hot_path_allocates_nothing() {
         reverse,
         offset,
         layout: None,
+        port: None,
     };
     let base = Settings::from_config(&Config::default()).unwrap();
     let mut musics: Vec<Music> = Vec::new();

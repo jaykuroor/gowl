@@ -336,7 +336,7 @@ impl Streams {
             devs.push(Stream {
                 label: d.label(),
                 sock,
-                sender: Sender::new(SocketAddrV4::new(d.ip, ports.for_ip(d.ip).control), n),
+                sender: Sender::new(SocketAddrV4::new(d.ip, d.control_port(ports)), n),
                 gate: SendGate::new(threshold, u64::from(keepalive_ms)),
                 // A calibrated layout already puts every zone on its segment.
                 reverse: d.reverse && layout.is_none(),
@@ -555,6 +555,7 @@ impl Streams {
                     dev: i,
                     ip: s.ip(),
                     mac: mac.clone(),
+                    port: s.sender.dst.port(),
                 });
             }
             s.iface = sel.iface;
@@ -1170,6 +1171,7 @@ mod tests {
             reverse: false,
             offset: 0,
             layout: None,
+            port: None,
         };
         let s = Streams::open(&[dev], None, ports, 3, 500, true).unwrap();
         (s, rx, net::interfaces().unwrap())

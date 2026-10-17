@@ -115,3 +115,42 @@ fn scan_end_to_end_dedupes_and_distrusts_payload_ip() {
     assert_eq!(found[0].ip, DEV);
     assert_eq!(found[0].sku, "H6609");
 }
+
+/// Per-device `port =` (legacy `Device_Port`): a one-shot goes to the override port,
+/// not to 4003, and the override wins over the loopback `GOWL_PORT_BASE` hook.
+#[test]
+fn device_port_override_is_used_by_one_shots() {
+    let dev = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 4), 0)).unwrap();
+    dev.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let port = dev.local_addr().unwrap().port();
+    let tmp = std::env::temp_dir().join(format!("gowl-port-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let cfg = tmp.join("config");
+    std::fs::write(
+        &cfg,
+        format!("[device lamp]\nip = 127.0.0.4\nport = {port}\n"),
+    )
+    .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_gowl"))
+        .args(["color", "ff0000", "lamp"])
+        .env("GOWL_CONFIG", &cfg)
+        .env("GOWL_PORT_BASE", "17000")
+        .env("XDG_STATE_HOME", &tmp)
+        .env("XDG_CACHE_HOME", &tmp)
+        .env("XDG_RUNTIME_DIR", &tmp)
+        .env("HOME", &tmp)
+        .env_remove("GOWL_DEVICE")
+        .env_remove("GOWL_LOG")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut buf = [0u8; 512];
+    let n = dev.recv(&mut buf).unwrap();
+    let s = std::str::from_utf8(&buf[..n]).unwrap();
+    assert!(s.contains(r#""cmd":"colorwc""#), "{s}");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
