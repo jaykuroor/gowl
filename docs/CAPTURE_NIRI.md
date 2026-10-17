@@ -106,8 +106,8 @@ Goal: replace niri's GPU→CPU readback with a GPU→GPU blit into a LINEAR buff
 - Ship only if niri's CPU drops measurably and gowl's CPU/RSS stays in budget.
 
 ## Things to verify on the machine (write results into this file)
-- [ ] screencopy version advertised; ext-image-copy-capture present?
-- [ ] which SHM formats niri offers on this output (8-bit? 10-bit?)
+- [x] screencopy version advertised; ext-image-copy-capture present? — **screencopy v3; ext-image-copy-capture and ext-output-image-capture-source absent on niri 26.04** (2026-10-17, wayland-info). The imagecopy backend stays a seam only.
+- [ ] which SHM formats niri offers on this output (8-bit? 10-bit?) — partial: `wl_shm` advertises only XRGB8888, ARGB8888, XBGR8888, ABGR8888 (no 10-bit). The per-frame `buffer` offer still needs checking in Phase 2.
 - [ ] does `copy_with_damage` really block on a static screen (gowl CPU ≈ 0)?
 - [ ] damage rect granularity niri reports (full-output vs. tight rects)
 - [ ] y_invert ever set?

@@ -24,3 +24,16 @@ Revisit-if: profiles show pulse overhead > 0.2% CPU.
 Context: EMA smoothing makes 30 fps visually equivalent for ambient light; fewer copies,
 fewer packets. Device cap is ~40 Hz anyway.
 Decision: default 30, configurable. Phase 4 asks the human to compare 30 vs 45 by eye.
+
+## D-005 — legacy/ path and git handling (2026-10-17, phase 0, orchestrator)
+Context: the LumiSync clone sits directly in `legacy/` (has its own `.git`), not `legacy/LumiSync/`.
+Decision: doc references rewritten to `legacy/`; `legacy/` is git-ignored (default from
+`prompts/00_recon.md`; it is a separate repo at upstream commit 92e1fce).
+Evidence: `legacy/lumisync/connection.py` exists; regenerated vectors are byte-identical to the committed ones.
+Revisit-if: the human wants legacy vendored into this repo.
+
+## D-006 — niri 26.04 on this machine has no ext-image-copy-capture (2026-10-17, phase 0, orchestrator)
+Context: CAPTURE_NIRI.md prefers ext-image-copy-capture when advertised.
+Decision: Phase 2 implements screencopy v3 only; keep the `Capture` trait seam for imagecopy.
+Evidence: `wayland-info` lists zwlr_screencopy_manager_v1 v3, no ext_image_copy_capture_manager_v1.
+Revisit-if: a niri update advertises it.

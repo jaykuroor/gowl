@@ -46,7 +46,7 @@ build with `CARGO_PROFILE_RELEASE_DEBUG=true CARGO_PROFILE_RELEASE_STRIP=false` 
 ## Results log (append; newest first)
 | Date | Commit | Scenario | CPU % | Wakeups/s | RSS MB | Pkts/s | niri Δ CPU % | Notes |
 |---|---|---|---|---|---|---|---|---|
-| | | | | | | | | |
+| 2026-10-17 | recon | — | — | — | — | — | — | hello-world release binary 296,480 B (release profile from ARCHITECTURE.md) |
 
 ## Legacy comparison
 Not measured: `legacy/` is never executed (CLAUDE.md rule 1). If the human wants a
