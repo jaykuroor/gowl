@@ -105,6 +105,7 @@ pub fn run(dev: Option<&Device>, lan_if: Option<&str>, ports: Ports) -> Result<(
     }
 
     // Bound devStatus, 500 ms.
+    let icmp_before = net::icmp_unreach_sent();
     let reply = net::status(lan, ports, dev.ip, ports.control, 500);
     match &reply {
         Ok(Some(r)) => {
@@ -150,21 +151,45 @@ pub fn run(dev: Option<&Device>, lan_if: Option<&str>, ports: Ports) -> Result<(
         Ok(_) => println!("scan:      unicast scan: no reply either"),
         Err(e) => println!("scan:      unicast scan failed: {e}"),
     }
+    let rejected = net::rejected_since(icmp_before);
+    let zone = firewall_zone(&lan.name);
+    match &zone {
+        Some(z) => println!("firewall:  {} is in zone {z:?}", lan.name),
+        None => println!("firewall:  zone unknown (firewall-cmd unavailable)"),
+    }
     println!(
         "rp_filter: {}={} all={} (0/2 fine; 1 drops replies only if a VPN hijacks the LAN route)",
         lan.name,
         rp_filter(&lan.name),
         rp_filter("all")
     );
-    match firewall_zone(&lan.name) {
-        Some(z) => println!("firewall:  {} is in zone {z:?}", lan.name),
-        None => println!("firewall:  zone unknown (firewall-cmd unavailable)"),
+    if rejected > 0 {
+        println!(
+            "cause:     the light DID answer, but this machine rejected {rejected} repl{} (the kernel sent ICMP",
+            if rejected == 1 { "y" } else { "ies" }
+        );
+        println!(
+            "           unreachable while gowl waited): inbound UDP {} is blocked by the firewall. The light",
+            ports.reply
+        );
+        println!(
+            "           replies from a different source port than gowl sent to, so conntrack can't match it."
+        );
+        println!(
+            "suggest:   sudo firewall-cmd --zone={} --add-rich-rule='rule family=\"ipv4\" source address=\"{}\" port port=\"{}\" protocol=\"udp\" accept'",
+            zone.as_deref().unwrap_or("public"),
+            subnet(lan),
+            ports.reply
+        );
+        println!(
+            "           (runtime only; repeat with --permanent once it works). gowl never changes the firewall."
+        );
+    } else {
+        println!(
+            "cause:     no reply reached this machine: light offline, wrong IP, or LAN Control off in the"
+        );
+        println!("           Govee Home app (or a firewall that drops silently)");
     }
-    println!("causes:    (a) light offline, wrong IP, or LAN Control off in the Govee Home app");
-    println!(
-        "           (b) inbound UDP {} blocked by the firewall (see docs/NETWORK.md for a LAN-scoped rule)",
-        ports.reply
-    );
     println!("note:      sync and on/off/color are send-only and work without any reply");
     Ok(())
 }

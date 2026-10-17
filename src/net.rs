@@ -704,6 +704,28 @@ pub fn status(
     }
 }
 
+/// Kernel counter `Icmp: OutDestUnreachs` (/proc/net/snmp, unprivileged). firewalld
+/// zones answer unsolicited inbound datagrams with an ICMP unreachable, so a rise while
+/// we wait for a reply that never arrives means the reply reached this machine and
+/// was rejected by the firewall. Read only on the no-reply path.
+pub fn icmp_unreach_sent() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/net/snmp").ok()?;
+    let mut lines = text.lines().filter(|l| l.starts_with("Icmp:"));
+    let (head, vals) = (lines.next()?, lines.next()?);
+    let col = head
+        .split_whitespace()
+        .position(|k| k == "OutDestUnreachs")?;
+    vals.split_whitespace().nth(col)?.parse().ok()
+}
+
+/// Replies rejected since `before` (see [`icmp_unreach_sent`]).
+pub fn rejected_since(before: Option<u64>) -> u64 {
+    match (before, icmp_unreach_sent()) {
+        (Some(a), Some(b)) => b.saturating_sub(a),
+        _ => 0,
+    }
+}
+
 /// Source address the kernel's routing table would use for `ip` (unbound socket,
 /// `connect` sends nothing). Doctor's route-hijack check only.
 pub fn route_source(ip: Ipv4Addr, port: u16) -> io::Result<Ipv4Addr> {

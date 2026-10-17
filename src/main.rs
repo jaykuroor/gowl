@@ -191,6 +191,7 @@ fn cmd_status(r: &[String]) -> Result<(), Error> {
     let c = ctx();
     let d = resolve(&c, r.first())?;
     let lan = lan_for(&c, &d)?;
+    let icmp_before = net::icmp_unreach_sent();
     match net::status(&lan, c.ports, d.ip, c.ports.control, 1000)? {
         Some(rep) => {
             let s = rep.status;
@@ -216,9 +217,13 @@ fn cmd_status(r: &[String]) -> Result<(), Error> {
             );
             Ok(())
         }
-        None => Err(Error::Runtime(format!(
-            "no status reply from {} (light offline, LAN Control off, or inbound UDP {} blocked) — run `gowl doctor`",
+        None if net::rejected_since(icmp_before) > 0 => Err(Error::Runtime(format!(
+            "{} answered, but the firewall rejected the reply (inbound UDP {} blocked) — run `gowl doctor`",
             d.ip, c.ports.reply
+        ))),
+        None => Err(Error::Runtime(format!(
+            "no status reply from {} (light offline or LAN Control off) — run `gowl doctor`",
+            d.ip
         ))),
     }
 }
@@ -347,12 +352,21 @@ fn cmd_scan(rest: &[String]) -> Result<(), Error> {
             t.unicast.len()
         );
     }
+    let icmp_before = net::icmp_unreach_sent();
     let found = net::scan(&targets, c.ports, timeout, sweep)?;
     if found.is_empty() {
-        eprintln!(
-            "gowl: no devices answered. Check LAN Control in the Govee Home app; multicast replies to UDP {} may be dropped by the firewall (`gowl doctor`). Known IPs can be used directly: GOWL_DEVICE=IP or ip= in the config.",
-            c.ports.reply
-        );
+        let rejected = net::rejected_since(icmp_before);
+        if rejected > 0 {
+            eprintln!(
+                "gowl: {rejected} repl{} reached this machine but the firewall rejected them (inbound UDP {} blocked; `gowl doctor` prints a LAN-scoped rule). A known IP works without replies: GOWL_DEVICE=IP or ip= in the config.",
+                if rejected == 1 { "y" } else { "ies" },
+                c.ports.reply
+            );
+        } else {
+            eprintln!(
+                "gowl: no devices answered. Check LAN Control in the Govee Home app. A known IP works without replies: GOWL_DEVICE=IP or ip= in the config."
+            );
+        }
         return Err(Error::NoDevice("scan found no devices".into()));
     }
     let new: Vec<Cached> = found
