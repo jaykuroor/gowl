@@ -322,3 +322,15 @@ ignored with a warning. Music mode is unaffected (renders in segment order).
 (out of scope). **Cost.** Setup-only code; the sampler hot path is unchanged (off segments
 are zero-sample zones). Binary +36,864 B (665,160 → 702,024 B, mostly the walk UI text and float layout math). Same poll loop shape as screen mode (stdin +
 timerfd keepalive + signalfd), razer OFF ×2 on every exit.
+
+## D-041 — Calibration preview = what the test images will give (2026-10-17, orchestrator)
+**Context.** First real calibration (3 segments on top, 2 on the bottom, corner segments):
+the D-040 preview painted every corner cell white, so the human read "left is white, should
+be red" and didn't save. **Decision.** The review cycles (Enter) through three previews that
+reproduce `left_red_right_yellow`, `top_blue_bottom_green` and `quadrants` exactly as screen
+sync will: each segment's `layout_rects` rect is area-weighted against the pattern's
+quadrants, averaged in linear light. Corners show their half's color, a segment across the
+middle shows the blend (orange/teal). The legend now says corner keys are only for a
+segment that wraps a corner, and that several segments on one side are split evenly in
+strip order (direction detected). Aspect ratio needs no input: rects are fractions of the
+captured output, whose size gowl reads from the compositor.

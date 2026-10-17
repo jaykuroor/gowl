@@ -26,26 +26,59 @@ const LEGEND: &str = "\
 One segment at a time turns red (the rest stay dim white). For each, type where it
 sits around your screen, seen from your chair, using the numpad as a map, then Enter:
 
-    7 8 9     7 top-left corner   8 top          9 top-right corner
-    4 5 6     4 left side         5 behind / middle (follows the whole screen)
-    1 2 3     1 bottom-left       2 bottom       3 bottom-right     6 right side
-              0 can't see it (stays off)
+    7 8 9     8 top     4 left side     6 right side     2 bottom
+    4 5 6     7 9 1 3   corners: only for a segment that wraps around a corner
+    1 2 3     5 behind the screen (follows all of it)     0 can't see it (off)
+
+Several segments on one side are fine: give each the same key. gowl splits that
+side evenly between them, in the order the strip runs (it works out the direction).
 
 b = back one   ? = this help   q = quit without saving (Ctrl+C too)
 If one red patch looks like two pieces, or part of the light never turns red,
 the segment count is off: n = the light has one more segment, p = one fewer.";
 
-/// Preview color of a placed cell.
-fn cell_color(c: Option<u8>) -> Rgb {
-    match c {
-        Some(8) => [0, 0, 255],
-        Some(2) => [0, 255, 0],
-        Some(4) => [255, 0, 0],
-        Some(6) => [255, 200, 0],
-        Some(7 | 9 | 1 | 3) => [255, 255, 255],
-        Some(5) => [60, 60, 60],
-        _ => [0, 0, 0],
-    }
+const R: Rgb = [255, 0, 0];
+const G: Rgb = [0, 255, 0];
+const B: Rgb = [0, 0, 255];
+const Y: Rgb = [255, 255, 0];
+
+/// Review previews: the `tools/test_pattern.py` images, as quadrant colors
+/// `[top-left, top-right, bottom-left, bottom-right]`, with what to expect.
+const VIEWS: [(&str, [Rgb; 4], &str); 3] = [
+    (
+        "left_red_right_yellow",
+        [R, Y, R, Y],
+        "left half of the light red, right half yellow (a segment across the middle: orange)",
+    ),
+    (
+        "top_blue_bottom_green",
+        [B, B, G, G],
+        "top half blue, bottom half green (a segment across the middle: teal)",
+    ),
+    (
+        "quadrants",
+        [R, G, B, Y],
+        "top-left red, top-right green, bottom-left blue, bottom-right yellow",
+    ),
+];
+
+/// The color a segment placed on `r` gets from a quadrant pattern in screen sync:
+/// area-weighted, averaged in linear light like the sampler. `None` (off) → black.
+fn preview_color(r: Option<crate::color::Rect>, quad: &[Rgb; 4]) -> Rgb {
+    let Some(r) = r else { return [0; 3] };
+    let left = ((0.5 - r.x) / r.w).clamp(0.0, 1.0);
+    let top = ((0.5 - r.y) / r.h).clamp(0.0, 1.0);
+    let w = [
+        left * top,
+        (1.0 - left) * top,
+        left * (1.0 - top),
+        (1.0 - left) * (1.0 - top),
+    ];
+    let lin = |v: u8| (f64::from(v) / 255.0).powf(2.2);
+    std::array::from_fn(|ch| {
+        let l: f64 = (0..4).map(|q| w[q] * lin(quad[q][ch])).sum();
+        (l.powf(1.0 / 2.2) * 255.0).round() as u8
+    })
 }
 
 /// What the loop must do after a line of input.
@@ -67,14 +100,19 @@ struct Walk {
     cells: Vec<Option<u8>>,
     at: usize,
     review: bool,
+    /// Which of `VIEWS` the review shows.
+    view: usize,
+    depth: f64,
 }
 
 impl Walk {
-    fn new(n: usize) -> Walk {
+    fn new(n: usize, depth: f64) -> Walk {
         Walk {
             cells: vec![None; n.clamp(1, MAX_SEGMENTS)],
             at: 0,
             review: false,
+            view: 0,
+            depth,
         }
     }
 
@@ -85,6 +123,10 @@ impl Walk {
     fn input(&mut self, line: &str) -> Step {
         let l = line.trim().to_ascii_lowercase();
         match l.as_str() {
+            "" | "v" if self.review => {
+                self.view = (self.view + 1) % VIEWS.len();
+                Step::Show
+            }
             "" => Step::Show,
             "q" | "quit" => Step::Quit,
             "?" | "h" | "help" => Step::Help,
@@ -122,7 +164,10 @@ impl Walk {
                 self.cells[self.at] = Some(d.as_bytes()[0] - b'0');
                 match (self.at + 1..self.n()).find(|&i| self.cells[i].is_none()) {
                     Some(i) => self.at = i,
-                    None if self.cells.iter().all(Option::is_some) => self.review = true,
+                    None if self.cells.iter().all(Option::is_some) => {
+                        self.review = true;
+                        self.view = 0;
+                    }
                     None => self.at = (self.at + 1) % self.n(),
                 }
                 Step::Show
@@ -133,14 +178,15 @@ impl Walk {
 
     /// Segment colors for the current state.
     fn frame(&self, out: &mut [Rgb]) {
-        for (i, (o, &c)) in out.iter_mut().zip(&self.cells).enumerate() {
-            *o = if self.review {
-                cell_color(c)
-            } else if i == self.at {
-                RED
-            } else {
-                DIM
-            };
+        if self.review {
+            let rects = crate::color::layout_rects(&self.layout(), self.depth);
+            for (o, r) in out.iter_mut().zip(rects) {
+                *o = preview_color(r, &VIEWS[self.view].1);
+            }
+            return;
+        }
+        for (i, o) in out.iter_mut().enumerate().take(self.n()) {
+            *o = if i == self.at { RED } else { DIM };
         }
     }
 
@@ -151,11 +197,13 @@ impl Walk {
     fn prompt(&self) -> String {
         if self.review {
             let l: Vec<String> = self.layout().iter().map(u8::to_string).collect();
+            let (name, _, expect) = VIEWS[self.view];
             format!(
-                "\nlayout = {}\nThe light now previews it: top blue, bottom green, left red, right yellow,\n\
-                 corners white, whole-screen dim white, off dark.\n\
-                 y = save   b = back to the last segment   r = start over   q = quit without saving\n> ",
-                l.join(" ")
+                "\nlayout = {}\npreview {}/{}: what {name}.png will look like after saving:\n  {expect}\n\
+                 Enter = next preview   y = save   b = back to the last segment   r = start over   q = quit\n> ",
+                l.join(" "),
+                self.view + 1,
+                VIEWS.len()
             )
         } else {
             let now = self.cells[self.at].map_or(String::new(), |c| format!(" (now {c})"));
@@ -196,7 +244,7 @@ pub fn cmd_calibrate(rest: &[String]) -> Result<(), Error> {
         };
         Streams::open(&[d], cfg.lan_if.as_deref(), ports, 0, keepalive)
     };
-    let mut walk = Walk::new(usize::from(dev.segments));
+    let mut walk = Walk::new(usize::from(dev.segments), cfg.depth);
     let sig = Signals::new()?;
     let mut timer = Timer::new()?;
     let mut streams = open(walk.n())?;
@@ -418,7 +466,7 @@ mod tests {
 
     #[test]
     fn walk_places_every_segment_then_reviews() {
-        let mut w = Walk::new(3);
+        let mut w = Walk::new(3, 0.28);
         let mut f = [[9u8; 3]; 3];
         w.frame(&mut f);
         assert_eq!(f, [RED, DIM, DIM]);
@@ -435,21 +483,20 @@ mod tests {
         assert_eq!(w.input("6"), Step::Show);
         assert!(w.review);
         w.frame(&mut f);
-        assert_eq!(
-            f,
-            [
-                cell_color(Some(4)),
-                cell_color(Some(9)),
-                cell_color(Some(6))
-            ]
-        );
+        assert_eq!(f, [R, Y, Y], "preview 1: left red, right yellow");
+        assert_eq!(w.input(""), Step::Show);
+        w.frame(&mut f);
+        assert_eq!(f[1], B, "preview 2: the top-right corner is blue");
+        assert_eq!(w.input(""), Step::Show);
+        assert_eq!(w.input(""), Step::Show);
+        assert_eq!(w.view, 0, "Enter cycles the previews");
         assert_eq!(w.layout(), vec![4, 9, 6]);
         assert_eq!(w.input("Y"), Step::Save);
     }
 
     #[test]
     fn walk_resizes_and_restarts() {
-        let mut w = Walk::new(2);
+        let mut w = Walk::new(2, 0.28);
         w.input("4");
         w.input("6");
         assert!(w.review);
@@ -464,7 +511,7 @@ mod tests {
         );
         assert_eq!(w.input("r"), Step::Show);
         assert_eq!((w.at, w.review, w.layout()), (0, false, vec![0, 0]));
-        let mut one = Walk::new(1);
+        let mut one = Walk::new(1, 0.28);
         assert_eq!(one.input("p"), Step::Bad);
         assert_eq!(one.input("q"), Step::Quit);
     }
@@ -515,5 +562,33 @@ mod tests {
         let out = updated_config(text, &dev(None), &cfg, &layout);
         assert!(out.starts_with("fps = 30\n[device h6609]\nip = 10.0.0.1\n\n[device h6609-2]\n"));
         assert!(!out.contains("device = "));
+    }
+
+    #[test]
+    fn preview_matches_what_the_test_images_give() {
+        // A loop with corner segments and three on top, two on the bottom: every
+        // segment on the left half is red in the left/right preview, corners too.
+        let l = [7, 8, 8, 8, 9, 6, 3, 2, 2, 1];
+        let rects = crate::color::layout_rects(&l, 0.28);
+        let c: Vec<Rgb> = rects
+            .iter()
+            .map(|&r| preview_color(r, &VIEWS[0].1))
+            .collect();
+        assert_eq!(
+            (c[0], c[1], c[9], c[8]),
+            (R, R, R, R),
+            "left corners and left-top/bottom"
+        );
+        assert_eq!((c[3], c[4], c[5], c[6], c[7]), (Y, Y, Y, Y, Y));
+        // The middle of three top segments straddles the split: orange.
+        assert_eq!(c[2][0], 255);
+        assert!((150..220).contains(&c[2][1]) && c[2][2] == 0, "{:?}", c[2]);
+        // Quadrants: corners take their quadrant's color.
+        let q: Vec<Rgb> = rects
+            .iter()
+            .map(|&r| preview_color(r, &VIEWS[2].1))
+            .collect();
+        assert_eq!((q[0], q[4], q[6], q[9]), (R, G, Y, B));
+        assert_eq!(preview_color(None, &VIEWS[0].1), [0; 3]);
     }
 }
