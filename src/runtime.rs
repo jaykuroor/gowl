@@ -46,6 +46,52 @@ pub fn now_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
+// ------------------------------------------------------------------ session
+
+/// A pidfd on the desktop session's compositor: readable when it exits (logout,
+/// crash). Found without speaking Wayland: connect to `$WAYLAND_DISPLAY` (absolute,
+/// or under `$XDG_RUNTIME_DIR`), read the listener's pid with `SO_PEERCRED`, hang
+/// up at once, `pidfd_open` it. Costs one idle fd and no wakeups (D-069). None when
+/// there is no Wayland session (a terminal over SSH, a test) or the kernel has no
+/// pidfds; the caller then just doesn't notice the session ending.
+pub fn compositor_pidfd() -> Option<OwnedFd> {
+    use std::os::unix::net::UnixStream;
+    let display = std::env::var_os("WAYLAND_DISPLAY").filter(|d| !d.is_empty())?;
+    let path = std::path::PathBuf::from(&display);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        crate::config::runtime_dir()?.join(path)
+    };
+    let sock = UnixStream::connect(&path).ok()?;
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: valid socket fd, out-buffer and its length.
+    let r = unsafe {
+        libc::getsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast(),
+            &mut len,
+        )
+    };
+    drop(sock);
+    // SAFETY: getpid has no preconditions.
+    if r != 0 || cred.pid <= 0 || cred.pid == unsafe { libc::getpid() } {
+        return None;
+    }
+    // SAFETY: pidfd_open(pid, 0) returns a new fd or -1.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, cred.pid, 0) };
+    debug!("session: compositor pid {} ({})", cred.pid, path.display());
+    // SAFETY: a fresh fd we own.
+    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as i32) })
+}
+
 // ------------------------------------------------------------------ signals
 
 /// What a signal asks for.
@@ -430,19 +476,28 @@ impl Streams {
     /// next one goes out unconditionally.
     pub fn razer(&mut self, on: bool) {
         self.live = on;
+        emergency::set_live(on);
         for s in &mut self.devs {
             s.razer(on);
         }
     }
 
-    /// Razer OFF twice, 10 ms apart (UDP): stop, pause and output-lost alike.
+    /// Razer OFF twice, 10 ms apart (UDP): stop, pause and output-lost alike — only
+    /// while the light is in stream mode (rule 7, D-068). After a pause, a lost
+    /// output or a lost sound server the light already got its OFF ×2 and shows
+    /// its own mode; a second pair (pause while the output is gone, the shutdown
+    /// after either) would change nothing.
     pub fn off(&mut self) {
+        if !self.live {
+            return;
+        }
         self.razer(false);
         std::thread::sleep(Duration::from_millis(10));
         self.razer(false);
     }
 
-    /// Shutdown contract (SPEC.md): razer OFF ×2.
+    /// Shutdown contract (SPEC.md): razer OFF ×2 if the light is streaming;
+    /// nothing if it isn't (never switched on, paused, output or sound server gone).
     pub fn shutdown(&mut self) {
         self.off();
     }
@@ -734,8 +789,18 @@ mod emergency {
         }
     }
 
+    /// Razer is ON somewhere in this process (the panic hook's OFF is skipped
+    /// otherwise, like `Streams::off`).
+    static LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub fn set_live(on: bool) {
+        LIVE.store(on, Ordering::SeqCst);
+    }
+
     pub fn send_off() {
-        send_off_slots(0..MAX);
+        if LIVE.load(Ordering::SeqCst) {
+            send_off_slots(0..MAX);
+        }
     }
 
     pub fn send_off_slots(slots: std::ops::Range<usize>) {

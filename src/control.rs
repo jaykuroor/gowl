@@ -17,6 +17,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config;
 use crate::error::Error;
@@ -76,9 +77,42 @@ pub enum Holder {
     Pid(i32),
 }
 
-/// Is `pid` a live process whose name is gowl's?
-fn is_gowl(pid: i32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim_end() == "gowl")
+/// Does process `pid` hold the OFD write lock on the file `(dev, ino)`? Proven
+/// from the kernel, not from names: one of its fds is that file and the fd's
+/// `/proc/PID/fdinfo` lists an `OFDLCK … WRITE` lock (D-066). So a renamed binary
+/// (`gowl-dev`), a wrapper that execs it, or a recycled pid that happens to be
+/// called gowl are all judged right. None = can't tell (no such pid, or /proc
+/// hides its fds): the caller falls back to the process name.
+fn holds_lock(pid: i32, dev: u64, ino: u64) -> Option<bool> {
+    let fds = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    for e in fds.flatten() {
+        let Ok(m) = std::fs::metadata(e.path()) else {
+            continue;
+        };
+        if m.dev() != dev || m.ino() != ino {
+            continue;
+        }
+        let info = std::fs::read_to_string(format!(
+            "/proc/{pid}/fdinfo/{}",
+            e.file_name().to_string_lossy()
+        ))
+        .unwrap_or_default();
+        if info
+            .lines()
+            .any(|l| l.starts_with("lock:") && l.contains("OFDLCK") && l.contains("WRITE"))
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Is `pid` the live gowl holding the pidfile `(dev, ino)`? The lock proof above;
+/// where /proc can't show it, the process name (the pre-D-066 check).
+fn is_holder(pid: i32, dev: u64, ino: u64) -> bool {
+    holds_lock(pid, dev, ino).unwrap_or_else(|| {
+        std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim_end() == "gowl")
+    })
 }
 
 /// Who holds `path` (see `Holder`).
@@ -90,11 +124,12 @@ pub fn holder_at(path: &Path) -> Holder {
         return Holder::Free;
     }
     let text = std::fs::read_to_string(path).unwrap_or_default();
+    let (dev, ino) = f.metadata().map_or((0, 0), |m| (m.dev(), m.ino()));
     // SAFETY: getpid has no preconditions.
     let me = unsafe { libc::getpid() };
     match parse_pid(&text) {
         Some(pid) if pid == me => Holder::Free,
-        Some(pid) if is_gowl(pid) => Holder::Pid(pid),
+        Some(pid) if is_holder(pid, dev, ino) => Holder::Pid(pid),
         _ => Holder::Starting,
     }
 }
@@ -163,7 +198,7 @@ impl Pidfile {
                     .ok()
                     .and_then(|t| parse_pid(&t))
                     .map_or_else(|| "starting".into(), |p| format!("pid {p}"));
-                return Err(Error::Runtime(format!(
+                return Err(Error::AlreadyRunning(format!(
                     "gowl is already running ({who}); `gowl stop` or `gowl toggle` stops it"
                 )));
             }
@@ -183,7 +218,7 @@ impl Pidfile {
                 .map_err(|e| Error::Io("write pidfile", e))?;
             file.set_len(text.len() as u64)
                 .map_err(|e| Error::Io("write pidfile", e))?;
-            set_panic_path(path);
+            set_panic_path(path, &file);
             return Ok(Pidfile {
                 path: path.to_path_buf(),
                 file,
@@ -197,20 +232,37 @@ impl Pidfile {
 }
 
 static PANIC_PIDFILE: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+/// Inode of the pidfile this process holds right now; 0 = none (never held, or
+/// released). The panic hook unlinks only while it is set *and* still the file at
+/// the path, so a panic after the session ended (calibrate saving, a toggle that
+/// already handed over) can't remove a newer session's pidfile (D-066).
+static PANIC_INO: AtomicU64 = AtomicU64::new(0);
 
-fn set_panic_path(path: &Path) {
+fn set_panic_path(path: &Path, file: &File) {
     use std::os::unix::ffi::OsStrExt;
     if let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
         let _ = PANIC_PIDFILE.set(c);
     }
+    if let Ok(m) = file.metadata() {
+        PANIC_INO.store(m.ino(), Ordering::SeqCst);
+    }
 }
 
 /// From the panic hook (`panic = "abort"` skips Drop): unlink the pidfile first, so
-/// a reader sees "not running" before the status file goes too.
+/// a reader sees "not running" before the status file goes too — only while this
+/// process still holds it (see `PANIC_INO`).
 pub fn panic_unlink_pidfile() {
+    let ino = PANIC_INO.load(Ordering::SeqCst);
+    if ino == 0 {
+        return;
+    }
     if let Some(p) = PANIC_PIDFILE.get() {
-        // SAFETY: valid C string.
-        unsafe { libc::unlink(p.as_ptr()) };
+        // SAFETY: valid C string and stat buffer.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::stat(p.as_ptr(), &mut st) } == 0 && st.st_ino == ino {
+            // SAFETY: valid C string.
+            unsafe { libc::unlink(p.as_ptr()) };
+        }
     }
 }
 
@@ -218,10 +270,15 @@ impl Drop for Pidfile {
     fn drop(&mut self) {
         // Unlink while still holding the lock; a racing start that opened this
         // inode notices it is gone and retries. The lock goes with the fd.
-        let ours = match (self.file.metadata(), std::fs::metadata(&self.path)) {
-            (Ok(a), Ok(b)) => a.ino() == b.ino() && a.dev() == b.dev(),
+        let mine = self.file.metadata().ok();
+        let ours = match (&mine, std::fs::metadata(&self.path)) {
+            (Some(a), Ok(b)) => a.ino() == b.ino() && a.dev() == b.dev(),
             _ => false,
         };
+        // Disarm the panic hook first: from here on the path may be a newer session's.
+        if let Some(m) = mine {
+            let _ = PANIC_INO.compare_exchange(m.ino(), 0, Ordering::SeqCst, Ordering::SeqCst);
+        }
         if ours {
             let _ = std::fs::remove_file(&self.path);
         }
@@ -372,7 +429,15 @@ pub fn cmd_pause(resume: bool) -> Result<(), Error> {
 /// `gowl stop`: SIGTERM, then wait up to 1 s for the exit (the shutdown contract
 /// promises 100 ms); "Screen sync off".
 pub fn cmd_stop() -> Result<(), Error> {
-    let s = session().ok_or_else(none_running)?;
+    let Some(s) = session() else {
+        // Nothing runs, but the screen-sync service is waiting to restart after a
+        // failure: "stop" means it shouldn't (D-065).
+        if state::hold_unit_retry() {
+            notify::send(config::load_quiet().notify, "Screen sync off", None);
+            return Ok(());
+        }
+        return Err(none_running());
+    };
     if !s.stop(1000)? {
         return Err(Error::Runtime(
             "gowl got the stop signal but has not exited after 1 s".into(),
@@ -408,7 +473,11 @@ mod tests {
         assert_eq!(running_at(&p), None);
         let e = Pidfile::acquire_at(&p).unwrap_err();
         assert!(e.to_string().contains("already running"), "{e}");
-        assert_eq!(e.exit_code(), 1);
+        assert_eq!(
+            e.exit_code(),
+            6,
+            "already running has its own exit code (D-065)"
+        );
         drop(held);
         assert!(!p.exists());
         let again = Pidfile::acquire_at(&p).unwrap();
@@ -456,6 +525,40 @@ mod tests {
         drop(f);
         std::fs::write(&p, "").unwrap();
         assert_eq!(holder_at(&p), Holder::Free, "unlocked");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn released_pidfile_is_safe_from_a_later_panic() {
+        let p = tmp("panic");
+        let _ = std::fs::remove_file(&p);
+        let held = Pidfile::acquire_at(&p).unwrap();
+        let ino = std::fs::metadata(&p).unwrap().ino();
+        assert_eq!(PANIC_INO.load(Ordering::SeqCst), ino, "armed while held");
+        drop(held);
+        // (Other tests in this binary may hold their own pidfiles meanwhile; ours
+        // must be disarmed.)
+        assert_ne!(PANIC_INO.load(Ordering::SeqCst), ino, "disarmed on release");
+        // A newer session's pidfile at the same path survives a late panic.
+        std::fs::write(&p, "1\n").unwrap();
+        panic_unlink_pidfile();
+        assert!(p.exists(), "a late panic removed someone else's pidfile");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_holder_is_proven_by_its_lock_not_its_name() {
+        let p = tmp("holder");
+        let _ = std::fs::remove_file(&p);
+        let held = Pidfile::acquire_at(&p).unwrap();
+        let m = std::fs::metadata(&p).unwrap();
+        // SAFETY: getpid has no preconditions.
+        let me = unsafe { libc::getpid() };
+        // This test binary isn't called "gowl", yet it holds the lock.
+        assert_eq!(holds_lock(me, m.dev(), m.ino()), Some(true));
+        // pid 1 doesn't (or /proc hides its fds: then the name decides — not gowl).
+        assert!(!is_holder(1, m.dev(), m.ino()));
+        drop(held);
         let _ = std::fs::remove_file(&p);
     }
 

@@ -48,25 +48,48 @@ LumiSync, and gowl's test vectors are generated from LumiSync's own code so the 
 
 gowl itself depends on nothing but the C library (one Rust crate, `libc`).
 
-## Quick start
+## Install
 
-Until the installer lands (`make install`, coming next), build and copy by hand:
+Per user, no root. From the source directory:
 
 ```sh
-cargo build --release
-install -Dm755 target/release/gowl ~/.local/bin/gowl
-gowl scan                 # find lights (see Troubleshooting if it finds nothing)
-gowl color ff0000         # the light should turn red
-gowl calibrate            # light one segment at a time, tell gowl where each one is
-gowl screen               # screen sync; Ctrl+C stops it and the light goes back to normal
+make install              # build, then install for your user (prints every change it makes)
+gowl setup                # find your light, calibrate it, pick keys and login behaviour
 ```
 
-If `gowl scan` finds nothing, you can still use the light by its IP address: put it in the config (below) or
-run `GOWL_DEVICE=192.168.1.50 gowl color ff0000`.
+`make install` puts:
+
+| What | Where |
+|---|---|
+| the program | `~/.local/bin/gowl` (`PREFIX=…` to change `~/.local`) |
+| the login service (screen sync), **not enabled** unless `AUTOSTART=1` or you say yes in `gowl setup` | `~/.config/systemd/user/gowl.service` |
+| a config with every setting commented out — only if you have none (never overwritten) | `~/.config/gowl/config` |
+| niri keys **Mod+M** (screen sync on/off) and **Mod+Shift+M** (music sync on/off) | `~/.config/gowl/niri-binds.kdl`, plus one `include` line at the end of `~/.config/niri/config.kdl` |
+| quickshell service + tile, and `config.example` | `~/.local/share/gowl/` |
+
+The niri line is added only if neither key is bound yet (in your config or anything it includes), only after
+`niri validate` accepted the edited config, and after a backup in `~/.config/gowl/backups/`. If a key is taken,
+the install goes on without keys and says how to pick others. `NIRI_KEYS=0` skips niri; `gowl keys add` /
+`gowl keys remove` do just that part later. The keys and the service call gowl by its full path, because niri and
+systemd often don't have `~/.local/bin` on their PATH. Running `make install` again only updates what changed.
+
+`make uninstall` stops a running sync, stops and disables the service, takes the niri line out (validated, backed
+up), and removes the program, the service, the keys file and `~/.local/share/gowl`. It keeps
+`~/.config/gowl/config` (and the niri backups); `make uninstall PURGE=1` removes those and the device cache too.
+
+**`gowl setup`** explains LAN Control, then finds the light: the one in your config, a network scan, or — when
+the firewall hides the light's answers, as Fedora's does by default — its IP address typed in or picked from the
+Govee devices this computer has seen. The light blinks blue and you confirm it. Then: segments and `gowl
+calibrate`, optionally `gowl calibrate --keepalive`, screen sync at login, niri keys, notifications, and a
+quickshell hint. It changes only the lines it needs in your config and never touches the firewall.
+
+By hand instead: `cargo build --release`, copy `target/release/gowl` anywhere, and write the config (below);
+`GOWL_DEVICE=192.168.1.50 gowl color ff0000` works without any config.
 
 ## Commands
 
 ```
+gowl setup                           first-run questions (needs a terminal)
 gowl scan [--sweep] [--timeout MS]   find lights on the network; remembers them
 gowl list                            lights found before (no network)
 gowl on | off [DEV]
@@ -84,6 +107,7 @@ gowl pause | resume | stop           control the running sync
 gowl toggle [screen|music] [ARGS]    what the keys run (below)
 gowl state                           the sync's state as one JSON line
 gowl watch                           the state line now and on every change (for bars)
+gowl keys [add|remove]               niri keys Mod+M / Mod+Shift+M: show, add or remove
 ```
 
 `DEV` is an alias from the config, an IP, a MAC, or a number from `gowl list`; without it gowl uses
@@ -92,7 +116,7 @@ Only one sync runs at a time.
 
 **`gowl toggle screen` / `gowl toggle music`:** that mode running → stop it; paused → resume it; the other mode
 running → switch (the other one stops first, so two syncs never fight over the light); nothing running →
-start. Suggested keys: Mod+M and Mod+Shift+M (a niri snippet is in
+start. Keys: Mod+M and Mod+Shift+M (`make install` or `gowl keys add` sets them up in niri; the template is
 [`packaging/niri-binds.kdl`](packaging/niri-binds.kdl)). `toggle`, `pause`, `resume` and `stop` each show a
 short desktop notification ("Screen sync on",
 "Switched from screen to music sync", "Music sync off", or what went wrong, e.g. "No light configured"). A
@@ -101,13 +125,15 @@ sync started from a key that fails later also says so. Set `notify = off` to sil
 Reactions: `flow pulse energy_fill band_split center_burst wave bass_bounce chase twinkle auto`.
 Palettes: `rgb auto rainbow aurora sunset ocean neon jewel fire spectrum warm cool mono`.
 
-Exit codes: 0 ok, 1 runtime error (also: nothing running, or a sync already running), 2 usage, 3 no light,
-4 screen capture unavailable, 5 no LAN interface reaches the light.
+Exit codes: 0 ok, 1 runtime error (also: nothing running), 2 usage or a bad config value, 3 no light
+configured, 4 screen capture unavailable, 5 no LAN interface reaches the light, 6 another gowl sync holds the
+light.
 
 ## Config
 
 `~/.config/gowl/config` (or `$XDG_CONFIG_HOME/gowl/config`, or `GOWL_CONFIG`). `key = value`, `#` comments,
-every key optional; a full example is in [`config.example`](config.example).
+every key optional; [`config.example`](config.example) lists every key with its default, commented out (that is
+the file `make install` starts you with).
 
 | Key | Default | What it does |
 |---|---|---|
@@ -172,10 +198,11 @@ A running sync keeps one JSON line in `$XDG_RUNTIME_DIR/gowl/state` and rewrites
 
 [`contrib/quickshell/Gowl.qml`](contrib/quickshell/Gowl.qml) is a `pragma Singleton` service, and
 [`contrib/quickshell/GowlTile.qml`](contrib/quickshell/GowlTile.qml) an example tile (Screen and Music toggles
-plus a status line; right-click pauses). Copy both into a directory of your shell that holds singletons, e.g.:
+plus a status line; right-click pauses). `make install` copies them to `~/.local/share/gowl/quickshell/`; gowl
+never edits your shell. Copy both into a directory of your shell that holds singletons, e.g.:
 
 ```sh
-cp contrib/quickshell/Gowl.qml contrib/quickshell/GowlTile.qml ~/.config/quickshell/myshell/services/
+cp ~/.local/share/gowl/quickshell/*.qml ~/.config/quickshell/myshell/services/
 ```
 
 The service runs one `gowl watch` (restarted with a back-off if it exits), so it costs nothing while the state
@@ -194,9 +221,13 @@ Text { text: Gowl.musicOn ? "♪" : Gowl.screenOn ? "▣" : ""; visible: Gowl.ru
 ## Running at login
 
 [`packaging/gowl.service`](packaging/gowl.service) is a systemd user unit that runs `gowl screen` with the
-graphical session (`systemctl --user enable --now gowl`). `gowl stop` or a toggle ends it with status 0, so
-systemd leaves it stopped until the next login (or `systemctl --user start gowl`); errors and crashes are
-restarted after 2 s. A sync you start from a key while the unit is stopped runs on its own, outside the unit.
+graphical session. `make install` installs it; `make install AUTOSTART=1`, `gowl setup` or
+`systemctl --user enable gowl` turns it on. `gowl stop` or a toggle ends it with status 0, so systemd leaves it
+stopped until the next login (or `systemctl --user start gowl`). Errors that can clear up (the compositor or the
+network not ready yet at login, a crash) are retried after 2 s, stepping up to a minute; errors that can't — no
+light configured, a bad config, the light already held by another gowl — stop it for good (exit 2, 3, 6). A sync
+you start from a key runs on its own, outside the service; if you press a key (or run `gowl stop`) while the
+service is waiting to retry, it stays stopped instead of starting screen sync behind your back.
 
 ## Troubleshooting
 
@@ -225,9 +256,10 @@ time and you type where it is (numpad layout); it saves `layout =` for that ligh
 **The light flickers back to its own mode on a still screen.** Run `gowl calibrate --keepalive`; it measures how
 long your light holds a frame and saves a safe `keepalive_ms`.
 
-**A key does nothing.** Look for the notification. Without one, the compositor probably can't find `gowl`:
-compositors and shells started by systemd often have `PATH=/usr/local/bin:/usr/bin`, without `~/.local/bin`,
-so bind the full path. Running `gowl toggle screen` in a terminal shows what gowl says.
+**A key does nothing.** Look for the notification. Without one, check `gowl keys` (is the include there, is a
+key taken?). Binding keys by hand: compositors and shells started by systemd often have
+`PATH=/usr/local/bin:/usr/bin`, without `~/.local/bin`, so bind the full path (`gowl keys add` does). Running
+`gowl toggle screen` in a terminal shows what gowl says.
 
 ## VPNs
 
@@ -254,7 +286,7 @@ Measured on my machine (Fedora 44, 3440x1440 at 100 Hz, NVIDIA RTX 4060), real H
 \* Measured before a fix that stopped music mode from sending every frame twice; to be re-measured on the
 light. Against the test device after the fix: 0.31 %, 50 wakeups/s, 6.1 MB, 39 packets/s.
 
-Binary: about 680 KiB (693,920 bytes), depending only on the C library. While paused gowl does nothing at all; on a still
+Binary: about 754 KiB (771,744 bytes), depending only on the C library. While paused gowl does nothing at all; on a still
 screen it sends only the keepalive. The compositor's own cost of handing out screen captures is separate and
 depends on the GPU: niri spent a noticeable share of a core on this NVIDIA machine at 30 fps, which is why
 gowl drops to `idle_fps` while the screen edges don't change. Method and full numbers: `docs/BUDGETS.md`.

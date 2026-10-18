@@ -420,6 +420,26 @@ pub fn set_global_key(text: &str, key: &str, value: &str) -> String {
     lines.concat()
 }
 
+/// Append a new `[device ALIAS]` section with `keys` to config `text`, leaving every
+/// existing byte as it was (a missing final line ending is added, in the file's
+/// style).
+pub fn append_device_section(text: &str, alias: &str, keys: &[(&str, String)]) -> String {
+    let lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
+    let eol = eol_of(&lines);
+    let mut out = text.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push_str(eol);
+    }
+    if !out.is_empty() {
+        out.push_str(eol);
+    }
+    out.push_str(&format!("[device {alias}]{eol}"));
+    for (k, v) in keys {
+        out.push_str(&key_line(k, v, None, eol));
+    }
+    out
+}
+
 /// The config file's text; a missing file is empty.
 pub fn read_text(path: &std::path::Path) -> Result<String, crate::Error> {
     match std::fs::read_to_string(path) {
@@ -466,18 +486,63 @@ mod tests {
 
     #[test]
     fn example_config_parses_cleanly() {
+        // As installed: everything commented out = the defaults, no light (so a
+        // fresh install says "No light configured — run gowl setup").
         let text = include_str!("../config.example");
         let mut warnings = Vec::new();
         let c = parse(text, &mut |n, m| warnings.push(format!("{n}: {m}")));
         assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(c, Config::default());
+        // Every commented setting, uncommented, is a valid key with the default
+        // value (the example documents the real defaults).
+        let on: String = text
+            .lines()
+            .map(|l| match l.strip_prefix("# ") {
+                Some(r)
+                    if r.starts_with("[device")
+                        || r.split_once(" = ").is_some_and(|(k, _)| {
+                            k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+                        }) =>
+                {
+                    format!("{r}\n")
+                }
+                _ => format!("{l}\n"),
+            })
+            .collect();
+        let c = parse(&on, &mut |n, m| warnings.push(format!("{n}: {m}")));
+        assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(c.device.as_deref(), Some("desk"));
         assert_eq!(c.fps, 30);
         assert_eq!(c.keepalive_ms, 500);
+        assert_eq!(c.music_fade_ms, 1000);
         let d = &c.devices[0];
         assert_eq!(d.alias, "desk");
         assert_eq!(d.ip, Some(Ipv4Addr::new(192, 168, 1, 50)));
         assert_eq!(d.segments, Some(10));
         assert_eq!(d.mac.as_deref(), Some("AA:BB:CC:DD:EE:FF:00:11"));
+        assert_eq!(d.layout.as_ref().map(Vec::len), Some(10));
+        let defaults = Config::default();
+        assert_eq!(
+            (c.depth, c.saturation, c.smoothing, c.threshold, c.idle_fps),
+            (
+                defaults.depth,
+                defaults.saturation,
+                defaults.smoothing,
+                defaults.threshold,
+                defaults.idle_fps
+            )
+        );
+    }
+
+    #[test]
+    fn appended_device_section_keeps_every_byte() {
+        let t = "fps = 30 # mine\r\n[device a]\r\nip = 1.2.3.4";
+        let out = append_device_section(t, "b", &[("ip", "5.6.7.8".into())]);
+        assert_eq!(out, format!("{t}\r\n\r\n[device b]\r\nip = 5.6.7.8\r\n"));
+        assert_eq!(
+            append_device_section("", "x", &[("ip", "1.1.1.1".into())]),
+            "[device x]\nip = 1.1.1.1\n"
+        );
     }
 
     #[test]

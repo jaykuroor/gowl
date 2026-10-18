@@ -34,6 +34,12 @@ src/
   runtime.rs     Signals/Timer/Ctl (signalfd + timerfd + netwatch), Streams (per-device socket,
                  gate, reorder, razer, rebind, back-off) shared by every mode; screen poll loop
   calibrate.rs   segment walk + keepalive tuning walk (stdin on the same Ctl loop)
+  keys.rs        `gowl keys`: niri binds file + one validated, backed-up include line (D-070)
+  setup.rs       `gowl setup`: first-run onboarding on a terminal (D-071)
+packaging/
+  install.sh     what `make install` / `make uninstall` run (per user, idempotent; D-072)
+  gowl.service   systemd user unit (GOWL_UNIT=1, RestartPreventExitStatus=2 3 6; D-065)
+  niri-binds.kdl template for `gowl keys add`
 ```
 
 ## Screen-sync data flow (per captured frame)

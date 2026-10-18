@@ -110,8 +110,10 @@ fn ensure_dir(rt: &std::path::Path) -> io::Result<PathBuf> {
 const FAILURE: &str = "failure";
 const FAILURE_QUIET_SECS: u64 = 600;
 
-/// True if `summary` should be notified now (and records it).
-pub fn failure_is_new(summary: &str) -> bool {
+/// True if the failure `summary` + `body` should be notified now (and records it).
+/// Keyed on both: "Light unreachable" for two different lights, or two different
+/// I/O errors under "gowl stopped on an error", are two notifications (D-067).
+pub fn failure_is_new(summary: &str, body: Option<&str>) -> bool {
     let Some(rt) = config::runtime_dir() else {
         return true;
     };
@@ -119,23 +121,97 @@ pub fn failure_is_new(summary: &str) -> bool {
         return true;
     };
     let p = dir.join(FAILURE);
-    let recent = std::fs::metadata(&p)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age.as_secs() < FAILURE_QUIET_SECS);
-    if recent && std::fs::read_to_string(&p).is_ok_and(|s| s == summary) {
+    let key = format!("{summary}\n{}", body.unwrap_or(""));
+    if age_secs(&p).is_some_and(|a| a < FAILURE_QUIET_SECS)
+        && std::fs::read_to_string(&p).is_ok_and(|s| s == key)
+    {
         return false;
     }
-    let _ = std::fs::write(&p, summary);
+    let _ = std::fs::write(&p, key);
     true
 }
 
-/// A sync started: the next failure is news again.
+/// Seconds since `p` was last modified, if it exists.
+fn age_secs(p: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|a| a.as_secs())
+}
+
+/// A sync started: the next failure is news again; a service restart that got
+/// this far worked, so it is no longer "retrying".
 pub fn clear_failure() {
     if let Some(rt) = config::runtime_dir() {
         let _ = std::fs::remove_file(rt.join(SUBDIR).join(FAILURE));
+        if unit_mode() {
+            let _ = std::fs::remove_file(rt.join(SUBDIR).join(UNIT_RETRY));
+        }
     }
+}
+
+// ------------------------------------------------------------------ systemd unit
+
+/// The systemd unit (packaging/gowl.service) sets `GOWL_UNIT=1`: this process is the
+/// screen-sync service, which systemd restarts after a failure (D-065).
+pub fn unit_mode() -> bool {
+    std::env::var_os("GOWL_UNIT").is_some_and(|v| v == "1")
+}
+
+/// `$XDG_RUNTIME_DIR/gowl/unit-retry`: the service failed in a way systemd retries
+/// (exit 1, 4, 5) and is waiting to restart. Refreshed by every failed attempt, so
+/// one older than `UNIT_MARK_SECS` is stale (the unit restarts within 60 s).
+const UNIT_RETRY: &str = "unit-retry";
+/// `$XDG_RUNTIME_DIR/gowl/unit-hold`: a key (toggle) or `gowl stop` acted while the
+/// service waited to retry — the user has the light now, so the restart stands
+/// down (exit 6) instead of starting screen sync behind their back.
+const UNIT_HOLD: &str = "unit-hold";
+const UNIT_MARK_SECS: u64 = 90;
+
+/// The service is exiting with a failure systemd will retry: note it.
+pub fn mark_unit_retry() {
+    if let Some(rt) = config::runtime_dir()
+        && let Ok(dir) = ensure_dir(&rt)
+    {
+        let _ = std::fs::write(dir.join(UNIT_RETRY), b"");
+    }
+}
+
+/// A key or `gowl stop` acted: if the service is waiting to retry, make that
+/// retry stand down. True if it was waiting.
+pub fn hold_unit_retry() -> bool {
+    let Some(rt) = config::runtime_dir() else {
+        return false;
+    };
+    let dir = rt.join(SUBDIR);
+    let retry = dir.join(UNIT_RETRY);
+    if !age_secs(&retry).is_some_and(|a| a < UNIT_MARK_SECS) {
+        let _ = std::fs::remove_file(&retry);
+        return false;
+    }
+    std::fs::rename(&retry, dir.join(UNIT_HOLD)).is_ok()
+}
+
+/// The service is starting: stand down if a key took over while it waited
+/// (the hold is used up, so a later `systemctl --user start gowl` runs).
+pub fn unit_held() -> Result<(), Error> {
+    if !unit_mode() {
+        return Ok(());
+    }
+    let Some(rt) = config::runtime_dir() else {
+        return Ok(());
+    };
+    let hold = rt.join(SUBDIR).join(UNIT_HOLD);
+    let fresh = age_secs(&hold).is_some_and(|a| a < UNIT_MARK_SECS);
+    let _ = std::fs::remove_file(&hold);
+    let _ = std::fs::remove_file(rt.join(SUBDIR).join(UNIT_RETRY));
+    if fresh {
+        return Err(Error::AlreadyRunning(
+            "the light was controlled from a key while this service waited to restart; it stays stopped until the next login (or `systemctl --user start gowl`)".into(),
+        ));
+    }
+    Ok(())
 }
 
 static PANIC_PATH: OnceLock<CString> = OnceLock::new();
@@ -551,6 +627,25 @@ fn pidfd(pid: i32) -> Option<OwnedFd> {
     (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as i32) })
 }
 
+/// The current line and a pidfd on the session it describes. The pidfd pins the
+/// process; re-checking the lock *after* opening it makes sure the pidfd is on the
+/// holder and not on a recycled pid of a session that ended in between (as
+/// `control::session` does; D-067). A handover in between → read again.
+fn follow(rt: &std::path::Path) -> (String, Option<OwnedFd>) {
+    for _ in 0..3 {
+        let (line, pid) = current_in(rt);
+        let Some(pid) = pid else {
+            return (line, None);
+        };
+        let fd = pidfd(pid);
+        if control::running_at(&rt.join(PIDFILE)) == Some(pid) {
+            return (line, fd);
+        }
+    }
+    // Still changing hands: report what is there now; the next change wakes us.
+    (current_in(rt).0, None)
+}
+
 /// `gowl watch`: the state line now and after every change, until SIGTERM/SIGINT/
 /// SIGHUP, the reader goes away (SIGPIPE/EPIPE or POLLERR on stdout) or the
 /// runtime dir does (logout).
@@ -581,8 +676,7 @@ pub fn cmd_watch() -> Result<(), Error> {
     if unsafe { libc::inotify_add_watch(ino.as_raw_fd(), cdir.as_ptr(), mask) } < 0 {
         return Err(Error::Io("inotify_add_watch", io::Error::last_os_error()));
     }
-    let (mut last, pid) = current_in(&rt);
-    let mut proc = pid.and_then(pidfd);
+    let (mut last, mut proc) = follow(&rt);
     if !emit(&last) {
         return Ok(());
     }
@@ -682,9 +776,9 @@ pub fn cmd_watch() -> Result<(), Error> {
             return Ok(());
         }
         if relevant {
-            let (now, pid) = current_in(&rt);
             // Follow the session that runs now (none, the same, or a new one).
-            proc = pid.and_then(pidfd);
+            let (now, fd) = follow(&rt);
+            proc = fd;
             if now != last {
                 if !emit(&now) {
                     return Ok(());

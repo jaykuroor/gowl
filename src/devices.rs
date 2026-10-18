@@ -185,7 +185,7 @@ fn finish(ip: Ipv4Addr, mac: Option<String>, cfg: Option<&DeviceCfg>, cache: &[C
     }
 }
 
-fn section_for<'a>(cfg: &'a Config, ip: Ipv4Addr, mac: Option<&str>) -> Option<&'a DeviceCfg> {
+pub fn section_for<'a>(cfg: &'a Config, ip: Ipv4Addr, mac: Option<&str>) -> Option<&'a DeviceCfg> {
     cfg.devices.iter().find(|d| {
         d.ip == Some(ip) || matches!((d.mac.as_deref(), mac), (Some(a), Some(b)) if mac_matches(a, b) || mac_matches(b, a))
     })
@@ -278,6 +278,96 @@ pub fn resolve(spec: Option<&str>, cfg: &Config, cache: &[Cached]) -> Result<Dev
     Err(Error::NoDevice(format!(
         "unknown device {spec:?}: not an alias, IPv4 address, MAC or index"
     )))
+}
+
+/// Where `gowl scan` (and `gowl setup`) look: multicast + broadcast on every LAN
+/// interface, plus one unicast probe to each IP already known (config, cache,
+/// default device) — replies to a unicast probe pass conntrack, so known lights
+/// are found even when multicast replies are dropped.
+pub fn scan_targets(cfg: &Config, cache: &[Cached]) -> Result<Vec<crate::net::ScanTarget>, Error> {
+    use crate::net::{self, ScanTarget};
+    let ifaces = net::interfaces().map_err(|e| Error::Io("getifaddrs", e))?;
+    let lan_if = cfg.lan_if.as_deref();
+    let mut targets: Vec<ScanTarget> = net::discovery_ifaces(&ifaces, lan_if)
+        .into_iter()
+        .map(|iface| ScanTarget {
+            iface,
+            discover: true,
+            unicast: Vec::new(),
+        })
+        .collect();
+    let mut known: Vec<Ipv4Addr> = cache.iter().map(|d| d.ip).collect();
+    known.extend(cfg.devices.iter().filter_map(|d| d.ip));
+    if let Ok(d) = resolve(None, cfg, cache) {
+        known.push(d.ip);
+    }
+    known.sort();
+    known.dedup();
+    for ip in known {
+        let Ok(sel) = net::select_for(&ifaces, ip, lan_if) else {
+            debug!("known device {ip} is on no LAN interface; skipped");
+            continue;
+        };
+        match targets.iter_mut().find(|t| t.iface.name == sel.iface.name) {
+            Some(t) => t.unicast.push(ip),
+            None => targets.push(ScanTarget {
+                iface: sel.iface,
+                discover: false,
+                unicast: vec![ip],
+            }),
+        }
+    }
+    if targets.is_empty() {
+        return Err(Error::NoLanIf(
+            "no LAN interface to scan on (VPN interfaces are never used); set lan_if= in the config".into(),
+        ));
+    }
+    Ok(targets)
+}
+
+/// Govee's MAC prefixes (OUIs): Shenzhen Intellirocks Tech. Co. Ltd. in the IEEE
+/// registry (hwdata's oui.txt), plus 60:74:F4 (registered "Private"; seen on an
+/// H6609). Used only to point at likely lights in the ARP table (`gowl setup`).
+pub const GOVEE_OUIS: &[&str] = &["5C:E7:53", "D4:13:68", "E0:2A:25", "D4:AD:FC", "60:74:F4"];
+
+/// One neighbour from `/proc/net/arp`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Neighbour {
+    pub ip: Ipv4Addr,
+    pub mac: String,
+    pub iface: String,
+    pub govee: bool,
+}
+
+/// Complete entries of an `/proc/net/arp` text (header skipped).
+pub fn parse_arp(text: &str) -> Vec<Neighbour> {
+    text.lines()
+        .skip(1)
+        .filter_map(|l| {
+            let w: Vec<&str> = l.split_whitespace().collect();
+            let (ip, flags, mac, iface) = (w.first()?, w.get(2)?, w.get(3)?, w.get(5)?);
+            let flags = u32::from_str_radix(flags.trim_start_matches("0x"), 16).ok()?;
+            if flags & 0x2 == 0 || *mac == "00:00:00:00:00:00" {
+                return None;
+            }
+            let mac = mac.to_ascii_uppercase();
+            Some(Neighbour {
+                ip: ip.parse().ok()?,
+                govee: GOVEE_OUIS.iter().any(|o| mac.starts_with(o)),
+                mac,
+                iface: iface.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The MAC this machine has for `ip` in its ARP table (after talking to it).
+pub fn arp_mac(ip: Ipv4Addr) -> Option<String> {
+    let t = std::fs::read_to_string("/proc/net/arp").ok()?;
+    parse_arp(&t)
+        .into_iter()
+        .find(|n| n.ip == ip)
+        .map(|n| n.mac)
 }
 
 /// Several DEVs for a sync mode (SPEC.md): none → the default device; the same

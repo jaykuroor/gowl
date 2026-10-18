@@ -1,29 +1,31 @@
-# gowl config — copy to ~/.config/gowl/config
-# key = value, '#' comments. Every key is optional.
+# gowl config — ~/.config/gowl/config. `make install` puts this file there if you
+# have none; `gowl setup` and `gowl calibrate` fill in your light. key = value,
+# '#' starts a comment. Every setting is optional: the commented values below are
+# the defaults — remove the leading '#' to change one.
 
-# Default device for commands without DEV: alias, IP, or MAC.
-device = desk
+# Default light for commands without DEV: alias, IP, or MAC.
+# device = desk
 
 # ---- screen sync ----
-output = DP-1            # niri output name (`niri msg outputs`); default: first output
-fps = 30                 # capture/send cap, 1-40 (device limit); frames only when the screen changes
-depth = 0.28             # how far edge zones reach into the screen (0.10-0.50)
-saturation = 1.15
-screen_brightness = 0.75 # channel multiplier, 0-1
-smoothing = 0.55         # EMA alpha, higher = snappier
-threshold = 3            # min channel change that triggers a send
-keepalive_ms = 500       # resend interval on a static screen; `gowl calibrate --keepalive` finds your light's
-idle_fps = 5             # capture rate once the edge colors stop changing (0 or >= fps = off)
-idle_after_ms = 1000     # ...after this long without a change above threshold
+# output = DP-1            # monitor to follow (`gowl outputs`); default: the first one
+# fps = 30                 # capture/send cap, 1-40 (device limit); frames only when the screen changes
+# depth = 0.28             # how far edge zones reach into the screen (0.10-0.50)
+# saturation = 1.15
+# screen_brightness = 0.75 # channel multiplier, 0-1
+# smoothing = 0.55         # EMA alpha, higher = snappier
+# threshold = 3            # min channel change that triggers a send
+# keepalive_ms = 500       # resend interval on a static screen; `gowl calibrate --keepalive` finds your light's
+# idle_fps = 5             # capture rate once the edge colors stop changing (0 or >= fps = off)
+# idle_after_ms = 1000     # ...after this long without a change above threshold
 
 # ---- music sync ----
-reaction = flow          # flow | pulse | energy_fill | band_split | center_burst | wave | bass_bounce | chase | twinkle | auto
-palette = rgb            # rgb | auto | rainbow | aurora | sunset | ocean | neon | jewel | fire | spectrum | warm | cool | mono
-music_fps = 60
-music_gain = 1.7
-music_brightness = 0.85
-music_smoothing = 0.6
-music_fade_ms = 1000     # when the music stops, dim to black over this long (ease-out); 0 = black at once
+# reaction = flow          # flow | pulse | energy_fill | band_split | center_burst | wave | bass_bounce | chase | twinkle | auto
+# palette = rgb            # rgb | auto | rainbow | aurora | sunset | ocean | neon | jewel | fire | spectrum | warm | cool | mono
+# music_fps = 60
+# music_gain = 1.7
+# music_brightness = 0.85
+# music_smoothing = 0.6
+# music_fade_ms = 1000     # when the music stops, dim to black over this long (ease-out); 0 = black at once
 
 # ---- network ----
 # gowl binds to the interface whose subnet contains the light, so VPNs (Tailscale,
@@ -31,16 +33,17 @@ music_fade_ms = 1000     # when the music stops, dim to black over this long (ea
 # lan_if = wlp3s0
 
 # ---- desktop ----
-notify = on              # notifications for toggle/pause/resume/stop and failed syncs (notify-send); off = silent
+# notify = on              # notifications for toggle/pause/resume/stop and failed syncs (notify-send); off = silent
 
-# ---- devices ----
-[device desk]
-mac = AA:BB:CC:DD:EE:FF:00:11
-ip = 192.168.1.50        # optional; refreshed by `gowl scan`
-segments = 10            # overrides the SKU table
-reverse = 0              # 1 = strip runs the other way
-offset = 0               # rotate zone 0 to this segment
-# port = 4003            # control port override (legacy Device_Port); default 4003
+# ---- lights: one section per light (`gowl setup` writes yours) ----
+# [device desk]
+# mac = AA:BB:CC:DD:EE:FF:00:11
+# ip = 192.168.1.50        # refreshed by `gowl scan`
+# sku = H6199
+# segments = 10            # overrides the SKU table
+# reverse = 0              # 1 = strip runs the other way
+# offset = 0               # rotate zone 0 to this segment
+# port = 4003              # control port override (legacy Device_Port); default 4003
 # layout = 4 4 8 8 9 6 6 2 2 1   # written by `gowl calibrate`: where each segment sits,
 #                                # numpad cells (7 8 9 / 4 5 6 / 1 2 3, 5 = whole screen,
 #                                # 0 = off); replaces reverse/offset

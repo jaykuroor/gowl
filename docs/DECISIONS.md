@@ -903,3 +903,140 @@ SigBlk 0x10000 and hid the real inherited mask) recording SigBlk and its open fd
 for every notification (CLI and syncs): mask 0, fds exactly 0–2, all `/dev/null`.
 **README:** VPN claims now say exactly what was checked by hand (ProtonVPN) and what only the netns simulation
 covers (Tailscale-, WireGuard-, OpenVPN-style routing); binary size from the final build; status file path.
+(Summary escaping amended by D-067: only the body is escaped.)
+
+## D-065 — Exit code 6 "light held"; the unit stops looping and stands down for keys (2026-10-18, phase 7, install agent)
+**Problem (Phase 6 re-review):** "already running" exited 1 like any runtime error, so the unit
+(`Restart=on-failure`, no start limit) restarted every 2–60 s forever while a key-started sync held the light,
+and started screen sync by itself as soon as the user turned that sync off. "No light configured" (3) looped too.
+**Decision.** New `Error::AlreadyRunning` → **exit 6** (pidfile claim lost). The unit gets
+`RestartPreventExitStatus=2 3 6` (usage/bad config, no light, light held) and `Environment=GOWL_UNIT=1`.
+Retryable exits (1; 4 capture unavailable; 5 no LAN interface — a login before the compositor or network is
+ready) still restart. The narrower case — a key pressed *while the unit waits to restart*, where no collision
+ever happens if the user toggles on and off within the back-off — is closed with two marker files in
+`$XDG_RUNTIME_DIR/gowl/`: a unit-run `gowl screen` that exits retryably writes `unit-retry`; `gowl toggle` (any
+key) and `gowl stop` with nothing running rename a fresh `unit-retry` (< 90 s; each retry refreshes it, and the
+longest back-off is 60 s) to `unit-hold`; the restart finds a fresh hold, removes it and exits 6 ("controlled
+from a key while this service waited"). The hold is used up, so a later `systemctl --user start gowl` runs; a
+successful unit start clears `unit-retry`. In unit mode an exit 6 is not notified (it is the user's own doing).
+`gowl stop` while the unit waits answers "Screen sync off" (exit 0). Rejected: calling `systemctl` from toggle
+(D-059: a blocking, D-Bus-backed tool in the key path); sniffing `INVOCATION_ID` (implicit); a marker without an
+age limit (a unit stopped by hand mid-retry would make one later manual start refuse).
+**Tests:** tests/session.rs `the_service_stands_down_when_a_key_takes_over` (exit 4 → retry marker; stop →
+"Screen sync off" + hold; unit → 6 and the hold is gone; next unit start → 4 again; toggle does the same; exit 3
+leaves no marker; a 10-minute-old marker is ignored; unit vs a running music sync → 6 without a notification, by
+hand → 6 with "already running"); the control unit test asserts exit 6; screen_mock's second sync → 6.
+`systemd-analyze --user verify` on a copy with ExecStart at the build: clean.
+
+## D-066 — Pidfile holder proven by its lock; panic unlink gated by inode (2026-10-18, phase 7, install agent)
+**is_gowl.** A locked pidfile's pid counted as a live session if `/proc/PID/comm == "gowl"`. That was wrong for
+a renamed binary or a wrapper, and right only by accident for a recycled pid that happens to be named gowl. Now
+`holds_lock(pid, dev, ino)`: one of PID's fds is the pidfile (stat dev/ino) **and** its `/proc/PID/fdinfo/N`
+shows an `OFDLCK … WRITE` lock line (checked on kernel 7.2: `lock: 1: OFDLCK ADVISORY  WRITE -1 00:35:55246 0
+EOF`). The proof comes from the kernel and the pidfile format is unchanged, so old and new gowl read each other's
+pidfile. Only when /proc hides the fds does the comm check apply. Rejected: a start time in the pidfile (old
+readers can't parse it); comparing `/proc/PID/exe` (breaks across an upgrade, because the running binary is the
+deleted old inode). Unit test: the test binary (not called gowl) is proven the holder; pid 1 is not.
+**PANIC_PIDFILE.** The panic hook unlinked the path whenever it had ever been set, so a panic after the session
+(calibrate saving, a toggle that handed over) could remove a newer session's pidfile. Now `PANIC_INO` holds the
+inode while this process holds the pidfile, `Drop` clears it first, and the hook unlinks only if the path still
+has that inode. Unit test `released_pidfile_is_safe_from_a_later_panic`.
+
+## D-067 — watch re-checks after the pidfd; notification summary unescaped, dedup on summary+body (2026-10-18, phase 7, install agent)
+`gowl watch` opened a pidfd on the session pid without re-checking the lock afterwards, so a session that ended
+in between could leave it watching a recycled pid. `follow()` now does what `control::session` does: pidfd,
+then `running_at == pid`, else read again (3 tries). Notifications: the summary is plain text by the notification
+spec, so it is no longer entity-escaped (spec-following servers showed "&amp;"); only the body (markup) is. A
+unit test covers the argv builder. The once-per-10-min failure dedup (`$XDG_RUNTIME_DIR/gowl/failure`) now keys
+on summary **and** body, so "Light unreachable" for two different lights gives two notifications.
+
+## D-068 — Razer OFF only while live; music switches the light on only after the stream opened (2026-10-18, phase 7, install agent)
+`Streams::off()` (and so `shutdown()`) returns at once unless `live`. After a pause, a lost output or a lost
+sound server the light has already had OFF ×2; the shutdown that followed, or a pause on top of a lost output,
+sent two more that changed nothing (rule 7). The panic hook's OFF is gated the same way (`emergency::LIVE`).
+Music no longer sends razer ON before the monitor stream exists. ON goes out on the first successful open (and,
+after `resume`, on the reopen). So `gowl music` with no sound server (the toggle-to-music case at logout) sends
+nothing at all, instead of ON and then OFF ×2. Tests: the screen_mock toggle switch now expects screen's OFF ×2
+and then nothing from music (not even at its exit); tests/session.rs: start, pause and exit without a sound
+server put nothing on the wire.
+
+## D-069 — Music ends with the desktop session, even paused (2026-10-18, phase 7, install agent)
+A paused `gowl music` has its stream closed and its timer disarmed, so nothing ever woke it, and a
+toggle-started one survived logout (Fedora keeps user processes: KillUserProcesses=no). **Decision:**
+`runtime::compositor_pidfd()` connects to `$WAYLAND_DISPLAY` (absolute, or under `$XDG_RUNTIME_DIR`), reads the
+listener's pid with `SO_PEERCRED`, hangs up at once (no Wayland request is ever sent) and runs `pidfd_open` on it.
+The pidfd is a fifth hook slot (`H_SESSION`), polled in every state. When it turns readable the compositor has
+exited (logout or crash): "the desktop session ended", razer OFF ×2 if live, exit 0. Cost: one idle fd, zero
+wakeups. Without a Wayland session (SSH, tests) there is no slot and the old behaviour applies. Rejected: inotify
+on the runtime dir (other programs' files wake it, and the dir outlives a quick re-login by `UserStopDelaySec`);
+watching the socket file (a crash doesn't unlink it); keeping a Wayland connection open (a client niri would carry
+for nothing); logind (D-Bus). `down_since` is also reset on pause and on resume, so time paused never counts
+towards the 10-minute "sound server unreachable" exit.
+**Evidence:** tests/session.rs uses a stand-in compositor process (python, listening on a Unix socket). With music
+paused and with it running, killing that process makes music exit 0 within 2 s with "session ended", and its files
+are gone. Live (isolated runtime dir, no sound server, loopback device, empty PATH): `session: compositor pid 5577`
+matches `pgrep -x niri`.
+
+## D-070 — `gowl keys`: niri keys through one validated include line (2026-10-18, phase 7, install agent)
+One implementation, used by `make install`, `make uninstall` and `gowl setup`. `add` writes
+`~/.config/gowl/niri-binds.kdl` from `packaging/niri-binds.kdl`, with gowl's absolute path (`current_exe`; niri's
+PATH lacks ~/.local/bin, D-061) and a first line marking it as generated (delete that line to keep hand edits
+across reinstalls). It then appends `// gowl: …` + `include optional=true "~/.config/gowl/niri-binds.kdl"` to
+niri's config (`$NIRI_CONFIG` or `$XDG_CONFIG_HOME/niri/config.kdl`), only if it isn't included yet.
+**The conflict check is gowl's own.** niri 26.04 accepts a duplicate bind in another included file (probe: two
+files binding Mod+M → "config is valid"; only duplicates within one block fail). So gowl scans config.kdl and
+everything it includes (`~` and relative paths, ≤ 8 deep, comments and `/-` skipped) for Mod+M / Mod+Shift+M,
+treating Mod, Super and Win alike. On a hit it refuses, naming file:line and saying how to use other keys.
+The edited text goes to a temp file **next to config.kdl** (so relative includes resolve the same) and
+`niri validate -c` must pass. The old file is copied to `~/.config/gowl/backups/niri-config.kdl.YYYYmmdd-HHMMSS`,
+then `config::write_atomic` replaces it (through a symlink, to its target). `remove` takes out exactly gowl's
+marker + include lines the same way and deletes the binds file. Without niri installed it removes them
+unvalidated, since nothing reads that config then. niri's config.kdl is never created (niri writes its own
+defaults on first start). Probes (temp files only): `~` is expanded, `optional=true` is accepted, a trailing `//`
+comment is accepted.
+**Tests:** keys unit tests (key spellings, comment stripping, binds text, stamp); tests/install.rs: install adds
+the include and the real niri validates the result; a Super+M in an included file → refused, nothing written; a
+failing `niri validate` → refused, no temp file or binds file left; a symlinked config is edited through the
+link; remove works without niri.
+
+## D-071 — `gowl setup` (2026-10-18, phase 7, install agent)
+Interactive and terminal only: stdin and stdout must be ttys, else exit 2 with a pointer to config.example.
+Prompts are read with `poll()` over stdin and a signalfd, so Ctrl+C or end of input cancels at any point ("setup
+cancelled", exit 1) and never leaves a light blinking. Flow: offer to stop a running sync; explain LAN Control;
+then find the **light**: the config's light (with an offered blink check), else a 1.5 s scan (the cache is
+updated), else the light's IP. In that last case — when replies are blocked, as on the human's machine — setup
+shows the LAN-scoped runtime firewall rule as optional text (never runs it) and takes an IP typed in or picked from
+`/proc/net/arp` entries with Govee OUIs (hwdata: Shenzhen Intellirocks 5C:E7:53, D4:13:68, E0:2A:25, D4:AD:FC;
+plus 60:74:F4, the human's H6609). **Every candidate is confirmed by eye:** with the pidfile held, gowl sends
+`turn on` and razer ON, alternates blue and black every 500 ms (which doubles as the keepalive) until the human
+answers y/n, then OFF ×2 gives the light back. The light is saved as a new `[device ALIAS]` section
+(`config::append_device_section`), or as only the keys that change in its existing section (`set_device_keys`),
+plus `device =` if there is none. Segments come from the SKU table or are asked. The `calibrate` walk and an
+optional `calibrate --keepalive` run as child processes on the same terminal (an existing layout or keepalive →
+"again? [y/N]"). Then: the login service (`systemctl --user enable|disable gowl.service`, only if the answer
+differs from the wants symlink), niri keys (`keys::add`), notifications (written only if changed), and a
+quickshell hint if `~/.config/quickshell` exists; a summary and next steps at the end. Every write is atomic and
+byte-preserving.
+**Tests** (a python helper drives a pty; temp HOME; loopback receiver; scans limited to `lan_if = lo`; the IP is
+typed, never picked, because the real ARP table lists the real light): a new light by IP → blink → 2 segments →
+calibrate walk saved → service enabled → keys added → notify off. The wire shows turn, ON, a frame, OFF ×2, then
+calibrate's ON … OFF ×2, and the installed config's bytes stay as a prefix. An existing calibrated config →
+nothing written at all; no tty → 2; EOF → cancelled, config unchanged.
+
+## D-072 — `make install` / `make uninstall` via packaging/install.sh (2026-10-18, phase 7, install agent)
+POSIX sh, per user (refuses root), idempotent, one line per item (`+ ~ - = !`). Install: the binary via temp file
++ rename (a running gowl keeps its inode); the unit with `%h/.local/bin/gowl` replaced by `$PREFIX/bin/gowl`;
+`daemon-reload` only when the unit changed; `enable` only with `AUTOSTART=1`; `restart` only if the unit is
+active and the binary changed; the config from `config.example` only if absent;
+`$PREFIX/share/gowl/{quickshell/*.qml,config.example}`; `gowl keys add` (a failure is reported and the install
+continues; `NIRI_KEYS=0` skips it); a PATH hint. Uninstall: `gowl stop` if a sync runs; `disable --now`, unit and
+wants link removed, `daemon-reload`; `gowl keys remove`; binary and share dir removed; the config and niri backups
+kept unless `PURGE=1` (which also removes the device cache).
+**config.example is now all commented out** (documented defaults). Installed as the first config it changes
+nothing, so a fresh install says "No light configured — run gowl setup" instead of streaming to the example's
+192.168.1.50 on output DP-1. Unit test: it parses to `Config::default()`, and uncommented it parses cleanly to the
+documented values. **Test** `install_uninstall_reinstall_in_a_temp_home`: install → every file as described, the
+human-style niri config kept byte for byte + 2 lines, one backup, real `niri validate` passes; install again →
+identical tree, no reload; AUTOSTART=1 → enabled; uninstall → niri config byte-identical to the original, nothing
+of gowl left but the config; uninstall again → no change; reinstall → works; `PURGE=1` → HOME's files exactly as
+before the first install.

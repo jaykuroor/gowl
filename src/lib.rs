@@ -14,11 +14,13 @@ pub mod control;
 pub mod devices;
 pub mod doctor;
 pub mod error;
+pub mod keys;
 pub mod net;
 pub mod netwatch;
 pub mod notify;
 pub mod proto;
 pub mod runtime;
+pub mod setup;
 pub mod state;
 
 pub use error::Error;

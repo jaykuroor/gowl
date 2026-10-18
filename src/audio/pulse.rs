@@ -52,7 +52,7 @@ type P = *mut c_void;
 type PollFn = unsafe extern "C" fn(*mut libc::pollfd, c_ulong, c_int, *mut c_void) -> c_int;
 
 /// Extra fds the mainloop's `poll()` watches for the caller.
-pub const HOOK_FDS: usize = 4;
+pub const HOOK_FDS: usize = 5;
 const NO_FD: libc::pollfd = libc::pollfd {
     fd: -1,
     events: libc::POLLIN,

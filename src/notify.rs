@@ -23,7 +23,20 @@ pub fn send(enabled: bool, summary: &str, body: Option<&str>) {
         "notify: {summary}{}",
         body.map_or(String::new(), |b| format!(" — {b}"))
     );
-    let mut args: Vec<&str> = vec![
+    let argv: Vec<CString> = args(summary, body)
+        .iter()
+        .map(|a| CString::new(a.replace('\0', " ")).unwrap_or_default())
+        .collect();
+    let mut ptrs: Vec<*const c_char> = argv.iter().map(|a| a.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    spawn_detached(&ptrs);
+}
+
+/// notify-send's argv. The body may be parsed as markup by the server: `<`, `>`
+/// and `&` are escaped. The summary is plain text by the notification spec, so it
+/// goes as is — escaping it would show a literal "&amp;" (D-067).
+fn args(summary: &str, body: Option<&str>) -> Vec<String> {
+    let mut a: Vec<String> = [
         "notify-send",
         "-a",
         "gowl",
@@ -32,22 +45,12 @@ pub fn send(enabled: bool, summary: &str, body: Option<&str>) {
         "-h",
         "string:x-canonical-private-synchronous:gowl",
         "--",
-    ];
-    // The body may be parsed as markup by the server: escape < > & (the summary is
-    // plain text by the spec, escaped too so no server can misread it).
-    let summary = escape(summary);
-    let body = body.map(escape);
-    args.push(&summary);
-    if let Some(b) = &body {
-        args.push(b);
-    }
-    let argv: Vec<CString> = args
-        .iter()
-        .map(|a| CString::new(a.replace('\0', " ")).unwrap_or_default())
-        .collect();
-    let mut ptrs: Vec<*const c_char> = argv.iter().map(|a| a.as_ptr()).collect();
-    ptrs.push(std::ptr::null());
-    spawn_detached(&ptrs);
+        summary,
+    ]
+    .map(str::to_string)
+    .into();
+    a.extend(body.map(escape));
+    a
 }
 
 /// `<`, `>`, `&` as entities (notification body markup).
@@ -107,5 +110,14 @@ mod tests {
     #[test]
     fn markup_is_escaped() {
         assert_eq!(super::escape("a <b> & c"), "a &lt;b&gt; &amp; c");
+    }
+
+    #[test]
+    fn only_the_body_is_escaped() {
+        let a = super::args("Rock & <roll>", Some("a & b"));
+        assert_eq!(a[8], "Rock & <roll>", "summary is plain text");
+        assert_eq!(a[9], "a &amp; b");
+        assert_eq!(a.len(), 10);
+        assert_eq!(super::args("x", None).len(), 9);
     }
 }

@@ -89,6 +89,7 @@ Singleton {
             if (running) { root._startedAt = Date.now(); return }
             if (!root.enabled) return
             if (root._startedAt > 0 && Date.now() - root._startedAt >= 10000) root._backoff = 1000
+            root._startedAt = 0            // judged once; a later exit without a start can't reuse it
             if (root.state.running !== false) root.state = { running: false }
             root._watchError = watchErr.text.trim() || (root.gowl !== "" ? "can't run `" + root.gowl + " watch`"
                 : "gowl not found on PATH or in ~/.local/bin")

@@ -32,6 +32,16 @@ fn subnet(i: &Iface) -> String {
     )
 }
 
+/// The LAN-scoped, runtime-only firewalld rule that lets the light's replies in
+/// (docs/NETWORK.md). Only ever shown — gowl never runs it.
+pub fn firewall_rule(lan: &Iface, reply_port: u16) -> String {
+    format!(
+        "sudo firewall-cmd --zone={} --add-rich-rule='rule family=\"ipv4\" source address=\"{}\" port port=\"{reply_port}\" protocol=\"udp\" accept'",
+        firewall_zone(&lan.name).as_deref().unwrap_or("public"),
+        subnet(lan)
+    )
+}
+
 /// Print the report. `dev` is `None` when no device could be resolved.
 pub fn run(dev: Option<&Device>, lan_if: Option<&str>, ports: Ports) -> Result<(), Error> {
     let ifaces = net::interfaces().map_err(|e| Error::Io("getifaddrs", e))?;
@@ -184,6 +194,7 @@ pub fn run(dev: Option<&Device>, lan_if: Option<&str>, ports: Ports) -> Result<(
             subnet(lan),
             ports.reply
         );
+        // (`firewall_rule` builds the same line for `gowl setup`.)
         println!(
             "           (runtime only; repeat with --permanent once it works). gowl never changes the firewall."
         );

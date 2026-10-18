@@ -21,8 +21,9 @@ use crate::control::Pidfile;
 use crate::devices;
 use crate::net::Ports;
 use crate::proto::MAX_SEGMENTS;
-use crate::runtime::{Ctl, Sig, Streams, min_opt, now_ns};
+use crate::runtime::{Ctl, Sig, Streams, compositor_pidfd, min_opt, now_ns};
 use crate::state::{Mode, Problem, Writer};
+use std::os::fd::AsRawFd;
 
 /// The clock the music loop renders, sends and keeps alive on: CLOCK_MONOTONIC in
 /// µs, the same clock as `now_ns()` (keepalive, fade, timerfd). Phase 5 rendered on
@@ -458,8 +459,9 @@ pub fn cmd_music(args: &[String], announce: Option<&str>) -> Result<(), Error> {
         ("palette", s.palette.name().to_string()),
     ];
     let mut music = Music::new(s, streams);
-    // From the first razer ON on, every exit path below runs the OFF rounds.
-    music.streams.razer(true);
+    // Razer ON waits for the first successful open of the monitor stream (D-068):
+    // with no sound server at start the light is never switched to stream mode
+    // just to be switched back. Every exit path below runs the OFF rounds if it is.
     let mut status = Writer::start(pidfile, Mode::Music, hz as u32, extra, &music.streams);
     if let Some(a) = announce {
         crate::notify::send(cfg.notify, a, None);
@@ -475,6 +477,8 @@ pub const H_SIG: usize = 0;
 pub const H_TIMER: usize = 1;
 pub const H_NET: usize = 2;
 pub const H_VERIFY: usize = 3;
+/// pidfd of the desktop session's compositor (`runtime::compositor_pidfd`).
+pub const H_SESSION: usize = 4;
 
 /// Open the monitor stream with only the signal slot of `hook` polled. A ready
 /// timerfd or netlink fd must not abort a half-made connection (they are
@@ -504,11 +508,17 @@ fn run_loop(
     hook.set_fd(H_SIG, ctl.sig.fd());
     hook.set_fd(H_TIMER, ctl.timer.fd());
     hook.set_fd(H_NET, ctl.net_fd());
+    // The session ending (logout: the compositor exits) ends music sync too, even
+    // paused — a paused sync has nothing else that would ever wake it (D-069).
+    let session = compositor_pidfd();
+    hook.set_fd(H_SESSION, session.as_ref().map_or(-1, |f| f.as_raw_fd()));
     let mut stream: Option<Capture<'_>> = None;
     let mut paused = false;
     let mut retry_at: Option<u64> = Some(0);
     let mut warned = false; // "cannot open" logged, waiting for it to come back
-    let mut failed = false; // the stream broke: razer ON again when it's back
+    // Razer ON is due when the stream opens: at start, after resume, and after the
+    // stream broke (the light may have left stream mode meanwhile).
+    let mut failed = true;
     let mut samples = [0f32; N];
     let interval = music.settings.interval_us();
     let mut next_us = 0u64;
@@ -669,6 +679,10 @@ fn run_loop(
         // One of our fds is ready.
         let now = now_ns();
         let ev = hook.take();
+        if ev[H_SESSION] != 0 {
+            warn!("the desktop session ended (the compositor exited); music sync stopped");
+            return Ok(());
+        }
         if ev[H_SIG] != 0 {
             while let Some(sig) = ctl.sig.read() {
                 match sig {
@@ -681,14 +695,18 @@ fn run_loop(
                         paused = true;
                         stream = None;
                         music.drop_fade();
+                        // (Nothing to send if the sound server was already gone.)
                         music.streams.off();
+                        // Time paused doesn't count towards "unreachable 10 min".
+                        down_since = None;
                         status.set_paused(true, &music.streams);
                     }
                     Sig::Resume if paused => {
                         debug!("resumed");
                         paused = false;
-                        music.streams.razer(true);
-                        failed = false; // razer ON just went out
+                        // Razer ON once the stream is open again (at once, normally).
+                        failed = true;
+                        down_since = None;
                         retry_at = Some(now);
                         status.set_paused(false, &music.streams);
                     }

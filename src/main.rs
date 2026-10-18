@@ -1,17 +1,18 @@
 //! gowl CLI: hand-written argument parsing and dispatch (SPEC.md "CLI").
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::SocketAddrV4;
 
 use gowl::color::Rgb;
 use gowl::config::{self, Config};
 use gowl::devices::{self, Cached, Device};
-use gowl::net::{self, Ports, ScanTarget};
+use gowl::net::{self, Ports};
 use gowl::{Error, debug, doctor, proto, warn};
 
 const HELP: &str = "\
 gowl — Govee LAN lights on niri
 
 usage:
+  gowl setup                           first-run questions: find the light, calibrate, keys, login
   gowl scan [--sweep] [--timeout MS]   discover devices; update the device cache
   gowl list                            print cached devices (no network)
   gowl on|off [DEV]
@@ -35,15 +36,16 @@ usage:
                                        running → switch to this one; nothing running → start it
   gowl state                           print the sync's state as one JSON line
   gowl watch                           print the state line now and on every change (for bars)
+  gowl keys [add|remove]               niri keys Mod+M / Mod+Shift+M: show, add or remove them
   gowl --version | --help
 
 DEV = alias | IP | MAC | index from `gowl list`; default: $GOWL_DEVICE, config device=,
 or the only cached device; screen and music take several. One sync at a time
 ($XDG_RUNTIME_DIR/gowl.pid). Config: $XDG_CONFIG_HOME/gowl/config. GOWL_LOG=debug for verbose.
 toggle/pause/resume/stop show a desktop notification (notify-send; config notify = off to silence).
-niri keys: Mod+M { spawn \"gowl\" \"toggle\" \"screen\"; }  Mod+Shift+M { spawn \"gowl\" \"toggle\" \"music\"; }
-exit: 0 ok, 1 runtime error (or nothing running), 2 usage, 3 no device, 4 capture unavailable,
-5 no LAN interface";
+niri keys (`gowl keys add`): Mod+M = gowl toggle screen, Mod+Shift+M = gowl toggle music.
+exit: 0 ok, 1 runtime error (or nothing running), 2 usage or bad config, 3 no light configured,
+4 capture unavailable, 5 no LAN interface, 6 another gowl session holds the light";
 
 #[cfg(feature = "count-alloc")]
 mod count_alloc {
@@ -82,6 +84,15 @@ fn main() {
             e.exit_code()
         }
     };
+    // The systemd unit's screen sync failed in a way systemd retries (not 2, 3 or
+    // 6, its RestartPreventExitStatus): a key pressed before the retry makes the
+    // retry stand down (D-065).
+    if gowl::state::unit_mode()
+        && args.first().is_some_and(|c| c == "screen")
+        && !matches!(code, 0 | 2 | 3 | 6)
+    {
+        gowl::state::mark_unit_retry();
+    }
     std::process::exit(code);
 }
 
@@ -92,6 +103,9 @@ fn notify_failure(args: &[String], e: &Error) {
     let cmd = args.first().map_or("", String::as_str);
     let wanted = match cmd {
         "toggle" | "pause" | "resume" | "stop" => true,
+        // The service finding the light taken (a key-started sync, or keys took
+        // over while it waited to restart) is the user's own doing: no bubble.
+        "screen" if gowl::state::unit_mode() && matches!(e, Error::AlreadyRunning(_)) => false,
         "screen" | "music" => !matches!(e, Error::Usage(_)),
         _ => false,
     };
@@ -111,7 +125,7 @@ fn notify_failure(args: &[String], e: &Error) {
         Error::Capture(_) => ("Screen capture unavailable".into(), Some(text)),
         Error::Usage(_) => ("gowl: bad command".into(), Some(text)),
         Error::Io(..) => ("gowl stopped on an error".into(), Some(text)),
-        Error::Runtime(m) => {
+        Error::AlreadyRunning(m) | Error::Runtime(m) => {
             let mut c = m.chars();
             let first = c.next().map(|f| f.to_uppercase().collect::<String>());
             (first.unwrap_or_default() + c.as_str(), None)
@@ -119,7 +133,8 @@ fn notify_failure(args: &[String], e: &Error) {
     };
     // A direct `gowl screen|music` (the systemd unit's restarts) tells each failure
     // once; keys (toggle) and control commands always answer.
-    if matches!(cmd, "screen" | "music") && !gowl::state::failure_is_new(&summary) {
+    if matches!(cmd, "screen" | "music") && !gowl::state::failure_is_new(&summary, body.as_deref())
+    {
         return;
     }
     gowl::notify::send(config::load_quiet().notify, &summary, body.as_deref());
@@ -202,7 +217,10 @@ fn run(args: &[String]) -> Result<(), Error> {
             println!("{}", gowl::capture::list_outputs()?);
             Ok(())
         }
-        "screen" => cmd_screen(rest, None),
+        "screen" => {
+            gowl::state::unit_held()?;
+            cmd_screen(rest, None)
+        }
         "music" => gowl::audio::cmd_music(rest, None),
         "calibrate" => gowl::calibrate::cmd_calibrate(rest),
         "pause" | "resume" => {
@@ -218,6 +236,8 @@ fn run(args: &[String]) -> Result<(), Error> {
             positionals(cmd, rest, 0)?;
             gowl::state::cmd_state()
         }
+        "setup" => gowl::setup::cmd_setup(rest),
+        "keys" => gowl::keys::cmd_keys(rest),
         "watch" => {
             positionals(cmd, rest, 0)?;
             gowl::state::cmd_watch()
@@ -244,6 +264,9 @@ fn cmd_toggle(rest: &[String]) -> Result<(), Error> {
         _ => (Mode::Screen, rest),
     };
     let notify = config::load_quiet().notify;
+    // A key press is the user taking the light: a service waiting to restart after
+    // a failure must not start screen sync behind it (D-065).
+    gowl::state::hold_unit_retry();
     let announce = match gowl::control::session() {
         // A claim in flight (another toggle won the race a moment ago): say so.
         None if gowl::control::starting() => return Err(gowl::control::none_running()),
@@ -473,44 +496,7 @@ fn cmd_scan(rest: &[String]) -> Result<(), Error> {
         }
     }
     let c = ctx();
-    let ifaces = net::interfaces().map_err(|e| Error::Io("getifaddrs", e))?;
-    let lan_if = c.cfg.lan_if.as_deref();
-    let mut targets: Vec<ScanTarget> = net::discovery_ifaces(&ifaces, lan_if)
-        .into_iter()
-        .map(|iface| ScanTarget {
-            iface,
-            discover: true,
-            unicast: Vec::new(),
-        })
-        .collect();
-    // Also probe known IPs by unicast (one datagram each): replies to a unicast probe
-    // pass conntrack, so known devices are found even when multicast replies are dropped.
-    let mut known: Vec<Ipv4Addr> = c.cache.iter().map(|d| d.ip).collect();
-    known.extend(c.cfg.devices.iter().filter_map(|d| d.ip));
-    if let Ok(d) = devices::resolve(None, &c.cfg, &c.cache) {
-        known.push(d.ip);
-    }
-    known.sort();
-    known.dedup();
-    for ip in known {
-        let Ok(sel) = net::select_for(&ifaces, ip, lan_if) else {
-            debug!("known device {ip} is on no LAN interface; skipped");
-            continue;
-        };
-        match targets.iter_mut().find(|t| t.iface.name == sel.iface.name) {
-            Some(t) => t.unicast.push(ip),
-            None => targets.push(ScanTarget {
-                iface: sel.iface,
-                discover: false,
-                unicast: vec![ip],
-            }),
-        }
-    }
-    if targets.is_empty() {
-        return Err(Error::NoLanIf(
-            "no LAN interface to scan on (VPN interfaces are never used); set lan_if= in the config".into(),
-        ));
-    }
+    let targets = devices::scan_targets(&c.cfg, &c.cache)?;
     for t in &targets {
         debug!(
             "scan on {}: {}{} unicast",

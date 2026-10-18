@@ -367,7 +367,10 @@ fn cli_pause_resume_stop_and_one_instance() {
     assert!(h.tmp.join("gowl.pid").exists(), "pidfile");
     // A second sync refuses to start (and sends nothing).
     let (code, err) = h.cli(&["screen"]);
-    assert_eq!(code, 1, "{err}");
+    assert_eq!(
+        code, 6,
+        "already running: its own exit code (D-065) — {err}"
+    );
     assert!(err.contains("already running"), "{err}");
     let (code, err) = h.cli(&["pause"]);
     assert_eq!(code, 0, "{err}");
@@ -561,14 +564,10 @@ fn toggle_resumes_switches_and_notifies() {
         .iter()
         .position(|k| **k == Kind::Off)
         .expect("razer OFF");
-    // Never two syncs: screen's OFF ×2 before music's ON. Then music finds no sound
-    // server and gives the light back at once (OFF ×2, no keepalives; D-064).
-    assert_eq!(
-        tail[i..],
-        [&Kind::Off, &Kind::Off, &Kind::On, &Kind::Off, &Kind::Off],
-        "{:?}",
-        h.log
-    );
+    // Never two syncs: screen's OFF ×2 first. Music finds no sound server, so it
+    // never switches the light to stream mode at all — no ON, no OFF ×2 right
+    // after it, no keepalives (D-064, D-068).
+    assert_eq!(tail[i..], [&Kind::Off, &Kind::Off], "{:?}", h.log);
     let notes = h.notes(4);
     assert_eq!(notes[3], "Switched from screen to music sync", "{notes:?}");
     let s = h.state();
@@ -587,6 +586,14 @@ fn toggle_resumes_switches_and_notifies() {
     assert!(!h.tmp.join("gowl.pid").exists());
     h.collect(3.8);
     h.tail_is_double_off();
+    // Music never had the light in stream mode, so its shutdown sent nothing either:
+    // from screen's first OFF to the end, the wire holds exactly OFF ×2 (D-068).
+    let end: Vec<&Kind> = h
+        .kinds(2.5, 3.8)
+        .into_iter()
+        .skip_while(|k| **k != Kind::Off)
+        .collect();
+    assert_eq!(end, [&Kind::Off, &Kind::Off], "{:?}", h.log);
     // Every notify-send started (from the CLI and from the syncs, which block
     // signals for their signalfd and hold sockets) got an empty signal mask and
     // only stdin/stdout/stderr.
