@@ -65,7 +65,7 @@ was running the whole time — so niri's numbers here include *its* capture too;
 | S4 paused 30 s | 0.000 | **0.0** | **3.05** (was 8.4) | capture memfd freed: **−19,352 kB** on pause, +19,416 on resume (screen_pause probe) | = S0 | D-055 |
 | S3 music idle (nothing playing), 40 s | 0.002 | **0.2** | 6.08 | — | — | black + keepalive 0.12 dgrams/s; quiet restarts back off (D-054) |
 | mock compositor, idle rate | — | — | — | — | — | copies/s 30 → 5 → 30, first changed frame < 0.3 s (`idle_capture_rate_drops_and_recovers`) |
-| smoothing deferral (D-058) | — | 5,546 timer wakeups saved over 36 simulated scripts | — | — | — | wire identical (`smoothing_wire`) |
+| smoothing deferral (D-058, re-review fix) | — | 5,654 timer wakeups saved over 36 simulated scripts | — | — | — | wire identical in those and in 12,348 down/up sweep runs (`smoothing_wire`) |
 | binary (stripped) | — | — | — | — | — | **652,904 B** (+12 KB: idle rate, netlink filter, Quiet, release) |
 
 Corrections to the summary below (audit 16):

@@ -1,7 +1,7 @@
 //! D-054 regression: loud music that stops abruptly (song paused, sink suspended or
 //! moved — the passive stream then delivers no more windows) must not leave the
 //! light frozen on the last loud frame. The run loop's idle bookkeeping (`Quiet`)
-//! asks for black 1.0–1.5 s after the last window; `Music::blank` sends it. Driven
+//! asks for black 1.5–2.0 s after the last window; `Music::blank` sends it. Driven
 //! here with a simulated clock and a loopback receiver standing in for the light.
 
 use std::net::{Ipv4Addr, UdpSocket};
@@ -120,7 +120,7 @@ fn abrupt_stop_goes_black_within_two_seconds() {
     let blank_at = blank_at.expect("never went black");
     let after = blank_at - stopped;
     assert!(
-        (1_000 * MS..=1_600 * MS).contains(&after),
+        (1_500 * MS..=2_100 * MS).contains(&after),
         "black {} ms after the last window",
         after / MS
     );

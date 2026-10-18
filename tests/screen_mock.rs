@@ -281,23 +281,46 @@ fn idle_capture_rate_drops_and_recovers() {
     h.ctl.send(mock_wl::Ctl::SameContent(false)).unwrap();
     let t = h.now();
     let c = served(&h);
-    // the first changed frame comes within one idle interval (200 ms), then 30 fps
+    // The first changed frame comes within one idle interval (200 ms); the frame
+    // after it already at the full rate (≈ 33 ms later, not another 200 ms).
+    let mut stamps = Vec::new();
+    let mut last = c;
+    while stamps.len() < 3 && h.now() < t + 1.0 {
+        let v = served(&h);
+        if v != last {
+            stamps.push(h.now());
+            last = v;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let first = stamps.len();
+    let to_first = stamps.first().map_or(9.0, |s| s - t);
+    let gap = match stamps[..] {
+        [a, b, ..] => b - a,
+        _ => 9.0,
+    };
     h.collect(t + 0.3);
-    let first = served(&h) - c;
     let d = served(&h);
     h.collect(t + 1.3);
     let back = served(&h) - d;
     let (_, err) = h.stop();
     println!(
-        "busy {busy}/s, idle {}/s, after the change {first} in 0.3 s, then {back}/s",
-        idle / 2
+        "busy {busy}/s, idle {}/s, first changed frame after {:.0} ms, next one {:.0} ms later, then {back}/s",
+        idle / 2,
+        to_first * 1000.0,
+        gap * 1000.0
     );
     assert!((27..=33).contains(&busy), "busy {busy}/s; {err}");
     assert!(
         (8..=12).contains(&idle),
         "idle {idle} in 2 s (5 fps); {err}"
     );
-    assert!(first >= 2, "rate did not come back within 0.3 s ({first})");
+    assert!(first >= 2, "rate did not come back ({stamps:?})");
+    assert!(to_first < 0.25, "first changed frame after {to_first:.3} s");
+    assert!(
+        gap < 0.08,
+        "frame after the first changed one came {gap:.3} s later"
+    );
     assert!((27..=33).contains(&back), "after the change {back}/s");
     h.tail_is_double_off();
 }

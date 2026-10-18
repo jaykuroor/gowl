@@ -26,7 +26,7 @@ Golden numbers: `tests/vectors/audio.json` (bands, AutoGain) and `tests/vectors/
   monitored sink awake. With nothing playing the sink suspends, no windows arrive and gowl
   sleeps: one keepalive every 1.25 × keepalive_ms, i.e. ≈ 0.14 wakeups/s at the human's
   keepalive_ms = 5600 (0.2–0.3/s measured incl. restarts) and ≈ 1.6/s at the default 500.
-  Playback anywhere resumes the sink and windows flow again. 1.0–1.5 s after the last window
+  Playback anywhere resumes the sink and windows flow again. 1.5–2.0 s after the last window
   (audio stopped, sink suspended, or nothing yet after opening) → one black frame, what silence
   renders to (D-054).
 

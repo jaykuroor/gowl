@@ -899,13 +899,22 @@ impl Pipeline {
     }
 
     /// Run smoothing steps that were deferred while they couldn't send (D-058),
-    /// at their scheduled times, up to `now`.
+    /// at their scheduled times, up to `now` — all of them, even if one of them
+    /// turns `lazy` off (the old timer would have run every one).
     pub fn catch_up(&mut self, now: u64) {
-        while self.lazy {
-            match self.step_at {
-                Some(t) if t <= now => self.step(t, false),
-                _ => break,
-            }
+        if !self.lazy {
+            return;
+        }
+        while let Some(t) = self.step_at.filter(|&t| t <= now) {
+            self.step(t, false);
+        }
+    }
+
+    /// The gate's last-sent frame moved (keepalive, resend): re-check that the
+    /// deferred steps still can't send; if they can, arm the timer again.
+    fn recheck_lazy(&mut self) {
+        if self.lazy && !self.wire_quiet() {
+            self.lazy = false;
         }
     }
 
@@ -1018,6 +1027,7 @@ impl Pipeline {
             .is_some_and(|t| t * MS <= now)
         {
             self.streams.keepalive(now / MS);
+            self.recheck_lazy();
         }
     }
 
@@ -1034,6 +1044,7 @@ impl Pipeline {
                 self.streams.push(i, &g.out, now / MS);
             }
         }
+        self.recheck_lazy();
     }
 
     /// Next step or keepalive deadline (ns).
@@ -1208,11 +1219,11 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
                         fails = 0;
                     }
                     let live = !paused && !waiting;
-                    let at = last_request + pipe.capture_interval(now);
                     // D-051: negotiate the next frame now, so its offers arrive while
-                    // this one is sampled; the copy waits for the slot (timer).
+                    // this one is sampled; the copy waits for the slot (timer). The
+                    // shortest possible slot decides (the idle rate only lengthens it).
                     if live
-                        && at > now
+                        && last_request + pipe.interval_ns > now
                         && cap.prepare()?
                         && let Err(e) = cap.flush()
                     {
@@ -1227,6 +1238,9 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
                     if let Some(f) = cap.frame() {
                         pipe.on_frame(&f, now);
                     }
+                    // After on_frame: a changed frame ends the idle rate for the very
+                    // next slot (D-057).
+                    let at = last_request + pipe.capture_interval(now);
                     if live {
                         if at <= now {
                             // Slow copy: the slot has passed, ask now (saves a timer wakeup).

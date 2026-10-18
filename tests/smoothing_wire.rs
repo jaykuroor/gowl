@@ -55,6 +55,7 @@ fn run(
     smoothing: f64,
     threshold: u8,
     keepalive_ms: u32,
+    script: &[(u64, Ev)],
 ) -> (Vec<(u64, Vec<u8>)>, usize) {
     let (w, h) = (64u32, 36u32);
     let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -97,8 +98,8 @@ fn run(
         }
     };
     drain(t0, &mut out);
-    let mut evs = script().into_iter().peekable();
-    let end = t0 + 20_000 * MS;
+    let mut evs = script.iter().copied().peekable();
+    let end = t0 + (script.last().map_or(0, |e| e.0) + 3_000) * MS;
     let mut now = t0;
     loop {
         let te = evs.peek().map(|(ms, _)| t0 + ms * MS);
@@ -156,8 +157,8 @@ fn deferred_smoothing_steps_change_nothing_on_the_wire() {
     for smoothing in [0.05, 0.3, 0.55, 1.0] {
         for threshold in [1u8, 3, 8] {
             for keepalive in [0u32, 500, 5600] {
-                let (old, t_old) = run(false, smoothing, threshold, keepalive);
-                let (new, t_new) = run(true, smoothing, threshold, keepalive);
+                let (old, t_old) = run(false, smoothing, threshold, keepalive, &script());
+                let (new, t_new) = run(true, smoothing, threshold, keepalive, &script());
                 assert!(old.len() > 10, "scenario sent only {}", old.len());
                 assert_eq!(
                     old, new,
@@ -170,4 +171,61 @@ fn deferred_smoothing_steps_change_nothing_on_the_wire() {
     }
     println!("timer wakeups saved over the 36 runs: {saved}");
     assert!(saved > 36, "deferral saved only {saved} wakeups");
+}
+
+/// Gray 120; at 3 s a change of −`down` (settles without sending); `gap` ms later
+/// +`up`. Re-review repro (threshold 3, keepalive 500, smoothing 0.1, −5 then +4
+/// after 320 ms): a keepalive in the deferred fade moved the gate's reference and the
+/// deferred run sent 0x5A where the timer run sent 0x5C.
+fn down_up(down: u8, up: u8, gap: u64) -> Vec<(u64, Ev)> {
+    let g = |c: u8| Ev::Frame([c; 3], [c; 3]);
+    vec![
+        (0, g(120)),
+        (3_000, g(120 - down)),
+        (3_000 + gap, g(120 + up)),
+    ]
+}
+
+fn sweep(
+    gaps: &[u64],
+    downs: &[u8],
+    ups: &[u8],
+    smoothings: &[f64],
+    thresholds: &[u8],
+    kas: &[u32],
+) {
+    let mut diverging = Vec::new();
+    let mut runs = 0;
+    for &gap in gaps {
+        for &d in downs {
+            for &u in ups {
+                let sc = down_up(d, u, gap);
+                for &sm in smoothings {
+                    for &th in thresholds {
+                        for &ka in kas {
+                            runs += 1;
+                            if run(false, sm, th, ka, &sc).0 != run(true, sm, th, ka, &sc).0 {
+                                diverging.push((gap, d, u, sm, th, ka));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("{runs} down/up runs, {} diverging", diverging.len());
+    assert!(
+        diverging.is_empty(),
+        "wire differs (gap, down, up, smoothing, threshold, keepalive): {:?}",
+        &diverging[..diverging.len().min(10)]
+    );
+}
+
+/// The reviewer's sweep (gaps 40–1500 ms step 70, every down/up 1–7, 12,348 runs;
+/// 106 diverged before the D-058 fix, ~3 s in release).
+#[test]
+fn deferral_full_down_up_sweep() {
+    let gaps: Vec<u64> = (40..1500).step_by(70).collect();
+    let du: Vec<u8> = (1..8).collect();
+    sweep(&gaps, &du, &du, &[0.05, 0.1, 0.3], &[3, 5], &[500, 1000]);
 }

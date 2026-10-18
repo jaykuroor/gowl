@@ -103,10 +103,15 @@ pub fn relevant(buf: &[u8], links: Option<&[u32]>) -> bool {
     false
 }
 
+/// Most interfaces the in-kernel filter lists (classic BPF jump offsets are u8);
+/// more → no filter, every link change counts (in user space too).
+pub const MAX_FILTER_LINKS: usize = 200;
+
 /// Classic BPF for the netlink socket: drop link messages (RTM_NEWLINK/DELLINK)
 /// for interfaces not in `links`, accept everything else. Dropped in the kernel, so
 /// e.g. an idle Wi-Fi's MAC randomisation never wakes gowl. Loads are big-endian
 /// while netlink is host-endian, hence the byte-swapped constants.
+/// `links.len() <= MAX_FILTER_LINKS`.
 pub fn link_filter(links: &[u32]) -> Vec<libc::sock_filter> {
     const LD_H_ABS: u16 = 0x28;
     const LD_W_ABS: u16 = 0x20;
@@ -115,13 +120,14 @@ pub fn link_filter(links: &[u32]) -> Vec<libc::sock_filter> {
     let ins = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
     let be16 = |v: u16| u32::from(u16::from_be_bytes(v.to_ne_bytes()));
     let be32 = |v: u32| u32::from_be_bytes(v.to_ne_bytes());
-    let n = links.len().min(200);
+    assert!(links.len() <= MAX_FILTER_LINKS);
+    let n = links.len();
     let mut p = Vec::with_capacity(n + 6);
     p.push(ins(LD_H_ABS, 0, 0, 4)); // 0: nlmsg_type
     p.push(ins(JEQ_K, 1, 0, be16(RTM_NEWLINK))); // 1: → 3
     p.push(ins(JEQ_K, 0, (n + 2) as u8, be16(RTM_DELLINK))); // 2: → 3, else accept
     p.push(ins(LD_W_ABS, 0, 0, IFI_INDEX_OFF as u32)); // 3: ifi_index
-    for (i, &l) in links[..n].iter().enumerate() {
+    for (i, &l) in links.iter().enumerate() {
         p.push(ins(JEQ_K, (n - i) as u8, 0, be32(l))); // → accept
     }
     p.push(ins(RET_K, 0, 0, 0)); // drop
@@ -176,6 +182,8 @@ impl NetWatch {
     /// Only link changes of these interfaces count (`None` = all): an in-kernel
     /// filter plus the same check here (D-056). Rebind / setup only.
     pub fn set_links(&mut self, links: Option<&[u32]>) {
+        // One set for both checks; too many to list → accept every link change.
+        let links = links.filter(|l| l.len() <= MAX_FILTER_LINKS);
         let r = match links {
             Some(l) => {
                 let prog = link_filter(l);

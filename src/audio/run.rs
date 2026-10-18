@@ -36,7 +36,7 @@ const GRID_NS: u64 = SEC / 2;
 /// Black this long (+ up to one grid step) after the last window: audio stopped —
 /// song paused, sink suspended or moved (D-054; the passive stream delivers nothing
 /// then, so nothing would fade).
-const BLACK_AFTER_NS: u64 = SEC;
+const BLACK_AFTER_NS: u64 = SEC + SEC / 2;
 /// Re-resolve `@DEFAULT_MONITOR@` (restart the stream on the same connection) after
 /// this long without sound (no windows, or only digital silence); doubles up to
 /// `QUIET_REOPEN_MAX_NS` while it stays quiet, back to the start on sound (D-054).
@@ -104,7 +104,7 @@ impl Quiet {
         t - t % GRID_NS
     }
 
-    /// When to send black, if not done yet: 1.0–1.5 s after the last window.
+    /// When to send black, if not done yet: 1.5–2.0 s after the last window.
     pub fn black_due(&self) -> Option<u64> {
         (!self.blanked).then(|| Quiet::grid(self.heard_at) + GRID_NS + BLACK_AFTER_NS)
     }
@@ -556,7 +556,7 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
                         }
                     }
                     QuietAction::Blank => {
-                        debug!("no audio for a second: black until something plays");
+                        debug!("no audio for 1.5 s: black until something plays");
                         music.blank(now / MS);
                     }
                     QuietAction::None => {}

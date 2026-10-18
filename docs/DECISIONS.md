@@ -565,7 +565,8 @@ but holds the copy; while a prepared frame waits for its slot the Wayland fd is 
 dispatches everything pending (offers, output events) and sends `copy_with_damage` immediately — the copy
 still follows its own `buffer_done`, so no protocol risk. The last frame's damage/flags are reset only
 when the next copy is sent, so it stays fully readable while the next frame is negotiated. Output
-events are seen up to one frame interval (33 ms) later while held; pause cancels the held frame; a
+events are seen up to one capture interval later while held (33 ms at 30 fps; ≤ 1/idle_fps = 200 ms
+when the idle rate applies, D-057); pause cancels the held frame; a
 `failed`/lost output for it is handled at the timer like before. If the offers are not in yet at the
 timer (slow compositor), the copy goes out on `buffer_done` as before (3 wakeups that frame).
 **Evidence** (same desktop, fake device, 30 s, `measure.py screen 30 --fake`): wakeups 90.7 → **60.5/s**
@@ -623,7 +624,8 @@ and only armed again at a reopen, so the D-048 stall guard kept resending the la
 the 30 s quiet reopen — the light froze for ~31 s. My D-052 check played digital silence, which renders
 to black by itself, so it could not show this.
 **Fix.** `audio::run::Quiet` (pure, unit-tested) tracks the last window and the last window with sound.
-Black is due 1.0–1.5 s after the *last* window (deadline on a 0.5 s grid, so windows arriving 47×/s
+Black is due 1.5–2.0 s after the *last* window (first 1.0–1.5 s; widened in the re-review, see below)
+(deadline on a 0.5 s grid, so windows arriving 47×/s
 don't re-arm the timerfd; while music plays this also replaces the per-send re-arm of the stall
 guard as the earliest deadline); `Music::blank` sends black once (the gate skips devices already black)
 and resets the smoothers so playback fades in from black like the light. After a rebind / moved
@@ -637,10 +639,15 @@ be lengthened — reuse the existing connection (`Capture::restart`: new stream,
 music no longer makes a new pulse connection twice a minute. A sound server that is down is retried
 after 1 s, doubling to 30 s (review item 15), reset when connected.
 **Evidence.** tests/music_idle.rs: a loud 80 Hz tone through the real `Music` pipeline to a loopback
-receiver, then no windows: exactly one black frame 1.0–1.6 s after the last window (fails on the old
+receiver, then no windows: exactly one black frame 1.5–2.1 s after the last window (fails on the old
 code: nothing for 30 s); back-off sequence 30/60/120/240/300 s and reset on sound. Live (PipeWire 1.6.9,
 isolated pidfile, fake device): a −50 dBFS 60 Hz tone from a second client lit the light (13 frames),
-stopped abruptly → black datagram **1.06 s** later, then only keepalives.
+stopped abruptly → black datagram **1.06 s** later (1.0 s margin), **1.74 s** with the final 1.5 s
+margin, then only keepalives.
+**Known trade-off (re-review N6).** A stall in audio delivery *during* playback that lasts longer than
+the margin (1.5–2.0 s; was 1.0–1.5 s) blinks the light dark until windows return. PipeWire stalls of
+that length are rare (device switch, xrun recovery); the margin was widened from 1 s to 1.5 s to make
+them rarer while a paused song still goes dark promptly.
 
 ## D-055 — Screen review/audit fixes: memfd freed on pause, syscall trims, held-poll guard (2026-10-17, phase 5 review, perf agent)
 - **Capture memfd freed on pause and output lost** (audit 11): `Capture::release` = cancel + destroy
@@ -678,7 +685,9 @@ socket (`SO_ATTACH_FILTER`) drops RTM_NEWLINK/DELLINK whose `ifi_index` is not o
 devices are bound to; address and route messages always pass (a new LAN address elsewhere may be the
 new path). The same check runs in user space (`netwatch::relevant`) before the debounce. The filter is
 rebuilt only when a binding changes (`Streams::links_gen`, checked in `Ctl::net_deadline`); while a
-device has no LAN interface every link change counts. **Tests:** `relevant` classification; the BPF
+device has no LAN interface every link change counts. The kernel filter and the user-space check use
+one list; more than 200 interfaces (BPF jump offsets are 8-bit) → no filter at all, every link change
+counts in both (re-review N2), never a truncated list. **Tests:** `relevant` classification; the BPF
 program run in the kernel on a unix datagram socket with crafted messages (foreign link change dropped,
 bound link / address / route pass). netns `--bin` PASS (rebind 0.51 s). S4 stays at 0 wakeups.
 
@@ -689,9 +698,13 @@ off) and `idle_after_ms` (default 1000). Each group keeps an *anchor* target; a 
 more than `threshold` on any channel from the anchor is a change (slow drifts add up and count too).
 After `idle_after_ms` without a change the next capture slot is `1/idle_fps` after the last request;
 the first changed frame switches back to `1/fps` for the very next slot. Only the slot length changes —
-no extra wakeups, no allocation, keepalive and smoothing untouched. **Tests:** tests/screen_mock.rs
+no extra wakeups, no allocation, keepalive and smoothing untouched. The next slot is computed *after*
+the frame is processed (re-review N1), so the frame right after the first changed one already comes at
+the full rate. Resume (and output back) start at the idle rate if nothing changed for `idle_after_ms`
+before the pause: the first captured frame that differs switches to `fps` (re-review Q1). **Tests:** tests/screen_mock.rs
 `idle_capture_rate_drops_and_recovers` (mock keeps completing copies with unchanged pixels): 30 → 5 →
-30 copies/s, first changed frame within 0.3 s. **Evidence (niri):** see BUDGETS Phase 5 summary.
+30 copies/s, first changed frame within 0.25 s and the next one < 80 ms after it (measured 96 / 33 ms;
+with the slot computed before processing it was 201 ms — the test fails on that order). **Evidence (niri):** see BUDGETS Phase 5 summary.
 
 ## D-058 — Smoothing steps that can't send are deferred, not timed (2026-10-17, phase 5 audit, perf agent)
 **Context (audit 14).** After a color change the EMA keeps stepping on the timer (D-017) until it is
@@ -708,3 +721,14 @@ through the real pipeline with timer steps (`lazy_ok = false`) and with deferral
 for smoothing 0.05/0.3/0.55/1.0 × threshold 1/3/8 × keepalive 0/500/5600: every datagram (bytes and
 time) identical in all 36 runs, 5,546 timer wakeups saved; forcing deferral unconditionally makes the
 test fail. Vectors unchanged (the EMA math is untouched).
+**Correction (re-review B1).** The first version *did* change the wire in some cases: a keepalive and
+`push_out` (rebind resend, resume) move the gate's last-sent reference without re-checking `lazy`, and
+`catch_up` looped only `while lazy`, dropping the remaining overdue steps once one step turned it off.
+Reviewer's repro: threshold 3, keepalive 500, smoothing 0.1, gray 120; −5 settles without sending, +4
+320 ms later → timer run sends 0x5C at 3,949 ms, deferred run 0x5A; 106 of 12,348 down/up runs
+diverged. **Fix:** `catch_up` runs every step with `step_at ≤ now` once it was entered lazy, even if
+`lazy` flips part-way; after a keepalive and after `push_out`, `lazy` is re-checked against the new
+reference (`recheck_lazy`). tests/smoothing_wire.rs `deferral_full_down_up_sweep` (gaps 40–1500 ms step
+70 × down/up 1–7 × smoothing 0.05/0.1/0.3 × threshold 3/5 × keepalive 500/1000 = 12,348 runs): 0
+diverging (7 of a 576-run subset diverge without the fix); the original 36-config script still
+identical, 5,654 timer wakeups saved (script end now 3 s after the last event).
