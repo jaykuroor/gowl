@@ -50,7 +50,8 @@ gowl itself depends on nothing but the C library (one Rust crate, `libc`).
 
 ## Install
 
-Per user, no root. From the source directory:
+Per user: run it as yourself, not with `sudo` (it refuses root before building anything). From the source
+directory:
 
 ```sh
 make install              # build, then install for your user (prints every change it makes)
@@ -79,9 +80,12 @@ up), and removes the program, the service, the keys file and `~/.local/share/gow
 
 **`gowl setup`** explains LAN Control, then finds the light: the one in your config, a network scan, or — when
 the firewall hides the light's answers, as Fedora's does by default — its IP address typed in or picked from the
-Govee devices this computer has seen. The light blinks blue and you confirm it. Then: segments and `gowl
+Govee devices this computer has seen. The light blinks blue and you confirm it; afterwards it goes back to what
+it was showing, and off again if it was off (when the firewall hides its answers gowl can't tell, and says it
+switched the light on). Then: segments and `gowl
 calibrate`, optionally `gowl calibrate --keepalive`, screen sync at login, niri keys, notifications, and a
-quickshell hint. It changes only the lines it needs in your config and never touches the firewall.
+quickshell hint. It changes only the lines it needs in your config and never touches the firewall. It always uses
+`~/.config/gowl/config`, the file the service and the keys read, even if `GOWL_CONFIG` is set in your shell.
 
 By hand instead: `cargo build --release`, copy `target/release/gowl` anywhere, and write the config (below);
 `GOWL_DEVICE=192.168.1.50 gowl color ff0000` works without any config.
@@ -286,7 +290,7 @@ Measured on my machine (Fedora 44, 3440x1440 at 100 Hz, NVIDIA RTX 4060), real H
 \* Measured before a fix that stopped music mode from sending every frame twice; to be re-measured on the
 light. Against the test device after the fix: 0.31 %, 50 wakeups/s, 6.1 MB, 39 packets/s.
 
-Binary: about 754 KiB (771,744 bytes), depending only on the C library. While paused gowl does nothing at all; on a still
+Binary: about 770 KiB (788,128 bytes), depending only on the C library. While paused gowl does nothing at all; on a still
 screen it sends only the keepalive. The compositor's own cost of handing out screen captures is separate and
 depends on the GPU: niri spent a noticeable share of a core on this NVIDIA machine at 30 fps, which is why
 gowl drops to `idle_fps` while the screen edges don't change. Method and full numbers: `docs/BUDGETS.md`.

@@ -45,21 +45,47 @@ if [ "$(id -u)" = 0 ] && [ -z "${GOWL_ALLOW_ROOT:-}" ]; then
     exit 1
 fi
 
+die() {
+    echo "gowl install: $*" >&2
+    exit 1
+}
+
+# NOTE: `set -e` is off inside any function called from `if`, `||` or `&&` (POSIX),
+# so every step that can fail is checked explicitly below (D-072 review).
+
 # install_file SRC DST MODE: copy through a temp file + rename (a running gowl keeps
-# its old inode). Returns 0 if DST changed.
+# its old inode). Returns 0 if DST changed, 1 if it was already identical; any
+# failure removes the temp file and stops the whole install — a partial copy is
+# never renamed over DST.
 install_file() {
     if [ -f "$2" ] && cmp -s "$1" "$2"; then
         say "= $2"
         return 1
     fi
-    mkdir -p "$(dirname "$2")"
+    mkdir -p "$(dirname "$2")" || die "cannot create $(dirname "$2")"
     tmp="$2.gowl-new.$$"
-    cp "$1" "$tmp"
-    chmod "$3" "$tmp"
     if [ -e "$2" ]; then verb="~"; else verb="+"; fi
-    mv -f "$tmp" "$2"
-    say "$verb $2"
-    return 0
+    if cp "$1" "$tmp" && chmod "$3" "$tmp" && cmp -s "$1" "$tmp" && mv -f "$tmp" "$2"; then
+        say "$verb $2"
+        return 0
+    fi
+    rm -f "$tmp"
+    die "cannot install $2 (left as it was)"
+}
+
+# The unit, with ExecStart naming $GOWL. Quoted for systemd ("…", \ and " escaped),
+# % → %% (specifiers; systemd does no $-expansion in the program path, checked with
+# systemd-analyze verify); written with printf, no sed program
+# built from the path.
+write_unit() {
+    esc=$(printf '%s' "$GOWL" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g') ||
+        die "cannot quote $GOWL"
+    while IFS= read -r line || [ -n "$line" ]; do
+        case $line in
+            ExecStart=*) printf 'ExecStart="%s" screen\n' "$esc" ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done < "$ROOT/packaging/gowl.service" > "$1" || die "cannot write $1"
 }
 
 userctl() {
@@ -81,9 +107,9 @@ do_install() {
     new_bin=0
     if install_file "$BUILT" "$GOWL" 755; then new_bin=1; fi
 
-    tmpd=$(mktemp -d)
+    tmpd=$(mktemp -d) || die "cannot create a temp directory"
     trap 'rm -rf "$tmpd"' EXIT
-    sed "s|%h/.local/bin/gowl|$GOWL|" "$ROOT/packaging/gowl.service" > "$tmpd/gowl.service"
+    write_unit "$tmpd/gowl.service"
     if install_file "$tmpd/gowl.service" "$UNIT" 644; then
         userctl daemon-reload || true
     fi
@@ -105,10 +131,16 @@ do_install() {
     if [ -e "$CONF" ]; then
         say "= $CONF (kept)"
     else
-        mkdir -p "$CONF_DIR"
-        cp "$ROOT/config.example" "$CONF"
-        chmod 644 "$CONF"
-        say "+ $CONF (every setting commented out; 'gowl setup' fills in your light)"
+        if mkdir -p "$CONF_DIR" && cp "$ROOT/config.example" "$CONF.gowl-new.$$" &&
+            chmod 644 "$CONF.gowl-new.$$" && mv "$CONF.gowl-new.$$" "$CONF"; then
+            say "+ $CONF (every setting commented out; 'gowl setup' fills in your light)"
+        else
+            rm -f "$CONF.gowl-new.$$"
+            die "cannot write $CONF"
+        fi
+    fi
+    if [ -n "${GOWL_CONFIG:-}" ] && [ "$GOWL_CONFIG" != "$CONF" ]; then
+        say "! GOWL_CONFIG=$GOWL_CONFIG is set in this shell, but the service, the niri keys and 'gowl setup' use $CONF"
     fi
 
     for f in "$ROOT"/contrib/quickshell/*.qml; do

@@ -91,11 +91,16 @@ fn home_join(rel: &str) -> Option<PathBuf> {
 
 /// `$GOWL_CONFIG`, else `$XDG_CONFIG_HOME/gowl/config`, else `~/.config/gowl/config`.
 pub fn config_path() -> Option<PathBuf> {
-    env_path("GOWL_CONFIG").or_else(|| {
-        env_path("XDG_CONFIG_HOME")
-            .or_else(|| home_join(".config"))
-            .map(|d| d.join("gowl/config"))
-    })
+    env_path("GOWL_CONFIG").or_else(default_config_path)
+}
+
+/// `$XDG_CONFIG_HOME/gowl/config`, else `~/.config/gowl/config` — ignoring
+/// `GOWL_CONFIG`: what the systemd unit and the niri keys read (they don't get that
+/// variable), so `gowl setup` writes here (D-075).
+pub fn default_config_path() -> Option<PathBuf> {
+    env_path("XDG_CONFIG_HOME")
+        .or_else(|| home_join(".config"))
+        .map(|d| d.join("gowl/config"))
 }
 
 /// `$XDG_STATE_HOME/gowl`, else `~/.local/state/gowl`.
@@ -449,11 +454,22 @@ pub fn read_text(path: &std::path::Path) -> Result<String, crate::Error> {
     }
 }
 
-/// Write the config through a sibling file + rename: a crash never leaves a
-/// half-written config. A symlinked config stays a symlink (the target is
-/// written), and the file keeps its permissions.
+/// Distinguishes temp files of one process (with the pid in the name).
+static TMP_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Write a whole file safely (D-074): a uniquely named sibling temp file
+/// (`.NAME.gowl-tmp.PID.N`, created new) is written and fsynced, renamed over the
+/// target, and the directory fsynced — a crash leaves the old or the new file,
+/// never half of one. A symlinked target stays a symlink (its target is written);
+/// the file keeps its permissions. A target the user may not write is refused,
+/// not replaced (rename would get around its permissions). A hard-linked target is
+/// written in place, so its other names keep seeing it; the fsynced temp copy
+/// stays on disk until that write is done.
 pub fn write_atomic(path: &std::path::Path, text: &str) -> Result<(), crate::Error> {
     use crate::Error;
+    use std::io::Write as _;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let target = match std::fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => match std::fs::canonicalize(path) {
             Ok(t) => t,
@@ -468,16 +484,81 @@ pub fn write_atomic(path: &std::path::Path, text: &str) -> Result<(), crate::Err
         },
         _ => path.to_path_buf(),
     };
-    if let Some(dir) = target.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| Error::Io("create config dir", e))?;
+    let dir = target
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    std::fs::create_dir_all(&dir).map_err(|e| Error::Io("create config dir", e))?;
+    let meta = std::fs::metadata(&target).ok();
+    if meta.is_some() {
+        let c = std::ffi::CString::new(target.as_os_str().as_bytes())
+            .map_err(|_| Error::Runtime(format!("bad path {}", target.display())))?;
+        // SAFETY: valid C string.
+        if unsafe { libc::access(c.as_ptr(), libc::W_OK) } != 0 {
+            return Err(Error::Runtime(format!(
+                "{} is read-only for you, so it was left as it is",
+                target.display()
+            )));
+        }
     }
-    let perms = std::fs::metadata(&target).ok().map(|m| m.permissions());
-    let tmp = target.with_extension("gowl-tmp");
-    std::fs::write(&tmp, text).map_err(|e| Error::Io("write config", e))?;
-    if let Some(p) = perms {
-        std::fs::set_permissions(&tmp, p).map_err(|e| Error::Io("chmod config", e))?;
+    let mode = meta
+        .as_ref()
+        .map_or(0o644, |m| m.permissions().mode() & 0o7777);
+    let name = target
+        .file_name()
+        .map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.gowl-tmp.{}.{seq}", std::process::id()));
+    let written = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        f.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error::Io("write config", e));
     }
-    std::fs::rename(&tmp, &target).map_err(|e| Error::Io("rename config", e))
+    if meta.as_ref().is_some_and(|m| m.nlink() > 1) {
+        let r = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&target)
+            .and_then(|mut f| {
+                f.write_all(text.as_bytes())?;
+                f.sync_all()
+            });
+        match r {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&tmp);
+                eprintln!(
+                    "gowl: {} has other hard links; written in place so they keep seeing it",
+                    target.display()
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(Error::Runtime(format!(
+                    "writing {} in place failed ({e}); the complete new text is in {}",
+                    target.display(),
+                    tmp.display()
+                )));
+            }
+        }
+    }
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error::Io("rename config", e));
+    }
+    if let Ok(d) = std::fs::File::open(&dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -532,6 +613,46 @@ mod tests {
                 defaults.idle_fps
             )
         );
+    }
+
+    #[test]
+    fn write_atomic_refuses_read_only_keeps_hard_links_and_leaves_no_temp() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let d = std::env::temp_dir().join(format!("gowl-wa-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("config");
+        // New file, then a replacement keeping the mode.
+        write_atomic(&p, "a = 1\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_atomic(&p, "a = 2\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a = 2\n");
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Hard-linked: written in place, the other name sees the new text.
+        let other = d.join("other-name");
+        std::fs::hard_link(&p, &other).unwrap();
+        write_atomic(&p, "a = 3\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "a = 3\n");
+        assert_eq!(std::fs::metadata(&p).unwrap().nlink(), 2);
+        std::fs::remove_file(&other).unwrap();
+        // Read-only for us: refused, untouched (skipped as root, who may write anything).
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o400)).unwrap();
+            let e = write_atomic(&p, "a = 4\n").unwrap_err();
+            assert!(e.to_string().contains("read-only"), "{e}");
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "a = 3\n");
+        }
+        let names: Vec<String> = std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["config"], "no temp file left");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

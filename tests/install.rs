@@ -183,7 +183,7 @@ fn install_uninstall_reinstall_in_a_temp_home() {
     assert_eq!(mode & 0o777, 0o755);
     let unit = h.read(".config/systemd/user/gowl.service");
     assert!(
-        unit.contains(&format!("ExecStart={bin} screen\n")),
+        unit.contains(&format!("ExecStart=\"{bin}\" screen\n")),
         "{unit}"
     );
     assert!(unit.contains("Environment=GOWL_UNIT=1\n"));
@@ -406,20 +406,95 @@ fn keys_are_never_forced() {
         .unwrap();
     assert!(r.status.success(), "{r:?}");
     assert_eq!(std::fs::read_to_string(&real).unwrap(), NIRI_CONF);
+    script(
+        &h.root.join("fakebin/niri"),
+        "#!/bin/sh\nif [ -n \"${FAKE_NIRI_FAIL:-}\" ]; then echo 'error: bad' >&2; exit 1; fi\nexit 0\n",
+    );
+
+    // An include of the binds file written by hand (no gowl marker) survives
+    // `remove`, and so does the file it needs.
+    std::fs::remove_file(h.p(".config/niri/config.kdl")).unwrap();
+    let by_hand = format!("{NIRI_CONF}include \"~/.config/gowl/niri-binds.kdl\"\n");
+    std::fs::write(h.p(".config/niri/config.kdl"), &by_hand).unwrap();
+    assert!(run(&["keys", "add"]).status.success());
+    assert_eq!(
+        h.read(".config/niri/config.kdl"),
+        by_hand,
+        "nothing appended: already included"
+    );
+    let r = run(&["keys", "remove"]);
+    assert!(r.status.success(), "{r:?}");
+    assert_eq!(h.read(".config/niri/config.kdl"), by_hand);
+    assert!(
+        h.p(".config/gowl/niri-binds.kdl").exists(),
+        "still needed by the hand-written include"
+    );
+
+    // Already included, but niri rejects the config as it is: said so, not hidden.
+    let r = h
+        .cmd(&gowl)
+        .env("FAKE_NIRI_FAIL", "1")
+        .args(["keys", "add"])
+        .output()
+        .unwrap();
+    assert!(!r.status.success());
+    assert!(
+        String::from_utf8_lossy(&r.stderr).contains("rejects niri's config"),
+        "{r:?}"
+    );
+
+    // A check file left by a gowl that died mid-check is cleaned up next time.
+    std::fs::write(h.p(".config/niri/config.kdl"), NIRI_CONF).unwrap();
+    std::fs::remove_file(h.p(".config/gowl/niri-binds.kdl")).unwrap();
+    std::fs::write(h.p(".config/niri/.gowl-check-999999999.kdl"), "x").unwrap();
+    assert!(run(&["keys", "add"]).status.success());
+    assert!(!h.p(".config/niri/.gowl-check-999999999.kdl").exists());
+    let names: Vec<String> = std::fs::read_dir(h.p(".config/niri"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 2, "config.kdl + real.kdl only: {names:?}");
+    // Several edits within one second: every backup kept, none overwritten.
+    for _ in 0..2 {
+        assert!(run(&["keys", "remove"]).status.success());
+        assert!(run(&["keys", "add"]).status.success());
+    }
+    let baks = std::fs::read_dir(h.p(".config/gowl/backups"))
+        .unwrap()
+        .count();
+    assert!(baks >= 7, "{baks} backups");
 }
 
 /// Run `gowl setup` on a pseudo-terminal, feeding `input` (all lines at once: the
 /// terminal hands them out one line per read). Returns (output, exit code).
 fn setup_on_pty(h: &Home, base: u16, input: &str) -> (String, i32) {
+    setup_steps(h, base, &[("", input)])
+}
+
+/// Like `setup_on_pty`, step by step: each `(expect, send)` waits until the output
+/// (since the previous step's text) contains `expect`, then types `send`. gowl runs
+/// as a session leader with the pty as its controlling terminal, so ^C really is
+/// SIGINT from the terminal.
+fn setup_steps(h: &Home, base: u16, steps: &[(&str, &str)]) -> (String, i32) {
     const DRIVER: &str = r#"
-import os, sys, subprocess, select, time
+import os, sys, subprocess, select, time, fcntl, termios
 master, slave = os.openpty()
-p = subprocess.Popen(sys.argv[1:], stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+def ctty():
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+p = subprocess.Popen(sys.argv[1:], stdin=slave, stdout=slave, stderr=slave, close_fds=True,
+                     start_new_session=True, preexec_fn=ctty)
 os.close(slave)
-os.write(master, sys.stdin.buffer.read())
+steps = [s.split(b'\x1f', 1) for s in sys.stdin.buffer.read().split(b'\x1e')]
 out = b''
+seen = 0
 end = time.monotonic() + 30
+done = False
 while True:
+    while steps and steps[0][0] in out[seen:]:
+        exp, snd = steps.pop(0)
+        seen = out.index(exp, seen) + len(exp) if exp else seen
+        os.write(master, snd)
     left = end - time.monotonic()
     if left <= 0:
         p.kill()
@@ -438,6 +513,8 @@ while True:
 sys.stdout.buffer.write(out)
 sys.exit(p.wait())
 "#;
+    let input: Vec<String> = steps.iter().map(|(e, s)| format!("{e}\u{1f}{s}")).collect();
+    let input = input.join("\u{1e}");
     let gowl = h.home.join(".local/bin/gowl");
     let mut c = h.cmd("python3");
     c.args(["-I", "-c", DRIVER])
@@ -537,16 +614,30 @@ fn setup_finds_a_light_by_ip_blinks_it_and_calibrates() {
     // The wire: switched on, razer ON, a blue frame, OFF ×2 (the light is given
     // back after the blink), then calibrate's own session.
     let wire = drain(&rx);
+    // First a status query (was it on?) — no answer here, so: switched on, and said so.
+    let t = wire
+        .iter()
+        .position(|m| is_cmd(m, "turn"))
+        .expect("turn on");
     assert!(
-        String::from_utf8_lossy(&wire[0]).contains("\"cmd\":\"turn\""),
-        "{:?}",
-        wire[0]
+        t >= 1
+            && wire[..t]
+                .iter()
+                .all(|m| is_cmd(m, "devStatus") || is_cmd(m, "status"))
     );
-    assert_eq!(wire[1], razer(true));
+    assert!(
+        String::from_utf8_lossy(&wire[t]).contains("\"value\":1"),
+        "on"
+    );
+    assert!(
+        out.contains("gowl switched the light on for this test"),
+        "{out}"
+    );
+    assert_eq!(wire[t + 1], razer(true));
     let off = razer(false);
     let first_off = wire.iter().position(|m| *m == off).expect("razer off");
     assert_eq!(wire[first_off + 1], off, "OFF ×2 after the blink");
-    assert!(first_off >= 3, "a frame between ON and OFF");
+    assert!(first_off >= t + 3, "a frame between ON and OFF");
     assert!(
         wire[first_off + 2..].contains(&razer(true)),
         "calibrate streamed"
@@ -608,4 +699,223 @@ fn setup_needs_a_terminal_and_cancels_cleanly() {
     assert_eq!(code, 1, "{out}");
     assert!(out.contains("setup cancelled"), "{out}");
     assert_eq!(h.read(".config/gowl/config"), before);
+}
+
+fn is_cmd(m: &[u8], cmd: &str) -> bool {
+    String::from_utf8_lossy(m).contains(&format!("\"cmd\":\"{cmd}\""))
+}
+
+/// A stand-in light on loopback that records every datagram and answers status
+/// queries with "off".
+struct OffLight {
+    got: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    t: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OffLight {
+    fn start(base: u16) -> OffLight {
+        let rx = UdpSocket::bind(("127.0.0.1", base + 3)).unwrap();
+        rx.set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (g, s) = (got.clone(), stop.clone());
+        let t = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while !s.load(std::sync::atomic::Ordering::SeqCst) {
+                if let Ok(n) = rx.recv(&mut buf) {
+                    let m = buf[..n].to_vec();
+                    if is_cmd(&m, "devStatus") {
+                        let _ = rx.send_to(
+                            br#"{"msg":{"cmd":"devStatus","data":{"onOff":0,"brightness":50}}}"#,
+                            ("127.0.0.1", base + 2),
+                        );
+                    }
+                    g.lock().unwrap().push(m);
+                }
+            }
+        });
+        OffLight {
+            got,
+            stop,
+            t: Some(t),
+        }
+    }
+
+    fn wire(&mut self) -> Vec<Vec<u8>> {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.t.take() {
+            t.join().unwrap();
+        }
+        self.got.lock().unwrap().clone()
+    }
+}
+
+#[test]
+fn the_blink_gives_the_light_back_as_it_was_even_on_ctrl_c() {
+    let h = Home::new("setup-blink");
+    let base = 17800;
+    let (out, code) = h.installer("install", &[("NIRI_KEYS", "0")]);
+    assert_eq!(code, 0, "{out}");
+    let mine = "device = desk\nlan_if = lo\n[device desk]\nip = 127.0.0.1\nlayout = 4 6\n";
+    std::fs::write(h.p(".config/gowl/config"), mine).unwrap();
+    let off = razer(false);
+
+    // The light answers "off": blink, y, then it is switched off again.
+    let mut light = OffLight::start(base);
+    let (out, code) = setup_steps(
+        &h,
+        base,
+        &[
+            ("LAN Control is on", "\n"),
+            ("Use it?", "\n"),
+            ("Blink it once", "\n"),
+            ("Is it?", "y\n"),
+            ("Calibrate again?", "\u{4}"), // then end of input: cancelled
+        ],
+    );
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("was off before the test"), "{out}");
+    let wire = light.wire();
+    assert!(is_cmd(&wire[0], "devStatus"), "{wire:?}");
+    let n = wire.len();
+    assert_eq!(wire[n - 3..n - 1], [off.clone(), off.clone()], "OFF ×2");
+    assert!(
+        is_cmd(&wire[n - 1], "turn")
+            && String::from_utf8_lossy(&wire[n - 1]).contains("\"value\":0")
+    );
+    assert_eq!(h.read(".config/gowl/config"), mine);
+
+    // Ctrl+C while it blinks: the light is given back (OFF ×2, off again), nothing
+    // keeps blinking, nothing is left behind.
+    let mut light = OffLight::start(base);
+    let (out, code) = setup_steps(
+        &h,
+        base,
+        &[
+            ("LAN Control is on", "\n"),
+            ("Use it?", "\n"),
+            ("Blink it once", "\n"),
+            ("Is it?", "\u{3}"),
+        ],
+    );
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("setup cancelled"), "{out}");
+    std::thread::sleep(Duration::from_millis(600)); // a blinking gowl would send more
+    let wire = light.wire();
+    let n = wire.len();
+    assert!(wire.contains(&razer(true)), "{wire:?}");
+    assert_eq!(wire[n - 3..n - 1], [off.clone(), off], "{wire:?}");
+    assert!(is_cmd(&wire[n - 1], "turn"));
+    assert!(!h.root.join("run/gowl.pid").exists());
+}
+
+#[test]
+fn a_failed_copy_never_replaces_the_installed_binary() {
+    let h = Home::new("cpfail");
+    let (out, code) = h.installer("install", &[]);
+    assert_eq!(code, 0, "{out}");
+    let built = std::fs::read(env!("CARGO_BIN_EXE_gowl")).unwrap();
+    // A different binary to install, so the copy is really attempted.
+    let newer = h.root.join("gowl-newer");
+    let mut bytes = built.clone();
+    bytes.push(0);
+    std::fs::write(&newer, &bytes).unwrap();
+    std::fs::set_permissions(&newer, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bad = h.root.join("badcp");
+    std::fs::create_dir_all(&bad).unwrap();
+    let path = format!(
+        "{}:{}:/usr/bin:/bin",
+        bad.display(),
+        h.root.join("fakebin").display()
+    );
+    for (what, body) in [
+        (
+            "cp fails half-way",
+            "#!/bin/sh\nhead -c 4096 \"$1\" > \"$2\"\nexit 1\n",
+        ),
+        (
+            "cp claims success with a short file",
+            "#!/bin/sh\nhead -c 4096 \"$1\" > \"$2\"\nexit 0\n",
+        ),
+    ] {
+        script(&bad.join("cp"), body);
+        let (out, code) = h.installer(
+            "install",
+            &[("PATH", &path), ("GOWL_BIN", &newer.display().to_string())],
+        );
+        assert_ne!(code, 0, "{what}: {out}");
+        assert!(out.contains("cannot install"), "{what}: {out}");
+        assert!(!out.contains("~ "), "{what}: reported as updated: {out}");
+        assert_eq!(
+            std::fs::read(h.p(".local/bin/gowl")).unwrap(),
+            built,
+            "{what}"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(h.p(".local/bin"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("gowl-new"))
+            .collect();
+        assert!(leftovers.is_empty(), "{what}: temp file left");
+        assert!(!h.log("systemctl.log").contains("restart"), "{what}");
+    }
+}
+
+#[test]
+fn root_is_refused_before_anything_is_built() {
+    let h = Home::new("root");
+    let fake = h.root.join("asroot");
+    std::fs::create_dir_all(&fake).unwrap();
+    script(&fake.join("id"), "#!/bin/sh\necho 0\n");
+    script(
+        &fake.join("cargo"),
+        "#!/bin/sh\necho \"$*\" >> \"$FAKE_LOG/cargo.log\"\nexit 0\n",
+    );
+    let path = format!(
+        "{}:{}:/usr/bin:/bin",
+        fake.display(),
+        h.root.join("fakebin").display()
+    );
+    for target in ["install", "uninstall"] {
+        let out = h
+            .cmd("make")
+            .args(["-s", "-C"])
+            .arg(common::root())
+            .arg(target)
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{target}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("not with sudo or as root"),
+            "{out:?}"
+        );
+    }
+    assert_eq!(h.log("cargo.log"), "", "nothing built as root");
+    let (out, code) = h.installer("install", &[("PATH", &path)]);
+    assert_eq!(code, 1, "{out}");
+    assert!(!h.p(".local/bin/gowl").exists());
+}
+
+#[test]
+fn an_odd_prefix_is_quoted_for_systemd() {
+    let h = Home::new("prefix");
+    let prefix = h.home.join("my apps%x$y");
+    let (out, code) = h.installer("install", &[("PREFIX", &prefix.display().to_string())]);
+    assert_eq!(code, 0, "{out}");
+    let bin = prefix.join("bin/gowl");
+    assert!(bin.exists());
+    let unit = h.read(".config/systemd/user/gowl.service");
+    let want = format!(
+        "ExecStart=\"{}\" screen\n",
+        bin.display().to_string().replace('%', "%%")
+    );
+    assert!(unit.contains(&want), "{want}\n{unit}");
+    // The keys spawn the same binary (a space is fine inside a KDL string).
+    assert!(
+        h.read(".config/gowl/niri-binds.kdl")
+            .contains(&format!("spawn \"{}\"", bin.display()))
+    );
 }

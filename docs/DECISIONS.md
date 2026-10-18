@@ -1040,3 +1040,76 @@ human-style niri config kept byte for byte + 2 lines, one backup, real `niri val
 identical tree, no reload; AUTOSTART=1 → enabled; uninstall → niri config byte-identical to the original, nothing
 of gowl left but the config; uninstall again → no change; reinstall → works; `PURGE=1` → HOME's files exactly as
 before the first install.
+
+## D-073 — Phase 7 review fixes: installer safety (2026-10-18, phase 7 review, install agent)
+**Root (blocking).** `sudo make install` used to build as root before install.sh refused, leaving root-owned
+files in `target/` (and possibly `~/.cargo`). The Makefile's `install` and `uninstall` recipes now refuse root
+in their first line, before `cargo build`; `install` no longer depends on the `build` target, so the order is
+fixed even under `make -j`. Test: a fake `id` printing 0 → `make install` and `make uninstall` fail with the
+message, and a fake `cargo` logs nothing.
+**Failed copies (blocking).** POSIX turns `set -e` off inside a function called from `if`, `||` or `&&`, and
+`install_file` is always called that way. So a failed or partial `cp` was renamed over the binary, reported as
+"~ updated", and the service restarted onto a truncated binary. Now `cp && chmod && cmp && mv`, else the temp
+file is removed and the install stops (`die`, exit 1) — `cmp` also catches a copy that claims success. Audit:
+`mkdir -p` in install_file, `mktemp`, the unit writer and the first-config copy are checked explicitly too;
+`userctl` and the `"$GOWL" keys add` / `stop` / `state` calls were already conditional by design; `do_install`
+and `do_uninstall` run from `case` (errexit on). Test `a_failed_copy_never_replaces_the_installed_binary`: a fake
+`cp` that writes 4 KiB and exits 1, and one that exits 0 → exit ≠ 0, "cannot install", the installed binary
+unchanged, no temp file left, no restart.
+**The unit's ExecStart** is generated with printf (no sed program built from a path): `ExecStart="PATH" screen`,
+with `\` and `"` escaped and `%` → `%%`. `$` is left alone: systemd does no variable expansion in the program
+path (`systemd-analyze verify` with `$$` reported the doubled `$$` as part of the path; with a plain `$` it
+passes). Test `an_odd_prefix_is_quoted_for_systemd` (PREFIX with a space, `%` and `$`); verify on that unit: clean.
+**MAC from ARP (D-071 fix).** `gowl setup` stores the 6-byte Wi-Fi MAC; a scan reply names the 8-byte device id,
+and netwatch's IP re-verify compared them with `==`, so it could never follow a moved light. It now uses
+`devices::mac_matches` (case-insensitive, id ending in `:MAC`). Test: verify follows a move from a 6-byte stored
+MAC to an 8-byte reply id.
+
+## D-074 — `config::write_atomic` made durable and careful (2026-10-18, phase 7 review, install agent)
+The temp file is `.NAME.gowl-tmp.PID.N` (process-wide counter), created with `create_new` and the target's mode,
+written and **fsynced**, then renamed; the directory is fsynced after. A target the user may not write
+(`access(W_OK)`) is **refused** ("read-only for you, so it was left as it is") instead of replaced (a rename would
+get around its permissions). A **hard-linked** target (nlink > 1) is written in place (truncate, write, fsync), so
+its other names keep seeing it; the fsynced temp copy stays on disk until that write is done, then goes (a failure
+names the temp copy that holds the full text), with a warning on stderr. niri-config backups are created with
+`create_new` (never overwriting), fsynced (file and directory), and named `niri-config.kdl.STAMP`, then `.2`, `.3`,
+… within the same second. Unit test: mode kept, hard link kept, read-only refused, no temp files left; the keys
+test makes 9 backups in about a second, all distinct.
+
+## D-075 — GOWL_CONFIG and the installed pieces (2026-10-18, phase 7 review, install agent)
+The service and the niri keys never get `GOWL_CONFIG`, so `gowl setup` writes `config::default_config_path()`
+(`$XDG_CONFIG_HOME/gowl/config`, else `~/.config/gowl/config`), notes on screen when `GOWL_CONFIG` points elsewhere,
+and runs its `calibrate` children without the variable. `make install` prints a `!` line in the same case. Rejected:
+`Environment=GOWL_CONFIG=` in the unit (the keys and quickshell would still read the default; one file for every
+entry point is simpler). The variable keeps working for gowl run by hand.
+
+## D-076 — `gowl keys` review fixes: a KDL tokenizer, exact removal, more checks (2026-10-18, phase 7 review, install agent)
+**Tokenizer** instead of line matching: strings (escapes, KDL v1 `r#"…"#` / v2 `#"…"#` raw strings), bare words,
+`{ } ; = /-`, newlines as node ends, `//` and nested `/* */` comments, `(type)` annotations and `\` line
+continuations. A small walker keeps a stack of open nodes and records every node name directly inside `binds`
+(with its line) and every top-level `include` (first argument; properties like `optional=true` skipped);
+`/-` drops the next node, argument or children block. So binds on the same line as `binds {`, quoted key names
+(`"Shift+Super+m"`), `;`-separated nodes, `r#"Mod+M"#` and a `spawn "Mod+M"` argument (not a bind) are all judged
+right. Unit tests cover each.
+**remove** deletes only gowl's marker line plus the include right after it. An include of the binds file written by
+hand stays, and so does the binds file it needs (a missing non-optional include would break niri's config), with a
+note. **add** with the include already present still validates: a rewritten binds file is kept only if
+`niri validate` accepts the whole config (else the previous file is put back), and an unchanged one reports a
+config niri already rejects. Paths with `"`, `\` or control characters are refused rather than escaped.
+**keys_exe:** run from a build tree (not a `bin` directory), the keys point at the installed `~/.local/bin/gowl` if
+it exists, else at the build binary with a warning. **Check files:** `.gowl-check-PID.kdl` is removed by a guard on
+every path, and stale ones (dead PID) are removed on the next run. Tests: tests/install.rs `keys_are_never_forced`
+(hand-written include kept by remove, already-included config rejected → said so, stale check file cleaned,
+backups distinct).
+**setup blink:** first a status query (700 ms). If the light answers "off", it is switched on for the blink and off
+again afterwards. If it answers "on", no `turn` is sent. If nothing answers (the human's firewall), setup says
+plainly that gowl switched it on and can't tell whether it was on before. SIGTSTP is ignored while it blinks
+(Ctrl+Z can't freeze gowl with the light streaming) and restored afterwards. Test
+`the_blink_gives_the_light_back_as_it_was_even_on_ctrl_c` (pty with gowl as session leader and controlling tty, so
+^C is a real SIGINT): an "off" light → OFF ×2 then `turn 0`; ^C mid-blink → "setup cancelled", OFF ×2, `turn 0`,
+nothing more within 0.6 s, no pidfile.
+**D-065 amended:** the retry/hold markers hold CLOCK_MONOTONIC nanoseconds in their contents — the clock systemd's
+restart timer runs on — instead of relying on wall-clock mtime, so a suspend no longer expires a hold early.
+systemd gives an automatic restart and a manual `systemctl --user start` the same environment, so they can't be told
+apart. The refusal message therefore says: "if you just started it yourself, run `systemctl --user start gowl` (or
+`gowl screen`) again". The hold is used up, so that second start works.

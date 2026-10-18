@@ -171,13 +171,24 @@ pub fn cmd_setup(rest: &[String]) -> Result<(), Error> {
         ));
     }
     let mut ui = Ui::new()?;
-    let path = config::config_path().ok_or_else(|| {
+    // The file the service and the keys read: they never see GOWL_CONFIG (D-075).
+    let path = config::default_config_path().ok_or_else(|| {
         Error::Runtime("no config path: HOME and XDG_CONFIG_HOME are unset".into())
     })?;
     println!(
         "gowl setup — a few questions, then your lights follow the screen or the music.\n\
          Answers in [brackets] are what Enter picks. Ctrl+C stops at any point.\n"
     );
+    if let Some(g) = std::env::var_os("GOWL_CONFIG").filter(|g| !g.is_empty())
+        && std::path::Path::new(&g) != path
+    {
+        println!(
+            "Note: GOWL_CONFIG={} is set here, but the login service and the niri keys don't see it,\n\
+             so setup uses {}.\n",
+            std::path::Path::new(&g).display(),
+            path.display()
+        );
+    }
     if let Some(s) = control::session() {
         println!(
             "{} is running; setup needs the light to itself for a moment.",
@@ -230,7 +241,7 @@ pub fn cmd_setup(rest: &[String]) -> Result<(), Error> {
     quickshell_hint();
 
     // 5. Summary.
-    let cfg = config::load_quiet();
+    let cfg = config::parse(&config::read_text(&path)?, &mut |_, _| {});
     let d = devices::resolve(Some(&alias), &cfg, &devices::load_cache())?;
     println!("\nDone. Saved in {}:", path.display());
     println!(
@@ -468,17 +479,27 @@ fn blink(ui: &mut Ui, l: &Light, cfg: &Config, ports: Ports) -> Result<bool, Err
         port: section.and_then(|s| s.port),
     };
     let pidfile = Pidfile::acquire()?;
-    // Switch it on first (a light that is off shows nothing), then stream.
-    let sock = net::bound_socket(&sel.iface, None)?;
-    let mut m = [0u8; 64];
-    let k = proto::turn(true, &mut m);
-    let _ = net::send_to(
-        &sock,
-        &m[..k],
-        SocketAddrV4::new(l.ip, dev.control_port(ports)),
-    );
-    drop(sock);
+    let dst = SocketAddrV4::new(l.ip, dev.control_port(ports));
+    // Was it on? Only a status reply can tell, and the firewall may drop it.
+    let was_on = net::status(&sel.iface, ports.for_ip(l.ip), l.ip, dst.port(), 700)
+        .ok()
+        .flatten()
+        .and_then(|r| r.status.on);
+    let turn = |on: bool| {
+        if let Ok(sock) = net::bound_socket(&sel.iface, None) {
+            let mut m = [0u8; 64];
+            let k = proto::turn(on, &mut m);
+            let _ = net::send_to(&sock, &m[..k], dst);
+        }
+    };
     let mut streams = Streams::open(&[dev], cfg.lan_if.as_deref(), ports, 0, 0, false)?;
+    // A light that is off shows nothing: switch it on unless it surely is.
+    if was_on != Some(true) {
+        turn(true);
+    }
+    // Ctrl+Z must not freeze gowl with the light blinking: ignored until it is back.
+    // SAFETY: plain signal disposition change, restored below.
+    let old_tstp = unsafe { libc::signal(libc::SIGTSTP, libc::SIG_IGN) };
     streams.razer(true);
     print!(
         "   The light at {} should be blinking blue now. Is it? [y/n] ",
@@ -507,6 +528,19 @@ fn blink(ui: &mut Ui, l: &Light, cfg: &Config, ports: Ports) -> Result<bool, Err
         }
     };
     streams.shutdown();
+    // SAFETY: restores the disposition saved above.
+    unsafe { libc::signal(libc::SIGTSTP, old_tstp) };
+    match was_on {
+        Some(true) => {}
+        Some(false) => {
+            turn(false);
+            println!("   (The light was off before the test, so gowl switched it off again.)");
+        }
+        None => println!(
+            "   (gowl switched the light on for this test. Its replies don't get through, so gowl can't\n   \
+             tell whether it was on before — switch it off in the Govee app or with `gowl off` if it was.)"
+        ),
+    }
     drop(pidfile);
     answer
 }
@@ -668,6 +702,8 @@ fn run_child(ui: &mut Ui, args: &[&str]) {
     let r = keys::own_exe().and_then(|exe| {
         Command::new(exe)
             .args(args)
+            // Same file as setup itself (D-075).
+            .env_remove("GOWL_CONFIG")
             .status()
             .map_err(|e| Error::Io("run gowl", e))
     });
@@ -759,7 +795,7 @@ fn offer_keys(ui: &mut Ui) -> Result<String, Error> {
     )? {
         return Ok("not added".into());
     }
-    match keys::add(&paths, &keys::own_exe()?) {
+    match keys::add(&paths, &keys::keys_exe()?) {
         Ok(keys::Added::Added(bak)) => {
             println!(
                 "   Added (niri config backed up to {}). They work right away.",

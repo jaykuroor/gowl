@@ -132,7 +132,7 @@ impl Device {
 }
 
 /// Govee ids are 8 bytes; accept the 6-byte Wi-Fi MAC a user sees in the app too.
-fn mac_matches(id: &str, given: &str) -> bool {
+pub fn mac_matches(id: &str, given: &str) -> bool {
     let (id, given) = (id.to_ascii_uppercase(), given.to_ascii_uppercase());
     id == given || (given.len() >= 17 && id.ends_with(&format!(":{given}")))
 }

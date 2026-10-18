@@ -214,14 +214,10 @@ fn the_service_stands_down_when_a_key_takes_over() {
     assert_eq!(out.status.code(), Some(3));
     assert!(!retry.exists());
     // A stale retry marker (the service gave up long ago) is not a reason to hold.
-    std::fs::write(&retry, b"").unwrap();
-    let old = std::time::SystemTime::now() - Duration::from_secs(600);
-    std::fs::File::options()
-        .write(true)
-        .open(&retry)
-        .unwrap()
-        .set_modified(old)
-        .unwrap();
+    // Its age is CLOCK_MONOTONIC in the contents (what systemd's timer runs on),
+    // not the file's mtime: a fresh mtime with an old time inside is stale.
+    let old = gowl::runtime::now_ns() - 600_000_000_000;
+    std::fs::write(&retry, old.to_string()).unwrap();
     assert_eq!(
         gowl(&tmp, base).arg("stop").status().unwrap().code(),
         Some(1)

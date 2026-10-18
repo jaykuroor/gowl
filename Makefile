@@ -12,6 +12,10 @@ AUTOSTART ?= 0
 NIRI_KEYS ?= 1
 PURGE ?= 0
 
+# Per user only: refused as root *before* anything is built (a root `cargo build`
+# would leave root-owned files in target/ and ~/.cargo).
+NOT_ROOT = @if [ "$$(id -u)" = 0 ]; then echo "gowl installs per user: run make install / make uninstall as yourself, not with sudo or as root." >&2; exit 1; fi
+
 .PHONY: all build install uninstall test
 
 all: build
@@ -19,10 +23,13 @@ all: build
 build:
 	cargo build --release
 
-install: build
+install:
+	$(NOT_ROOT)
+	cargo build --release
 	PREFIX="$(PREFIX)" AUTOSTART="$(AUTOSTART)" NIRI_KEYS="$(NIRI_KEYS)" sh packaging/install.sh install
 
 uninstall:
+	$(NOT_ROOT)
 	PREFIX="$(PREFIX)" PURGE="$(PURGE)" sh packaging/install.sh uninstall
 
 test:

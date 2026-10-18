@@ -351,7 +351,11 @@ impl Verify {
             let data = &buf[..n];
             if let Some(r) = proto::parse_scan(data) {
                 let mac = String::from_utf8_lossy(r.device).to_ascii_uppercase();
-                let Some(k) = self.pending.iter().position(|p| p.mac == mac) else {
+                let Some(k) = self
+                    .pending
+                    .iter()
+                    .position(|p| crate::devices::mac_matches(&mac, &p.mac))
+                else {
                     continue;
                 };
                 let ip =
@@ -558,7 +562,9 @@ mod tests {
             Pending {
                 dev: 1,
                 ip: Ipv4Addr::new(127, 0, 0, 9),
-                mac: "BB".into(),
+                // As `gowl setup` stores it from the ARP table: the 6-byte Wi-Fi MAC;
+                // the light's scan reply names its 8-byte device id (D-073).
+                mac: "60:74:f4:d9:72:f0".into(),
                 port: dport,
             },
         ];
@@ -583,7 +589,7 @@ mod tests {
         // No reply for device 1 within 300 ms → scan; its MAC answers from 127.0.0.1.
         assert!(v.on_deadline(STATUS_WAIT_NS));
         dev.send_to(
-            br#"{"msg":{"cmd":"scan","data":{"ip":"127.0.0.1","device":"bb","sku":"H6609"}}}"#,
+            br#"{"msg":{"cmd":"scan","data":{"ip":"127.0.0.1","device":"1A:2B:60:74:F4:D9:72:F0","sku":"H6609"}}}"#,
             back,
         )
         .unwrap();

@@ -146,9 +146,11 @@ disables and removes the unit, `gowl keys remove`, removes binary and share dir;
 Mod+M nor Mod+Shift+M (Super/Win alike) is bound in config.kdl or anything it includes, after `niri validate -c`
 passed on the edited copy next to config.kdl and after a backup in `~/.config/gowl/backups/`.
 `gowl setup` (D-071): terminal only (else exit 2); LAN Control → the config's light, a scan, or an IP typed /
-picked from `/proc/net/arp` Govee prefixes, each confirmed by a blue blink and y/n → segments (SKU table or
-asked) → `calibrate`, optional `calibrate --keepalive` → login service, niri keys, notifications, quickshell hint
-→ summary. Config writes are atomic and byte-preserving.
+picked from `/proc/net/arp` Govee prefixes, each confirmed by a blue blink and y/n (on/off state restored when a
+status reply tells it; otherwise said plainly) → segments (SKU table or asked) → `calibrate`, optional
+`calibrate --keepalive` → login service, niri keys, notifications, quickshell hint → summary. Config writes are
+atomic, fsynced and byte-preserving (D-074), always to the default config path, never `GOWL_CONFIG` (D-075). The
+Makefile refuses root before building (D-073).
 
 ## Shutdown contract
 On SIGINT/SIGTERM/SIGHUP/SIGQUIT or `stop` (or a panic, via a hook): send razer OFF to every streaming device (twice,

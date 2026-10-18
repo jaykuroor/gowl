@@ -169,13 +169,21 @@ const UNIT_RETRY: &str = "unit-retry";
 const UNIT_HOLD: &str = "unit-hold";
 const UNIT_MARK_SECS: u64 = 90;
 
-/// The service is exiting with a failure systemd will retry: note it.
+/// The service is exiting with a failure systemd will retry: note it, with the
+/// time on CLOCK_MONOTONIC — the clock systemd's restart timer runs on, so a
+/// suspend in between doesn't age the marker (wall-clock mtime would; D-065 review).
 pub fn mark_unit_retry() {
     if let Some(rt) = config::runtime_dir()
         && let Ok(dir) = ensure_dir(&rt)
     {
-        let _ = std::fs::write(dir.join(UNIT_RETRY), b"");
+        let _ = std::fs::write(dir.join(UNIT_RETRY), crate::runtime::now_ns().to_string());
     }
+}
+
+/// Seconds (CLOCK_MONOTONIC) since the time written in marker `p`, if readable.
+fn marker_age_secs(p: &std::path::Path) -> Option<u64> {
+    let t: u64 = std::fs::read_to_string(p).ok()?.trim().parse().ok()?;
+    Some(crate::runtime::now_ns().checked_sub(t)? / 1_000_000_000)
 }
 
 /// A key or `gowl stop` acted: if the service is waiting to retry, make that
@@ -186,7 +194,7 @@ pub fn hold_unit_retry() -> bool {
     };
     let dir = rt.join(SUBDIR);
     let retry = dir.join(UNIT_RETRY);
-    if !age_secs(&retry).is_some_and(|a| a < UNIT_MARK_SECS) {
+    if !marker_age_secs(&retry).is_some_and(|a| a < UNIT_MARK_SECS) {
         let _ = std::fs::remove_file(&retry);
         return false;
     }
@@ -203,12 +211,15 @@ pub fn unit_held() -> Result<(), Error> {
         return Ok(());
     };
     let hold = rt.join(SUBDIR).join(UNIT_HOLD);
-    let fresh = age_secs(&hold).is_some_and(|a| a < UNIT_MARK_SECS);
+    let fresh = marker_age_secs(&hold).is_some_and(|a| a < UNIT_MARK_SECS);
     let _ = std::fs::remove_file(&hold);
     let _ = std::fs::remove_file(rt.join(SUBDIR).join(UNIT_RETRY));
     if fresh {
+        // systemd gives an automatic restart and a manual `systemctl start` the same
+        // environment, so the two can't be told apart; the hold is used up here, so
+        // starting it again works.
         return Err(Error::AlreadyRunning(
-            "the light was controlled from a key while this service waited to restart; it stays stopped until the next login (or `systemctl --user start gowl`)".into(),
+            "screen sync was turned off from a key while this service waited to restart, so it stays stopped; if you just started it yourself, run `systemctl --user start gowl` (or `gowl screen`) again".into(),
         ));
     }
     Ok(())
