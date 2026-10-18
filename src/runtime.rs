@@ -188,12 +188,11 @@ impl Timer {
         Ok(())
     }
 
-    /// Consume an expiry (after poll said readable).
+    /// Consume an expiry (after poll said readable) without a read(2): every loop
+    /// calls `arm` before it polls again, and the forced `timerfd_settime` (even to
+    /// "disarmed") resets the expiry count, so the fd is no longer readable.
     pub fn drain(&mut self) {
-        let mut v = 0u64;
-        // SAFETY: reading 8 bytes into a u64.
-        unsafe { libc::read(self.fd(), (&mut v as *mut u64).cast(), 8) };
-        self.armed = None;
+        self.armed = Some(u64::MAX);
     }
 }
 
@@ -979,7 +978,9 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
         pfds[4].fd = pipe.streams.verify_fd();
         // D-051: while a prepared frame waits for its slot, don't wake for its offers
         // (or anything else the compositor says); the timer reads them all at once.
-        let held = cap.held() && next_capture.is_some();
+        // Only while a capture deadline is armed (live, slot ahead): otherwise the fd is
+        // polled, so an error/hang-up or output event is never left waiting.
+        let held = cap_dl.is_some() && cap.held();
         pfds[0].fd = if held { -1 } else { cap.fd() };
         for p in &mut pfds {
             p.revents = 0;
@@ -1008,7 +1009,8 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
                     Sig::Pause if !paused => {
                         debug!("paused");
                         paused = true;
-                        cap.cancel()?;
+                        // Frees the 19.8 MB capture memfd too (niri's share of it).
+                        cap.release()?;
                         next_capture = None;
                         pipe.streams.off();
                     }
@@ -1034,12 +1036,13 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
         }
 
         if pfds[0].revents != 0 || (held && pfds[1].revents != 0) {
-            let mut st = cap.dispatch()?;
-            loop {
+            let st = cap.dispatch()?;
+            {
                 if st.lost {
                     warn!("output gone; lights off until it comes back");
                     waiting = true;
                     next_capture = None;
+                    cap.release()?;
                     if !paused {
                         pipe.streams.off();
                     }
@@ -1074,7 +1077,6 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
                         next_capture = Some(now + backoff);
                     }
                 }
-                let mut prepared = false;
                 if st.ready {
                     if fails > 0 {
                         warn!("capture works again after {fails} failure(s)");
@@ -1084,17 +1086,18 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
                     let at = last_request + interval;
                     // D-051: negotiate the next frame now, so its offers arrive while
                     // this one is sampled; the copy waits for the slot (timer).
-                    if live && at > now && cap.prepare()? {
-                        if let Err(e) = cap.flush() {
-                            if ctl.sig.read() == Some(Sig::Stop) {
-                                debug!(
-                                    "stop signal while the compositor was not reading: razer off, exit"
-                                );
-                                return Ok(());
-                            }
-                            return Err(e);
+                    if live
+                        && at > now
+                        && cap.prepare()?
+                        && let Err(e) = cap.flush()
+                    {
+                        if ctl.sig.read() == Some(Sig::Stop) {
+                            debug!(
+                                "stop signal while the compositor was not reading: razer off, exit"
+                            );
+                            return Ok(());
                         }
-                        prepared = true;
+                        return Err(e);
                     }
                     if let Some(f) = cap.frame() {
                         pipe.on_frame(&f, now);
@@ -1111,11 +1114,9 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
                         }
                     }
                 }
-                if !prepared {
-                    break;
-                }
-                // Offers that came in while we sampled: handled without a wakeup.
-                st = cap.dispatch()?;
+                // Offers for a prepared frame are read at the timer wakeup (the fd is
+                // not polled while held), not here: a dispatch right after sampling
+                // found nothing in practice and cost one EAGAIN recvmsg per frame.
             }
         }
 

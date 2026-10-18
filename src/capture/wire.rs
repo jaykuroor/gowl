@@ -113,6 +113,9 @@ pub struct Conn {
     /// Polled alongside the socket while a send waits (the runtime's signalfd), so
     /// a compositor that stops reading can't swallow Ctrl+C. -1 = none.
     interrupt_fd: RawFd,
+    /// The last `fill` emptied the socket: a short read without fds, or EAGAIN. A
+    /// dispatch loop can stop there instead of paying one more recvmsg for EAGAIN.
+    pub drained: bool,
 }
 
 fn sock_path() -> Result<Vec<u8>, Error> {
@@ -195,6 +198,7 @@ impl Conn {
             rfds: [-1; MAX_FDS],
             nrfds: 0,
             interrupt_fd: -1,
+            drained: false,
         }
     }
 
@@ -366,7 +370,10 @@ impl Conn {
                 let e = io::Error::last_os_error();
                 return match e.kind() {
                     io::ErrorKind::Interrupted => continue,
-                    io::ErrorKind::WouldBlock => Ok(false),
+                    io::ErrorKind::WouldBlock => {
+                        self.drained = true;
+                        Ok(false)
+                    }
                     _ => Err(Error::Capture(format!("Wayland connection lost: {e}"))),
                 };
             }
@@ -375,6 +382,9 @@ impl Conn {
                     "the Wayland compositor closed the connection".into(),
                 ));
             }
+            // Fewer bytes than room and no fds: the kernel queue was empty (a stream
+            // socket returns everything queued, up to the buffer).
+            self.drained = (n as usize) < iov.iov_len && msg.msg_controllen == 0;
             self.take_received_fds(&msg);
             self.rend += n as usize;
             return Ok(true);

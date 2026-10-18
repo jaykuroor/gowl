@@ -238,6 +238,30 @@ fn screen_against_mock_compositor() {
     h.tail_is_double_off();
 }
 
+/// D-051 widens the gap between `capture_output` and `copy` (the next frame is
+/// negotiated on `ready`, copied at the next slot). A `failed` sent in that gap is
+/// read at the timer wakeup and takes the normal back-off; capture then resumes.
+#[test]
+fn failed_while_held_backs_off_and_recovers() {
+    let mut h = Harness::start("screen-held-fail", 16500, usize::MAX);
+    h.collect(1.0);
+    let before = h.served.load(Ordering::SeqCst);
+    h.ctl.send(mock_wl::Ctl::FailBeforeCopy).unwrap();
+    h.collect(2.0);
+    let after = h.served.load(Ordering::SeqCst);
+    let (exit_ms, err) = h.stop();
+    assert!(exit_ms < 500, "exit took {exit_ms} ms");
+    assert!(err.contains("capture failed; retrying"), "{err}");
+    assert!(err.contains("capture works again after 1 failure"), "{err}");
+    // 30 fps for 1 s minus one 100 ms back-off.
+    assert!(
+        after - before >= 20,
+        "only {} frames after the failure",
+        after - before
+    );
+    h.tail_is_double_off();
+}
+
 #[test]
 fn output_unplug_and_replug() {
     let mut h = Harness::start("screen-hotplug", 16100, 10);

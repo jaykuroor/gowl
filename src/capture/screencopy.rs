@@ -271,7 +271,10 @@ pub struct Screencopy {
     buf: Option<ShmBuffer>,
     /// The buffer was (re)allocated: the next frame counts as fully damaged.
     fresh: bool,
+    /// `y_invert` of the last ready frame (what `frame()` reports).
     y_invert: bool,
+    /// `flags` seen on the in-flight frame object (applied at `ready`).
+    next_y_invert: bool,
     damage: [DamageRect; MAX_DAMAGE],
     ndamage: usize,
     damage_all: bool,
@@ -332,6 +335,7 @@ impl Screencopy {
             buf: None,
             fresh: true,
             y_invert: false,
+            next_y_invert: false,
             damage: [DamageRect::default(); MAX_DAMAGE],
             ndamage: 0,
             damage_all: false,
@@ -419,7 +423,6 @@ impl Screencopy {
         // The previous frame's damage/flags stay valid until here (`prepare`).
         self.ndamage = 0;
         self.damage_all = false;
-        self.y_invert = false;
         self.have_frame = false;
         let op = if self.mgr_version >= 2 {
             FRAME_COPY_WITH_DAMAGE
@@ -453,6 +456,8 @@ impl Screencopy {
         self.phase = Phase::Negotiating;
         self.noffers = 0;
         self.offers_done = false;
+        // A new frame object: its flags are its own (the last frame keeps `y_invert`).
+        self.next_y_invert = false;
         Ok(())
     }
 
@@ -477,7 +482,7 @@ impl Screencopy {
             }
             EV_FRAME_LINUX_DMABUF => {}
             EV_FRAME_BUFFER_DONE => self.offers_ready()?,
-            EV_FRAME_FLAGS => self.y_invert = a.uint() & FLAG_Y_INVERT != 0,
+            EV_FRAME_FLAGS => self.next_y_invert = a.uint() & FLAG_Y_INVERT != 0,
             EV_FRAME_DAMAGE => {
                 let r = DamageRect {
                     x: a.uint(),
@@ -498,6 +503,7 @@ impl Screencopy {
                 // whether that means rows as stored (bottom-up) or as displayed, and
                 // compositors disagree; niri never sets y_invert (CAPTURE_NIRI.md), so
                 // rather than guess we treat a y-inverted frame as fully damaged.
+                self.y_invert = self.next_y_invert;
                 self.frame_full =
                     self.fresh || self.damage_all || self.ndamage == 0 || self.y_invert;
                 self.fresh = false;
@@ -530,6 +536,7 @@ impl Capture for Screencopy {
 
     fn dispatch(&mut self) -> Result<Status, Error> {
         let mut st = Status::default();
+        self.g.conn.drained = false;
         loop {
             while let Some(ev) = self.g.conn.next_event()? {
                 if self.phase != Phase::Idle && ev.obj == self.frame {
@@ -567,10 +574,13 @@ impl Capture for Screencopy {
                     }
                 }
             }
-            if !self.g.conn.fill()? {
+            // Stop after a read that emptied the socket (12a: saves the EAGAIN read);
+            // anything arriving later makes the fd readable again.
+            if self.g.conn.drained || !self.g.conn.fill()? {
                 break;
             }
         }
+        self.g.conn.drained = false;
         Ok(st)
     }
 
@@ -616,6 +626,16 @@ impl Capture for Screencopy {
         // Damage accumulated for the abandoned frame is lost: next frame is full.
         self.fresh = true;
         self.destroy_frame()
+    }
+
+    fn release(&mut self) -> Result<(), Error> {
+        self.cancel()?;
+        self.have_frame = false;
+        if let Some(b) = self.buf.take() {
+            debug!("capture buffer released ({} bytes)", b.data().len());
+            b.destroy(&mut self.g.conn)?;
+        }
+        Ok(())
     }
 
     fn frame(&self) -> Option<Frame<'_>> {

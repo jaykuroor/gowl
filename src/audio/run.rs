@@ -27,17 +27,112 @@ use crate::runtime::{Ctl, Sig, Streams, min_opt, now_ns};
 
 /// Legacy `max_update_hz` for Govee LAN devices.
 pub const DEVICE_CAP_HZ: u32 = 40;
-/// Reopen the stream after this much continuous digital silence (default sink may
-/// have changed; `@DEFAULT_MONITOR@` doesn't follow an open stream everywhere).
-const SILENCE_REOPEN_WINDOWS: u32 = 30 * SAMPLE_RATE / N as u32;
 const SOURCE: &std::ffi::CStr = c"@DEFAULT_MONITOR@";
-/// No audio this long after the stream opened (passive stream on a suspended sink,
-/// D-052): send black once, as silence would render, so the light is in stream mode
-/// and dark like legacy's idle music mode; keepalives repeat it.
-const BLACK_AFTER_NS: u64 = 1_000_000_000;
-/// No window at all for this long (sink suspended, or the default sink moved and the
-/// passive stream still watches the old one): reopen, like 30 s of digital silence.
-const QUIET_REOPEN_NS: u64 = 30_000_000_000;
+
+const SEC: u64 = 1_000_000_000;
+/// Deadlines below are rounded to this grid so windows arriving 47 times a second
+/// don't re-arm the timerfd each time.
+const GRID_NS: u64 = SEC / 2;
+/// Black this long (+ up to one grid step) after the last window: audio stopped —
+/// song paused, sink suspended or moved (D-054; the passive stream delivers nothing
+/// then, so nothing would fade).
+const BLACK_AFTER_NS: u64 = SEC;
+/// Re-resolve `@DEFAULT_MONITOR@` (restart the stream on the same connection) after
+/// this long without sound (no windows, or only digital silence); doubles up to
+/// `QUIET_REOPEN_MAX_NS` while it stays quiet, back to the start on sound (D-054).
+const QUIET_REOPEN_NS: u64 = 30 * SEC;
+const QUIET_REOPEN_MAX_NS: u64 = 300 * SEC;
+/// Sound server unreachable: retry after 1 s, doubling to 30 s (D-054).
+const RETRY_MAX_NS: u64 = 30 * SEC;
+
+/// What the idle bookkeeping wants done at a timer wakeup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuietAction {
+    None,
+    /// Send black (silence) to every device.
+    Blank,
+    /// Restart the stream (follow a changed default sink).
+    Restart,
+}
+
+/// Idle bookkeeping for the open stream (D-052, D-054): black ~1 s after the last
+/// window, restart after a long time without sound (backing off). Pure; times in ns.
+#[derive(Clone, Copy, Debug)]
+pub struct Quiet {
+    /// Last window, or the stream (re)open.
+    heard_at: u64,
+    /// Last window with sound (not all zeros), or the last (re)open / restart.
+    sound_at: u64,
+    /// Black was sent since the last window.
+    blanked: bool,
+    reopen_after: u64,
+}
+
+impl Quiet {
+    pub fn new(now: u64) -> Quiet {
+        Quiet {
+            heard_at: now,
+            sound_at: now,
+            blanked: false,
+            reopen_after: QUIET_REOPEN_NS,
+        }
+    }
+
+    /// Stream opened or restarted: black if nothing arrives; keeps the back-off.
+    pub fn opened(&mut self, now: u64) {
+        self.heard_at = now;
+        self.sound_at = now;
+        self.blanked = false;
+    }
+
+    /// A full window arrived (`silent` = all zeros).
+    #[inline]
+    pub fn heard(&mut self, now: u64, silent: bool) {
+        self.heard_at = now;
+        self.blanked = false;
+        if !silent {
+            self.sound_at = now;
+            self.reopen_after = QUIET_REOPEN_NS;
+        }
+    }
+
+    pub fn blanked(&self) -> bool {
+        self.blanked
+    }
+
+    fn grid(t: u64) -> u64 {
+        t - t % GRID_NS
+    }
+
+    /// When to send black, if not done yet: 1.0–1.5 s after the last window.
+    pub fn black_due(&self) -> Option<u64> {
+        (!self.blanked).then(|| Quiet::grid(self.heard_at) + GRID_NS + BLACK_AFTER_NS)
+    }
+
+    /// When to restart the stream for lack of sound.
+    pub fn restart_due(&self) -> u64 {
+        Quiet::grid(self.sound_at) + GRID_NS + self.reopen_after
+    }
+
+    pub fn deadline(&self) -> u64 {
+        self.black_due()
+            .map_or(self.restart_due(), |b| b.min(self.restart_due()))
+    }
+
+    /// Timer wakeup at `now`.
+    pub fn on_timer(&mut self, now: u64) -> QuietAction {
+        if now >= self.restart_due() {
+            self.reopen_after = (self.reopen_after * 2).min(QUIET_REOPEN_MAX_NS);
+            self.sound_at = now;
+            return QuietAction::Restart;
+        }
+        if self.black_due().is_some_and(|t| now >= t) {
+            self.blanked = true;
+            return QuietAction::Blank;
+        }
+        QuietAction::None
+    }
+}
 
 // ------------------------------------------------------------------ pipeline
 
@@ -159,11 +254,14 @@ impl Music {
         sent
     }
 
-    /// Black on every device that has nothing yet (what silence renders to).
+    /// Black on every device (what silence renders to); smoothing restarts from
+    /// black, like the light. The gate skips devices already showing black.
     pub fn blank(&mut self, now_ms: u64) {
         let black = [[0u8; 3]; MAX_SEGMENTS];
-        for i in 0..self.voices.len() {
+        for (i, v) in self.voices.iter_mut().enumerate() {
             let n = self.streams.segments(i);
+            v.smoother.reset(n);
+            v.smooth[..n].fill([0; 3]);
             self.streams.push(i, &black[..n], now_ms);
         }
     }
@@ -281,9 +379,8 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
     let interval = music.settings.interval_us();
     let start = Instant::now();
     let mut next_us = 0u64;
-    let mut silent = 0u32;
-    let mut black_at: Option<u64> = None;
-    let mut heard_at = 0u64; // last window (or open), ns
+    let mut quiet = Quiet::new(now_ns());
+    let mut retry_ns = SEC; // next back-off while the sound server is unreachable
     let verbose = crate::log::enabled(crate::log::DEBUG);
     let (mut windows, mut renders, mut sends, mut stat_at) = (0u32, 0u32, 0u32, 0u64);
 
@@ -300,10 +397,7 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
         if stream.is_some() {
             let grace = music.streams.keepalive_ms() / 4;
             dl = min_opt(dl, ka.map(|t| (t + grace) * MS));
-            dl = min_opt(dl, black_at);
-            // Whole seconds, so a window arriving doesn't re-arm the timerfd each time.
-            let quiet = (heard_at / 1_000_000_000) * 1_000_000_000 + QUIET_REOPEN_NS;
-            dl = min_opt(dl, Some(quiet));
+            dl = min_opt(dl, Some(quiet.deadline()));
         } else if !paused && !opening {
             dl = min_opt(dl, retry_at);
             dl = min_opt(dl, ka.map(|t| t * MS));
@@ -329,9 +423,8 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
                         SAMPLE_RATE
                     );
                     stream = Some(st);
-                    silent = 0;
-                    heard_at = now_ns();
-                    black_at = Some(heard_at + BLACK_AFTER_NS);
+                    quiet.opened(now_ns());
+                    retry_ns = SEC;
                     continue;
                 }
                 // A signal is pending: handle it below, then retry (unless paused/stopped).
@@ -339,13 +432,14 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
                 Err(ReadError::Failed(e)) => {
                     if !warned {
                         warn!(
-                            "cannot open {}: {e}; retrying every second",
+                            "cannot open {}: {e}; retrying (1 s, backing off to 30 s)",
                             SOURCE.to_string_lossy()
                         );
                         warned = true;
                     }
                     failed = true;
-                    retry_at = Some(now_ns() + 1000 * MS);
+                    retry_at = Some(now_ns() + retry_ns);
+                    retry_ns = (retry_ns * 2).min(RETRY_MAX_NS);
                     continue;
                 }
             }
@@ -356,9 +450,14 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
                 Ok(()) => {}
                 Err(ReadError::Interrupted) => {}
                 Err(ReadError::Expired) => {
-                    debug!("passive stream never started (sink suspended): reopening");
-                    stream = None;
-                    retry_at = Some(now_ns());
+                    // libpulse's ~30 s request timeout; same connection, new stream.
+                    debug!("passive stream never started (sink suspended): new stream");
+                    if let Err(e) = st.restart(SOURCE) {
+                        warn!("audio stream restart failed: {e:?}; reopening");
+                        stream = None;
+                        failed = true;
+                        retry_at = Some(now_ns());
+                    }
                     continue;
                 }
                 Err(ReadError::Failed(e)) => {
@@ -372,21 +471,7 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
             if !hook.fired() {
                 // A full window.
                 windows += 1;
-                black_at = None;
-                heard_at = now_ns();
-                if samples.iter().all(|&v| v == 0.0) {
-                    silent += 1;
-                    if silent >= SILENCE_REOPEN_WINDOWS {
-                        debug!(
-                            "30 s of silence: reopening the monitor stream (default sink may have changed)"
-                        );
-                        stream = None;
-                        retry_at = Some(now_ns());
-                        continue;
-                    }
-                } else {
-                    silent = 0;
-                }
+                quiet.heard(now_ns(), samples.iter().all(|&v| v == 0.0));
                 let now_us = start.elapsed().as_micros() as u64;
                 if now_us < next_us {
                     continue;
@@ -446,30 +531,44 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
         if ev[H_NET] != 0 {
             ctl.on_netlink(now);
         }
+        // A moved or rebound device got razer ON (gate reset): while audio flows the
+        // next render sends to it; while quiet and already black, send black now so
+        // the light isn't left in stream mode without a frame.
+        let mut rebound = false;
         if ev[H_VERIFY] != 0 {
-            // A moved device got razer ON; the next render sends to it.
-            music.streams.on_verify_readable();
+            rebound |= music.streams.on_verify_readable();
         }
         if ev[H_TIMER] != 0 {
             ctl.timer.drain();
-            // Rebound devices got razer ON (gate reset): the next render sends.
-            ctl.service_net(&mut music.streams, now);
+            rebound |= ctl.service_net(&mut music.streams, now);
+            if !paused && let Some(st) = stream.as_mut() {
+                match quiet.on_timer(now) {
+                    QuietAction::Restart => {
+                        debug!(
+                            "no sound for a while: new stream (the default sink may have changed)"
+                        );
+                        quiet.opened(now);
+                        if let Err(e) = st.restart(SOURCE) {
+                            warn!("audio stream restart failed: {e:?}; reopening");
+                            stream = None;
+                            failed = true;
+                            retry_at = Some(now);
+                        }
+                    }
+                    QuietAction::Blank => {
+                        debug!("no audio for a second: black until something plays");
+                        music.blank(now / MS);
+                    }
+                    QuietAction::None => {}
+                }
+            }
             if !paused {
-                if stream.is_some()
-                    && now >= heard_at.saturating_add(QUIET_REOPEN_NS - 1_000_000_000)
-                {
-                    debug!("no audio for 30 s: reopening (the default sink may have changed)");
-                    stream = None;
-                    retry_at = Some(now);
-                }
-                if stream.is_some() && black_at.is_some_and(|t| t <= now) {
-                    debug!("no audio yet (sink suspended?): black until something plays");
-                    black_at = None;
-                    music.blank(now / MS);
-                }
                 // Only frames that were actually rendered are kept alive.
                 music.streams.keepalive(now / MS);
             }
+        }
+        if rebound && !paused && stream.is_some() && quiet.blanked() {
+            music.blank(now / MS);
         }
     }
 }

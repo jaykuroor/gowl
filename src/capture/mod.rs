@@ -155,6 +155,11 @@ pub trait Capture {
     }
     /// Abandon the in-flight frame (pause). No-op if none.
     fn cancel(&mut self) -> Result<(), Error>;
+    /// `cancel`, then free the capture buffer (pause, output gone): the next frame
+    /// reallocates it. Default: just `cancel`.
+    fn release(&mut self) -> Result<(), Error> {
+        self.cancel()
+    }
     /// The last ready frame.
     fn frame(&self) -> Option<Frame<'_>>;
     /// Name of the captured output, if any.

@@ -45,6 +45,9 @@ pub enum Ctl {
     RemoveOutput,
     /// Announce a (new) output global and answer `more_frames` further copies.
     AddOutput { more_frames: usize },
+    /// Send `failed` for the next frame right after its `buffer_done`, before the
+    /// client copies (the gap D-051 widens to up to one frame interval).
+    FailBeforeCopy,
 }
 
 /// Serve one client until it disconnects. `served` counts completed frames.
@@ -65,6 +68,7 @@ pub fn serve_ctl(fd: OwnedFd, o: Opts, served: Arc<AtomicUsize>, ctl: Option<Rec
     let mut frames: Vec<u32> = Vec::new();
     let stride = o.width * 4 + 64; // padded, to exercise stride handling
     let mut k = 0usize;
+    let mut fail_before_copy = false;
     loop {
         loop {
             let ev = match c.next_event() {
@@ -170,6 +174,10 @@ pub fn serve_ctl(fd: OwnedFd, o: Opts, served: Arc<AtomicUsize>, ctl: Option<Rec
                     ],
                 );
                 let _ = c.request(frame, 6, &[]);
+                if fail_before_copy {
+                    fail_before_copy = false;
+                    let _ = c.request(frame, 3, &[]);
+                }
             } else if let Some(fi) = frames.iter().position(|&f| f == ev.obj) {
                 match ev.op {
                     2 => {
@@ -239,6 +247,7 @@ pub fn serve_ctl(fd: OwnedFd, o: Opts, served: Arc<AtomicUsize>, ctl: Option<Rec
                                 let _ = c.request(reg, 1, &[Arg::Uint(out_global)]);
                                 out_global = 0;
                             }
+                            Ctl::FailBeforeCopy => fail_before_copy = true,
                             Ctl::AddOutput { more_frames } => {
                                 out_global = next_global;
                                 next_global += 1;

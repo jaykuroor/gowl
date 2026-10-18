@@ -66,25 +66,24 @@ fn socketpair() -> (OwnedFd, OwnedFd) {
     unsafe { (OwnedFd::from_raw_fd(sv[0]), OwnedFd::from_raw_fd(sv[1])) }
 }
 
-/// Request one frame and dispatch until it is ready; process it.
+/// One frame the way `runtime::screen_loop` drives it (D-051): at the "timer" a
+/// held (prepared) frame first reads its offers, then `request_next` copies; on
+/// `ready` the next frame is prepared and flushed *before* the frame is processed.
 fn one_frame(cap: &mut Screencopy, pipe: &mut Pipeline, now: u64) {
+    if cap.held() {
+        wait_readable(cap); // the offers were sent while we sampled the last frame
+        let st = cap.dispatch().unwrap();
+        assert!(!st.ready && !st.failed && !st.lost);
+    }
     assert!(cap.request_next().unwrap());
     loop {
         cap.flush().unwrap();
-        let mut p = libc::pollfd {
-            fd: cap.fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one valid pollfd.
-        assert_eq!(
-            unsafe { libc::poll(&mut p, 1, 5000) },
-            1,
-            "mock never answered"
-        );
+        wait_readable(cap);
         let st = cap.dispatch().unwrap();
         assert!(!st.failed && !st.lost);
         if st.ready {
+            assert!(cap.prepare().unwrap());
+            cap.flush().unwrap();
             let f = cap.frame().unwrap();
             pipe.on_frame(&f, now);
             pipe.on_timer(now);

@@ -349,6 +349,8 @@ impl Pulse {
             filled: 0,
             iterations: 0,
             started: false,
+            rate: 0,
+            frag_bytes: 0,
         };
         // SAFETY: `m` is live; the API pointer lives as long as `m`.
         cap.c = unsafe { (f.context_new)((f.mainloop_get_api)(m), c"gowl".as_ptr()) };
@@ -377,35 +379,9 @@ impl Pulse {
                 _ => cap.iterate()?,
             }
         }
-        let ss = SampleSpec {
-            format: PA_SAMPLE_FLOAT32LE,
-            rate,
-            channels: 1,
-        };
-        let attr = BufferAttr {
-            maxlength: u32::MAX,
-            tlength: u32::MAX,
-            prebuf: u32::MAX,
-            minreq: u32::MAX,
-            fragsize: frag_bytes,
-        };
-        // SAFETY: live context; `ss` valid for the call (copied); NULL map = default.
-        cap.s = unsafe { (f.stream_new)(cap.c, c"gowl music".as_ptr(), &ss, std::ptr::null()) };
-        if cap.s.is_null() {
-            return Err(ReadError::Failed(cap.context_error()));
-        }
-        // SAFETY: live stream; `source` and `attr` valid for the call (copied).
-        if unsafe {
-            (f.stream_connect_record)(
-                cap.s,
-                source.as_ptr(),
-                &attr,
-                PA_STREAM_ADJUST_LATENCY | PA_STREAM_DONT_INHIBIT_AUTO_SUSPEND,
-            )
-        } < 0
-        {
-            return Err(ReadError::Failed(cap.context_error()));
-        }
+        cap.rate = rate;
+        cap.frag_bytes = frag_bytes;
+        cap.connect_stream(source)?;
         Ok(cap)
     }
 }
@@ -425,9 +401,69 @@ pub struct Capture<'a> {
     iterations: u32,
     /// The stream has been READY at least once.
     started: bool,
+    rate: u32,
+    frag_bytes: u32,
 }
 
 impl Capture<'_> {
+    /// Create the record stream on the open context (passive, D-052).
+    fn connect_stream(&mut self, source: &CStr) -> Result<(), ReadError> {
+        let f = &self.p.f;
+        let ss = SampleSpec {
+            format: PA_SAMPLE_FLOAT32LE,
+            rate: self.rate,
+            channels: 1,
+        };
+        let attr = BufferAttr {
+            maxlength: u32::MAX,
+            tlength: u32::MAX,
+            prebuf: u32::MAX,
+            minreq: u32::MAX,
+            fragsize: self.frag_bytes,
+        };
+        // SAFETY: live context; `ss` valid for the call (copied); NULL map = default.
+        self.s = unsafe { (f.stream_new)(self.c, c"gowl music".as_ptr(), &ss, std::ptr::null()) };
+        if self.s.is_null() {
+            return Err(ReadError::Failed(self.context_error()));
+        }
+        // SAFETY: live stream; `source` and `attr` valid for the call (copied).
+        if unsafe {
+            (f.stream_connect_record)(
+                self.s,
+                source.as_ptr(),
+                &attr,
+                PA_STREAM_ADJUST_LATENCY | PA_STREAM_DONT_INHIBIT_AUTO_SUSPEND,
+            )
+        } < 0
+        {
+            return Err(ReadError::Failed(self.context_error()));
+        }
+        Ok(())
+    }
+
+    /// Drop the record stream and request a new one on the same connection (no new
+    /// pulse connection): after libpulse expired a never-started passive stream, or
+    /// to re-resolve `@DEFAULT_MONITOR@` after a long quiet spell (D-054).
+    pub fn restart(&mut self, source: &CStr) -> Result<(), ReadError> {
+        let f = &self.p.f;
+        if !self.s.is_null() {
+            // SAFETY: the stream came from stream_new and is released exactly once.
+            unsafe {
+                (f.stream_disconnect)(self.s);
+                (f.stream_unref)(self.s);
+            }
+            self.s = std::ptr::null_mut();
+        }
+        // SAFETY: live context.
+        if unsafe { (f.context_get_state)(self.c) } != PA_CONTEXT_READY {
+            return Err(ReadError::Failed(self.context_error()));
+        }
+        self.off = 0;
+        self.filled = 0;
+        self.started = false;
+        self.connect_stream(source)
+    }
+
     /// Mainloop iterations since the last call.
     pub fn take_iterations(&mut self) -> u32 {
         std::mem::take(&mut self.iterations)
