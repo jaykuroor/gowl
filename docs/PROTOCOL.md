@@ -16,7 +16,9 @@ Home phone app. Without it the device ignores everything below.
 Legacy keeps a manual override: a device record may carry `Device_Port`/`devicePort`
 or a manual `port`; otherwise control goes to 4003. gowl: `port = N` in the device's
 `[device ALIAS]` section (1-65535) sends every control datagram and the devStatus query
-there (D-049); it also wins over the loopback `GOWL_PORT_BASE` test hook.
+there (D-049); it also wins over the loopback `GOWL_PORT_BASE` test hook. Exception: `scan --sweep`
+probes unknown hosts on 4001/4003 (there is no device to take a port from); a light on another
+port needs `ip =` in its section instead of discovery.
 
 Only `scan` and `status` need replies, so **only those commands bind 4002**
 (`SO_REUSEADDR` + `SO_REUSEPORT`, timeout-bounded, then close). Sync modes and one-shot

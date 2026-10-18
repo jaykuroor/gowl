@@ -19,13 +19,16 @@ Golden numbers: `tests/vectors/audio.json` (bands, AutoGain) and `tests/vectors/
   than us doing it). `pa_buffer_attr.fragsize = 1024 * 4` bytes, others `u32::MAX`.
 - Stream name `"gowl music"` so it's identifiable in `pavucontrol`/`wpctl status`.
 - If the default sink changes, `@DEFAULT_MONITOR@` doesn't follow an open stream: on
-  read error, reopen (1 s back-off while the server is unreachable, then razer ON again);
-  additionally reopen after 30 s of continuous all-zero windows (cheap check).
+  read error, reopen (back-off 1 → 2 → 4 … 30 s while the server is unreachable, then razer ON
+  again); after 30 s without sound (no windows or only zeros) the stream is restarted on the same
+  connection, backing off to 5 min while it stays quiet (D-054).
 - The stream is passive (`PA_STREAM_DONT_INHIBIT_AUTO_SUSPEND`, D-052): it never keeps the
   monitored sink awake. With nothing playing the sink suspends, no windows arrive and gowl
-  sleeps (0.2 wakeups/s: one keepalive every 1.25 × keepalive_ms); playback anywhere resumes the
-  sink and windows flow again. No audio within 1 s of opening → one black frame (what silence
-  renders to); no window for 30 s → reopen (follows a changed default sink).
+  sleeps: one keepalive every 1.25 × keepalive_ms, i.e. ≈ 0.14 wakeups/s at the human's
+  keepalive_ms = 5600 (0.2–0.3/s measured incl. restarts) and ≈ 1.6/s at the default 500.
+  Playback anywhere resumes the sink and windows flow again. 1.0–1.5 s after the last window
+  (audio stopped, sink suspended, or nothing yet after opening) → one black frame, what silence
+  renders to (D-054).
 
 Alternative considered: native libpipewire. Rejected for v1 (bindgen/clang build dep,
 larger API surface). Phase 5 may benchmark it if pulse overhead shows up in profiles.

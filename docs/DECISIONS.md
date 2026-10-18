@@ -506,67 +506,10 @@ else 4003 (or the loopback `GOWL_PORT_BASE` test port — the explicit override 
 by every control path: one-shots, `status`, `doctor` (route check + devStatus), sync `Streams` and the
 netwatch re-verify devStatus (`Pending.port`). Discovery stays on 4001/4002 (legacy only overrides the
 control port). Legacy's "repair a stale auto-discovered 4001" quirk is not needed: gowl never stores a
-port from discovery. **Tests:** config parse (valid / 0 / 70000 → warning), tests/net_e2e.rs
+port from discovery. **Exception:** `scan --sweep` probes *unknown* hosts on 4001 and 4003; it
+has no device to take a port from. A light on a non-standard port needs `ip =` in its section (no
+discovery needed then). Documented in PROTOCOL.md. **Tests:** config parse (valid / 0 / 70000 → warning), tests/net_e2e.rs
 `device_port_override_is_used_by_one_shots` (gowl binary, temp config, receiver on 127.0.0.4).
-
-## D-051 — Screen capture: two wakeups per frame (prepare + held fd) (2026-10-17, phase 5, perf agent)
-Supersedes D-018. **Context.** S1 measured 90.7 wakeups/s at 30 fps (3/frame: timer → `capture_output`;
-offers → `copy_with_damage`; `ready`), budget ≤ 2·fps. D-018 rejected sending the copy speculatively
-(a buffer that no longer matches is the fatal `invalid_buffer` error). **Decision.** On `ready`, if the
-next slot is in the future, gowl sends `capture_output` for the *next* frame at once (`Capture::prepare`)
-but holds the copy; while a prepared frame waits for its slot the Wayland fd is left out of the poll set
-(`Capture::held`), so niri's offers sit in the socket instead of waking us. The timer wakeup then
-dispatches everything pending (offers, output events) and sends `copy_with_damage` immediately — the copy
-still follows its own `buffer_done`, so no protocol risk. The last frame's damage/flags are reset only
-when the next copy is sent, so it stays fully readable while the next frame is negotiated. Output
-events are seen up to one frame interval (33 ms) later while held; pause cancels the held frame; a
-`failed`/lost output for it is handled at the timer like before. If the offers are not in yet at the
-timer (slow compositor), the copy goes out on `buffer_done` as before (3 wakeups that frame).
-**Evidence** (same desktop, fake device, 30 s, `measure.py screen 30 --fake`): wakeups 90.7 → **60.5/s**
-(debug line: wayland 30 + timer 30 per second); `perf stat` task-clock 107.2 → **90.2 ms per 30 s**
-(0.357 → 0.301 % of a core); niri Δ unchanged (≈ 21 %, see D-050). Test: tests/capture_alloc.rs
-`prepare_holds_the_copy_and_keeps_the_last_frame` (offers arrive, no copy until `request_next`, last
-frame's pixels and damage intact, cancel while held).
-**Revisit-if.** A compositor sends something time-critical on the Wayland socket (none of the
-interfaces gowl binds has a ping).
-
-## D-052 — Passive music stream (auto-suspend friendly) (2026-10-17, phase 5, perf agent)
-Supersedes D-034's "keep the monitor stream active". **Context.** D-034 kept the stream active
-because the light's razer timeout was unknown; D-046 measured it: the H6609 holds stream mode for at
-least 8 s, keepalive_ms = 5600, and the D-048 stall guard resends every 1.25 × keepalive (7 s) when
-windows stop. **Decision.** Record with `PA_STREAM_DONT_INHIBIT_AUTO_SUSPEND`. On a suspended sink
-the stream stays CREATING (D-034's observation), so `Pulse::open` returns once the stream is
-requested and `Capture::read` waits in the hooked mainloop (signals, timer, netlink stay live; no
-`pa_stream_peek` while CREATING — it returns "Bad state"). libpulse times the pending create out
-after ~30 s → `ReadError::Expired` → quiet reopen (not a warning, no razer re-ON). No window within
-1 s of opening → one black frame (what silence renders to: the light is in stream mode and dark, as
-in legacy's idle music mode); keepalives repeat it. No window for 30 s → reopen, so a changed default
-sink is still picked up although a suspended sink delivers no zero windows to count (deadline
-quantised to whole seconds so windows don't re-arm the timerfd).
-**Evidence** (live PipeWire 1.6.9, loopback receiver, nothing playing): `measure.py music 30 --fake`
-**0.3 ctx switches/s** (was 47–50), CPU 0.000 %, RSS 6.13 MB, 0.12–0.20 dgrams/s (black + keepalive);
-65 s run: reopen every ~30 s, no warnings. Playing 5–6 s of digital silence to the default sink
-from a separate client (inaudible) woke the stream: 47–48 windows/s, 40 renders/s; it went quiet
-again when that client stopped. Sink running (silent playback) S3-like: 47.6 ctx/s, 0.44 % CPU,
-6.26 MB. Pause → stream closed, razer OFF ×2; resume → reopen; stop → exit in 14 ms.
-System-wide: the USB DAC and the PipeWire graph can now suspend while `gowl music` idles.
-**Not verified here:** reaction to real music (the human: `gowl music`, start/stop a song).
-**Revisit-if.** A PipeWire update keeps passive streams from resuming (music would stay dark);
-the fix is to drop the flag (one constant in pulse.rs).
-
-## D-053 — Release profile opt-level "s" (2026-10-17, phase 5, perf agent)
-ARCHITECTURE.md asked to try `"s"` against `3` and keep whichever measures better on CPU.
-**Evidence** (same desktop, fake device, `perf stat` over 20 s of S1, two alternating runs each):
-task-clock 62.5 / 62.8 ms (`3`) vs **58.2 / 59.4 ms** (`"s"`), user cycles 53.0M / 53.8M vs 51.1M / 50.7M.
-Music benches (`cargo test --release --lib -- --ignored bench`): render+AutoGain 41–43 vs 49 ns/frame
-(flow), 191–196 vs 184 ns (wave), 130 vs 171 ns (auto); window+FFT 3.55–3.84 vs 3.24 µs — all noise
-at ≤ 47 windows/s (≤ 0.02 % of a core). All 86 tests (vectors included) pass at `"s"`. Binary
-**743,016 → 640,616 B**; S1 RSS 8.84 → 8.55 MB (the binary's mapped text 600 → 560 KB).
-**Decision.** `opt-level = "s"`. **Revisit-if.** A profile shows a hot loop losing vectorization.
-Not tried, with reasons: `target-cpu=native` (user code is ~20 % of gowl's CPU, the rest is kernel time
-in poll/recvmsg/sendmsg; and the RPM must stay portable); `MADV_HUGEPAGE` on the SHM buffer
-(`shmem_enabled = never` on this kernel, and a huge page would map 2 MB per touched sample → more
-RSS); `MAP_POPULATE` (maps all 19.8 MB → RSS up, nothing saved per frame).
 
 ## D-050 — Capture path for D-019: stay on wlr-screencopy SHM; DMA-BUF needs libgbm sign-off (2026-10-17, phase 5, perf agent)
 **Context.** D-019: niri pays ≈ 14 % of a core (Phase 2) for 30 fps SHM screencopy of 3440x1440;
@@ -611,3 +554,157 @@ and `perf report -i /tmp/niri-gowl.perf --no-children --sort dso,sym --stdio | h
 will help and only a lower or adaptive capture rate does.
 **Revisit-if.** niri ships ext-image-copy-capture, the GPU/driver changes (Mesa: retry udmabuf — the
 reverted patch is described above), or the human accepts a slower idle capture rate.
+
+## D-051 — Screen capture: two wakeups per frame (prepare + held fd) (2026-10-17, phase 5, perf agent)
+Supersedes D-018. **Context.** S1 measured 90.7 wakeups/s at 30 fps (3/frame: timer → `capture_output`;
+offers → `copy_with_damage`; `ready`), budget ≤ 2·fps. D-018 rejected sending the copy speculatively
+(a buffer that no longer matches is the fatal `invalid_buffer` error). **Decision.** On `ready`, if the
+next slot is in the future, gowl sends `capture_output` for the *next* frame at once (`Capture::prepare`)
+but holds the copy; while a prepared frame waits for its slot the Wayland fd is left out of the poll set
+(`Capture::held`), so niri's offers sit in the socket instead of waking us. The timer wakeup then
+dispatches everything pending (offers, output events) and sends `copy_with_damage` immediately — the copy
+still follows its own `buffer_done`, so no protocol risk. The last frame's damage/flags are reset only
+when the next copy is sent, so it stays fully readable while the next frame is negotiated. Output
+events are seen up to one frame interval (33 ms) later while held; pause cancels the held frame; a
+`failed`/lost output for it is handled at the timer like before. If the offers are not in yet at the
+timer (slow compositor), the copy goes out on `buffer_done` as before (3 wakeups that frame).
+**Evidence** (same desktop, fake device, 30 s, `measure.py screen 30 --fake`): wakeups 90.7 → **60.5/s**
+(debug line: wayland 30 + timer 30 per second); `perf stat` task-clock 107.2 → **90.2 ms per 30 s**
+(0.357 → 0.301 % of a core); niri Δ unchanged (≈ 21 %, see D-050). Test: tests/capture_alloc.rs
+`prepare_holds_the_copy_and_keeps_the_last_frame` (offers arrive, no copy until `request_next`, last
+frame's pixels and damage intact, cancel while held).
+**Revisit-if.** A compositor sends something time-critical on the Wayland socket (none of the
+interfaces gowl binds has a ping).
+
+## D-052 — Passive music stream (auto-suspend friendly) (2026-10-17, phase 5, perf agent)
+Supersedes D-034's "keep the monitor stream active". **Context.** D-034 kept the stream active
+because the light's razer timeout was unknown; D-046 measured it: the H6609 holds stream mode for at
+least 8 s, keepalive_ms = 5600, and the D-048 stall guard resends every 1.25 × keepalive (7 s) when
+windows stop. **Decision.** Record with `PA_STREAM_DONT_INHIBIT_AUTO_SUSPEND`. On a suspended sink
+the stream stays CREATING (D-034's observation), so `Pulse::open` returns once the stream is
+requested and `Capture::read` waits in the hooked mainloop (signals, timer, netlink stay live; no
+`pa_stream_peek` while CREATING — it returns "Bad state"). libpulse times the pending create out
+after ~30 s → `ReadError::Expired` → quiet reopen (not a warning, no razer re-ON). No window within
+1 s of opening → one black frame (what silence renders to: the light is in stream mode and dark, as
+in legacy's idle music mode); keepalives repeat it. No window for 30 s → reopen, so a changed default
+sink is still picked up although a suspended sink delivers no zero windows to count (deadline
+quantised to whole seconds so windows don't re-arm the timerfd).
+**Evidence** (live PipeWire 1.6.9, loopback receiver, nothing playing): `measure.py music 30 --fake`
+**0.3 ctx switches/s** (was 47–50), CPU 0.000 %, RSS 6.13 MB, 0.12–0.20 dgrams/s (black + keepalive);
+65 s run: reopen every ~30 s, no warnings. Playing 5–6 s of digital silence to the default sink
+from a separate client (inaudible) woke the stream: 47–48 windows/s, 40 renders/s; it went quiet
+again when that client stopped. Sink running (silent playback) S3-like: 47.6 ctx/s, 0.44 % CPU,
+6.26 MB. Pause → stream closed, razer OFF ×2; resume → reopen; stop → exit in 14 ms.
+System-wide: the USB DAC and the PipeWire graph can now suspend while `gowl music` idles.
+**Corrected by D-054:** the evidence above used a digital-silence client, which hid that a loud
+frame stayed frozen for ~31 s when audio stopped abruptly (the passive stream then delivers nothing).
+**Not verified here:** reaction to real music (the human: `gowl music`, start/stop a song).
+**Revisit-if.** A PipeWire update keeps passive streams from resuming (music would stay dark);
+the fix is to drop the flag (one constant in pulse.rs).
+
+## D-053 — Release profile opt-level "s" (2026-10-17, phase 5, perf agent)
+ARCHITECTURE.md asked to try `"s"` against `3` and keep whichever measures better on CPU.
+**Evidence** (same desktop, fake device, `perf stat` over 20 s of S1, two alternating runs each):
+task-clock 62.5 / 62.8 ms (`3`) vs **58.2 / 59.4 ms** (`"s"`), user cycles 53.0M / 53.8M vs 51.1M / 50.7M.
+Music benches (`cargo test --release --lib -- --ignored bench`): render+AutoGain 41–43 vs 49 ns/frame
+(flow), 191–196 vs 184 ns (wave), 130 vs 171 ns (auto); window+FFT 3.55–3.84 vs 3.24 µs — all noise
+at ≤ 47 windows/s (≤ 0.02 % of a core). All 86 tests (vectors included) pass at `"s"`. Binary
+**743,016 → 640,616 B**; S1 RSS 8.84 → 8.55 MB (the binary's mapped text 600 → 560 KB).
+**Decision.** `opt-level = "s"`. **Revisit-if.** A profile shows a hot loop losing vectorization.
+Not tried, with reasons: `target-cpu=native` (user code is ~20 % of gowl's CPU, the rest is kernel time
+in poll/recvmsg/sendmsg; and the RPM must stay portable); `MADV_HUGEPAGE` on the SHM buffer
+(`shmem_enabled = never` on this kernel, and a huge page would map 2 MB per touched sample → more
+RSS); `MAP_POPULATE` (maps all 19.8 MB → RSS up, nothing saved per frame).
+
+## D-054 — Music: black ~1 s after the last window; quiet restarts back off (2026-10-17, phase 5 review, perf agent)
+**Bug (review, blocking).** With the passive stream (D-052), PipeWire suspends the sink when a song is
+paused or the default sink changes, so windows simply stop. `black_at` was cleared by the first window
+and only armed again at a reopen, so the D-048 stall guard kept resending the last *loud* frame until
+the 30 s quiet reopen — the light froze for ~31 s. My D-052 check played digital silence, which renders
+to black by itself, so it could not show this.
+**Fix.** `audio::run::Quiet` (pure, unit-tested) tracks the last window and the last window with sound.
+Black is due 1.0–1.5 s after the *last* window (deadline on a 0.5 s grid, so windows arriving 47×/s
+don't re-arm the timerfd; while music plays this also replaces the per-send re-arm of the stall
+guard as the earliest deadline); `Music::blank` sends black once (the gate skips devices already black)
+and resets the smoothers so playback fades in from black like the light. After a rebind / moved
+device while quiet and black, black is sent again at once (review item 3: razer ON had reset the gate
+and left the light without a frame).
+**Quiet restarts (review question c).** A stream that hears no *sound* (no windows, or only digital
+silence) for 30 s is restarted to follow a changed default sink (`@DEFAULT_MONITOR@` is resolved when
+the stream is created); the interval now doubles 30 → 60 → 120 → 240 → 300 s while it stays quiet and
+resets on sound. Restarts — and libpulse's ~30 s expiry of a never-started passive stream, which can't
+be lengthened — reuse the existing connection (`Capture::restart`: new stream, same context), so idle
+music no longer makes a new pulse connection twice a minute. A sound server that is down is retried
+after 1 s, doubling to 30 s (review item 15), reset when connected.
+**Evidence.** tests/music_idle.rs: a loud 80 Hz tone through the real `Music` pipeline to a loopback
+receiver, then no windows: exactly one black frame 1.0–1.6 s after the last window (fails on the old
+code: nothing for 30 s); back-off sequence 30/60/120/240/300 s and reset on sound. Live (PipeWire 1.6.9,
+isolated pidfile, fake device): a −50 dBFS 60 Hz tone from a second client lit the light (13 frames),
+stopped abruptly → black datagram **1.06 s** later, then only keepalives.
+
+## D-055 — Screen review/audit fixes: memfd freed on pause, syscall trims, held-poll guard (2026-10-17, phase 5 review, perf agent)
+- **Capture memfd freed on pause and output lost** (audit 11): `Capture::release` = cancel + destroy
+  `wl_buffer`/pool + munmap; the next frame reallocates. gowl's RSS/PSS hide this buffer — niri's PSS
+  carries most of it and /proc/meminfo `Shmem` rises by its size. Live: Shmem −19,352 kB on pause,
+  +19,416 kB on resume, −19,356 kB on exit; gowl RSS 8.75 → 3.18 MB paused.
+- **Syscall trims** (audit 12): `Conn::fill` marks the socket drained after a short read without fds
+  (a stream socket returns everything queued) and the dispatch loop stops there instead of reading to
+  EAGAIN; the post-`prepare` dispatch is gone (it always found nothing — the offers are read at the
+  timer wakeup while the fd is held, so nothing is left unread); `Timer::drain` no longer reads the
+  timerfd: every loop re-arms before polling, and the forced `timerfd_settime` (even to "disarmed")
+  clears the expiry. Not done: "arm to now + interval at the timer wake so the `ready` re-arm is a
+  no-op" — on a static screen (S2) the copy blocks, so the capture slot must not be armed while a copy
+  is pending (it would wake every interval for nothing); with the drain change the timer wake has to
+  call settime anyway, so the saving would be nil.
+- **Held fd only while a capture deadline is armed** (review 2): `held = cap_dl.is_some() &&
+  cap.held()`, so paused / output-gone / no-slot states always poll the Wayland fd (errors, hang-up,
+  output events never wait).
+- **y_invert (review question a).** `flags` belongs to a frame object and is sent after the copy in
+  practice (wlroots, niri), but nothing forbids sending it earlier. It is now recorded per frame object
+  (`next_y_invert`, reset when a new frame is negotiated) and becomes the frame's `y_invert` at `ready`,
+  so the last frame keeps its own flag while the next one is prepared and an early `flags` is never lost.
+  Damage stays reset at copy time (damage events only follow a copy).
+- **`failed` in the widened gap (review question b).** tests/screen_mock.rs
+  `failed_while_held_backs_off_and_recovers`: the mock sends `failed` right after `buffer_done` of the
+  prepared frame (before any copy); gowl reads it at the timer wakeup, logs "capture failed; retrying",
+  backs off 100 ms, and capture resumes (≥ 20 frames in the next second, "works again after 1 failure").
+- **Allocation test drives the production path** (review 4): `capture_alloc` / `alloc_steady_state`
+  now go through `prepare` → held → offers read at the "timer" → `request_next`.
+
+## D-056 — Netlink: link changes of unused interfaces are filtered in the kernel (2026-10-17, phase 5 audit, perf agent)
+**Context (audit 13).** The idle Wi-Fi `wlp4s0` randomises its MAC; every RTM_NEWLINK woke gowl and
+started a debounce + re-selection, even while paused. **Decision.** A classic BPF program on the netlink
+socket (`SO_ATTACH_FILTER`) drops RTM_NEWLINK/DELLINK whose `ifi_index` is not one of the interfaces the
+devices are bound to; address and route messages always pass (a new LAN address elsewhere may be the
+new path). The same check runs in user space (`netwatch::relevant`) before the debounce. The filter is
+rebuilt only when a binding changes (`Streams::links_gen`, checked in `Ctl::net_deadline`); while a
+device has no LAN interface every link change counts. **Tests:** `relevant` classification; the BPF
+program run in the kernel on a unix datagram socket with crafted messages (foreign link change dropped,
+bound link / address / route pass). netns `--bin` PASS (rebind 0.51 s). S4 stays at 0 wakeups.
+
+## D-057 — Idle capture rate: 5 fps once the edges stop changing (2026-10-17, phase 5, perf agent)
+**Context.** D-050: niri's cost is per capture and the human accepted "up to ~200 ms more latency on the
+first reaction after a calm spell" (option 5, yes). **Decision.** `idle_fps` (default 5; 0 or ≥ `fps` =
+off) and `idle_after_ms` (default 1000). Each group keeps an *anchor* target; a frame whose target moves
+more than `threshold` on any channel from the anchor is a change (slow drifts add up and count too).
+After `idle_after_ms` without a change the next capture slot is `1/idle_fps` after the last request;
+the first changed frame switches back to `1/fps` for the very next slot. Only the slot length changes —
+no extra wakeups, no allocation, keepalive and smoothing untouched. **Tests:** tests/screen_mock.rs
+`idle_capture_rate_drops_and_recovers` (mock keeps completing copies with unchanged pixels): 30 → 5 →
+30 copies/s, first changed frame within 0.3 s. **Evidence (niri):** see BUDGETS Phase 5 summary.
+
+## D-058 — Smoothing steps that can't send are deferred, not timed (2026-10-17, phase 5 audit, perf agent)
+**Context (audit 14).** After a color change the EMA keeps stepping on the timer (D-017) until it is
+exactly settled, ~8 wakeups per change whose output the gate never sends. **Decision.** After each step,
+if every unsettled group's target is within the threshold of what each of its devices last sent, the
+remaining steps can't send: the output moves monotonically from the current output (within the
+threshold of the last sent frame, by the gate) toward the target. Then `step_at` is not armed; the
+steps run later at their scheduled times (`Pipeline::catch_up`) before the next frame, timer
+(keepalive) or live resend, so the smoother state, every pushed frame and every keepalive are the same
+as before. Pause applies the steps due before it; resume resends first and lets an overdue step follow
+(as the old timer did). **Proof:** tests/smoothing_wire.rs runs a scripted screen (changes, a sub-
+threshold change, a change mid-fade, static spells with keepalives, pause/resume, a slow drift)
+through the real pipeline with timer steps (`lazy_ok = false`) and with deferral, on a simulated clock,
+for smoothing 0.05/0.3/0.55/1.0 × threshold 1/3/8 × keepalive 0/500/5600: every datagram (bytes and
+time) identical in all 36 runs, 5,546 timer wakeups saved; forcing deferral unconditionally makes the
+test fail. Vectors unchanged (the EMA math is untouched).

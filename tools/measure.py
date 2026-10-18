@@ -2,7 +2,8 @@
 """Budget measurement harness for gowl (see docs/BUDGETS.md).
 
 Reads /proc directly — no sysstat, no root. Measures gowl and niri over a window:
-CPU % of one core, context switches/s (≈ wakeups), RSS/HWM, threads, mapped libs,
+CPU % of one core (exact, from /proc/PID/task/*/schedstat), context switches/s (≈ wakeups),
+RSS/HWM, system Shmem (the capture memfd is charged there, not to gowl), threads, mapped libs,
 and — with --fake — datagrams and bytes the device received.
 
     python3 tools/measure.py screen 30                  # against the configured device
@@ -28,7 +29,6 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE = os.sysconf("SC_PAGE_SIZE")
 
 
@@ -43,9 +43,24 @@ def find_pid(comm: str) -> int | None:
     return None
 
 
-def cpu_ticks(pid: int) -> int:
-    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-    return int(fields[11]) + int(fields[12])  # utime + stime
+def cpu_ns(pid: int) -> int:
+    """CPU time in ns from /proc/PID/schedstat (sum_exec_runtime, all threads of the
+    task group leader's process via /proc/PID/task/*). Exact, unlike the 10 ms ticks
+    of /proc/PID/stat."""
+    total = 0
+    for task in Path(f"/proc/{pid}/task").iterdir():
+        try:
+            total += int((task / "schedstat").read_text().split()[0])
+        except OSError:
+            pass
+    return total
+
+
+def shmem_kb() -> int:
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        if line.startswith("Shmem:"):
+            return int(line.split()[1])
+    return 0
 
 
 def ctx_switches(pid: int) -> int:
@@ -141,17 +156,19 @@ def main() -> int:
                 time.sleep(1.0)
 
         pids = {"gowl": lumi.pid if lumi else None, "niri": niri}
-        start = {n: (cpu_ticks(p), ctx_switches(p)) for n, p in pids.items() if p}
+        shm0 = shmem_kb()
+        start = {n: (cpu_ns(p), ctx_switches(p)) for n, p in pids.items() if p}
         pk0 = counter.snapshot() if counter else (0, 0, 0)
         t0 = time.monotonic()
         time.sleep(a.seconds)
         dt = time.monotonic() - t0
-        end = {n: (cpu_ticks(p), ctx_switches(p)) for n, p in pids.items() if p}
+        end = {n: (cpu_ns(p), ctx_switches(p)) for n, p in pids.items() if p}
+        shm1 = shmem_kb()
         pk1 = counter.snapshot() if counter else (0, 0, 0)
 
         rows = {}
         for n in start:
-            cpu = (end[n][0] - start[n][0]) / CLK_TCK / dt * 100
+            cpu = (end[n][0] - start[n][0]) / 1e9 / dt * 100
             cs = (end[n][1] - start[n][1]) / dt
             rows[n] = (cpu, cs)
 
@@ -163,7 +180,8 @@ def main() -> int:
             rss, hwm = status_kb(lumi.pid, "VmRSS"), status_kb(lumi.pid, "VmHWM")
             threads = status_kb(lumi.pid, "Threads")
             libs = mapped_libs(lumi.pid)
-            print(f"gowl  RSS {rss/1024:.2f} MB  HWM {hwm/1024:.2f} MB  threads {threads}")
+            print(f"gowl  RSS {rss/1024:.2f} MB  HWM {hwm/1024:.2f} MB  threads {threads}  "
+                  f"(system Shmem {shm1/1024:.1f} MB, {(shm1-shm0)/1024:+.1f} MB during the window)")
             print(f"gowl  mapped libs: {', '.join(libs)}")
             if a.mode != "music" and any("pulse" in l for l in libs):
                 print("WARNING: libpulse mapped outside music mode (dlopen not lazy?)")

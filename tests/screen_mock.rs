@@ -319,8 +319,14 @@ fn output_unplug_and_replug() {
     assert!(err.contains("output gone"), "{err}");
     assert!(err.contains("is back"), "{err}");
     assert!(h.frames(0.0, 1.5) >= 5, "{:?}", h.log);
-    // Unplugged: razer OFF ×2, then nothing — no keepalives, no fade steps.
-    assert_eq!(h.kinds(1.5, 3.0), [&Kind::Off, &Kind::Off], "{:?}", h.log);
+    // Unplugged: razer OFF ×2, then nothing — no keepalives, no fade steps. (A
+    // keepalive due in the few ms before the mock's removal lands may precede them.)
+    let unplugged: Vec<&Kind> = h
+        .kinds(1.5, 3.0)
+        .into_iter()
+        .skip_while(|k| **k == Kind::Frame)
+        .collect();
+    assert_eq!(unplugged, [&Kind::Off, &Kind::Off], "{:?}", h.log);
     // Replugged: razer ON first, then frames from the new output.
     let back = h.kinds(3.0, 4.0);
     assert_eq!(back.first(), Some(&&Kind::On), "{:?}", h.log);

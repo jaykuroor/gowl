@@ -42,7 +42,8 @@ and — with `--fake` — datagrams/s and bytes/frame as received by `tools/fake
 It prints a ready-to-paste row for the results log below.
 For real devices, count datagrams with `sudo tcpdump -i any -n udp dst port 4003` (ask
 first), or run with `GOWL_LOG=debug`, which prints a once-per-second send counter.
-Allocation count: `cargo test --release --features count-alloc -- --ignored alloc_steady_state`.
+Allocation count: `cargo test --release --test capture_alloc -- --ignored alloc_steady_state`
+(the test has its own counting allocator; `--features count-alloc` is only for the live debug line).
 Frame → sendto latency: `cargo test --release --test latency -- --ignored --nocapture`.
 S2 on the gowl side (mock compositor that stops completing copies):
 `cargo test --release --test screen_mock -- --ignored s2 --nocapture`.
@@ -50,6 +51,38 @@ Precise CPU without tick rounding: `perf stat -e task-clock,context-switches -p 
 (own processes are allowed at `perf_event_paranoid = 2`).
 Profiling: `perf record -g ./target/release/gowl screen` (needs `perf`, ask first);
 build with `CARGO_PROFILE_RELEASE_DEBUG=true CARGO_PROFILE_RELEASE_STRIP=false` for symbols.
+
+## Phase 5 review + audit round (2026-10-17, branch head after D-054..D-058; fake device, temp config with
+keepalive_ms = 5600 + the calibrated layout, isolated pidfile because the human's own `gowl screen` (main build)
+was running the whole time — so niri's numbers here include *its* capture too; CPU now from
+/proc/PID/task/*/schedstat, exact)
+
+| Scenario | gowl CPU % | Wakeups/s | RSS MB | Shmem | niri | Notes |
+|---|---|---|---|---|---|---|
+| S1 screen 30 fps, edges static (desktop calm at the time) | 0.008 | 1.3 | 8.61 | — | 22.8 vs S0 17.6–17.9 (Δ ≈ 5: the pending damage copy, D-050) | copies block; keepalive 0.17 dgrams/s |
+| S1, desktop animated, idle 5 fps vs off (2 paired rounds, 30 s) | 0.175 / 0.118 vs 0.217 / 0.289 | 39.4 / 28.8 vs 44.7 / 61.8 | — | — | 46.5 / 44.2 vs 46.7 / 52.8 | desktop load changed between runs: inconclusive for niri; human to re-run (commands in the report) |
+| S1 later, edges static, idle 5 fps vs off (8 paired rounds, 12 s) | ≈ 0.009 vs ≈ 0.008 | 1.0–2.1 vs 0.7–1.6 | — | — | 22.3–25.4 vs 21.4–23.3 | idle rate can't help when copies block anyway |
+| S4 paused 30 s | 0.000 | **0.0** | **3.05** (was 8.4) | capture memfd freed: **−19,352 kB** on pause, +19,416 on resume (screen_pause probe) | = S0 | D-055 |
+| S3 music idle (nothing playing), 40 s | 0.002 | **0.2** | 6.08 | — | — | black + keepalive 0.12 dgrams/s; quiet restarts back off (D-054) |
+| mock compositor, idle rate | — | — | — | — | — | copies/s 30 → 5 → 30, first changed frame < 0.3 s (`idle_capture_rate_drops_and_recovers`) |
+| smoothing deferral (D-058) | — | 5,546 timer wakeups saved over 36 simulated scripts | — | — | — | wire identical (`smoothing_wire`) |
+| binary (stripped) | — | — | — | — | — | **652,904 B** (+12 KB: idle rate, netlink filter, Quiet, release) |
+
+Corrections to the summary below (audit 16):
+- **User vs kernel:** user code ≈ 54 % of gowl's CPU on a busy desktop (auditor, utime/stime), not 20 %.
+- **niri's extra cost depends on the desktop:** 13.5–21 points at 30 fps on an animated desktop (auditor and
+  me), ≈ 5 while copies are pending on a calm one, 0 paused. The "≈ 21" in the summary is the top of the range.
+- **Precise CPU:** `tools/measure.py` now reads /proc/PID/task/*/schedstat (ns) instead of 10 ms ticks, and
+  prints system Shmem, where the capture memfd is charged (gowl's RSS/PSS hide most of it; niri's PSS
+  carries it). gowl's true memory cost while capturing is RSS + ≈ 19.35 MB of shared capture buffer.
+- **libpulse (music):** ≈ 94 calloc+free pairs per second inside libpulse's mainloop/stream code (not gowl
+  code; rule 4 covers gowl's hot path, which stays at 0 — tests/alloc_music.rs). Besides libpulse itself, 15 more
+  libraries come with it in music mode (libpulsecommon, which pulls in libsndfile and its codecs libFLAC,
+  libogg, libvorbis, libvorbisenc, libopus, libmpg123, libmp3lame, libgsm, plus libasyncns, libdbus-1,
+  libsystemd, libxcb, libXau) ≈ 2.4 MB RSS / 0.75 MB PSS. Unavoidable with libpulse (they are its NEEDED
+  libs); screen mode never maps them (dlopen in music only).
+- Syscalls on the S1 hot path (auditor's count): ≈ 360 → 240/s, recvmsg 150 → 60/s, timerfd reads 30 → 0
+  (D-055). `perf trace`/syscall tracepoints are not readable here (tracefs root-only), so I could not recount.
 
 ## Phase 5 summary (2026-10-17, final code = commit f997638 + docs; fake device, temp config with the
 human's keepalive_ms = 5600 and calibrated layout; same desktop for every row — it was *not* idle: niri
@@ -76,8 +109,9 @@ static linking would drop the library pages but breaks `dlopen` for music; MADV_
 shmem fault-around (Phase 2); MADV_HUGEPAGE has no effect (`shmem_enabled = never`). Ceiling met.
 
 ### Profile (prompt step 3) — `perf record -e cycles:u --call-graph dwarf` on gowl, S1, 60 s (515 samples)
-`perf stat`: task-clock 194 ms / 60 s (0.32 %), user cycles 163M → **user code ≈ 20 % of gowl's CPU; the
-rest is kernel time** (poll / recvmsg / sendmsg / timerfd, 2 wakeups per frame). Top user symbols:
+`perf stat`: task-clock 194 ms / 60 s (0.32 %), user cycles 163M. **Correction (audit):** I divided user
+cycles by an assumed clock; the auditor's utime/stime split on a busy desktop gives **user code ≈ 54 % of
+gowl's CPU**, the rest kernel time (poll / recvmsg / sendmsg / timerfd, 2 wakeups per frame). Top user symbols:
 1. `Sampler::run::<Xrgb8888>` (inlined into `run_screen`) — 63–75 % of user samples (≈ 6.4k scattered
    pixel loads per fully dirty frame; 23.6 µs p50 in the latency bench)
 2. `screen_loop` body — 5 %
