@@ -2,6 +2,12 @@
 name = "gowl"
 version = "0.1.0"
 edition = "2024"
+description = "Lightweight Govee screen and music sync for Linux and Wayland, over the local network only"
+license = "MIT"
+repository = "https://github.com/jaykuroor/gowl"
+readme = "README.md"
+keywords = ["govee", "wayland", "niri", "ambilight", "music-sync"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 libc = { version = "0.2.191", default-features = false }

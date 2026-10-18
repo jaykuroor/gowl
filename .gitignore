@@ -3,3 +3,13 @@
 __pycache__/
 /legacy/
 /.claude/worktrees/
+
+# development / AI-assistant files (kept locally, not published)
+/CLAUDE.md
+/AGENTS.md
+/PROMPT.md
+/PROGRESS.md
+/UPDATE_001_NETWORK.md
+/prompts/
+/.claude/
+/dist/
