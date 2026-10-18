@@ -307,6 +307,9 @@ pub struct Streams {
     reselect_at: Option<u64>,
     backoff: usize,
     verify: Option<Verify>,
+    /// Bumped whenever a device's bound interface (or "no LAN") changes, so `Ctl`
+    /// re-filters link notifications for the new set (D-056).
+    pub links_gen: u64,
 }
 
 impl Streams {
@@ -368,6 +371,7 @@ impl Streams {
             reselect_at: None,
             backoff: 0,
             verify: None,
+            links_gen: 1,
         })
     }
 
@@ -454,6 +458,18 @@ impl Streams {
         }
     }
 
+    /// Interface indices the devices are bound to; `None` if a device has no LAN
+    /// interface (then every link change matters). Setup / rebind only (allocates).
+    pub fn link_indices(&self) -> Option<Vec<u32>> {
+        if self.devs.iter().any(|s| s.no_lan) {
+            return None;
+        }
+        let mut v: Vec<u32> = self.devs.iter().map(|s| s.iface.index).collect();
+        v.sort_unstable();
+        v.dedup();
+        Some(v)
+    }
+
     /// Earliest keepalive deadline (ms), if keepalive is on and anything was sent.
     pub fn keepalive_due_ms(&self) -> Option<u64> {
         if self.keepalive_ms == 0 {
@@ -516,6 +532,7 @@ impl Streams {
                     if !s.no_lan {
                         warn!("{}: {e}; waiting for the network to come back", s.label);
                         s.no_lan = true;
+                        self.links_gen += 1;
                     }
                     continue;
                 }
@@ -562,6 +579,7 @@ impl Streams {
                 s.razer(true);
             }
             changed = true;
+            self.links_gen += 1;
         }
         if !verify.is_empty() && self.verify.is_none() {
             // One interface per verification run (several LANs at once is rare).
@@ -736,8 +754,17 @@ impl Ctl {
         self.net.as_ref().map_or(-1, NetWatch::fd)
     }
 
-    /// Earliest network deadline: netlink debounce or `streams`' own.
-    pub fn net_deadline(&self, streams: &Streams) -> Option<u64> {
+    /// Earliest network deadline: netlink debounce or `streams`' own. Also keeps the
+    /// link-notification filter in step with the interfaces `streams` is bound to
+    /// (cheap check; rebuilt only after a rebind, D-056).
+    pub fn net_deadline(&mut self, streams: &Streams) -> Option<u64> {
+        if let Some(w) = &mut self.net
+            && w.links_gen != streams.links_gen
+        {
+            w.links_gen = streams.links_gen;
+            let links = streams.link_indices();
+            w.set_links(links.as_deref());
+        }
         min_opt(
             self.net.as_ref().and_then(|w| w.debounce.due()),
             streams.net_deadline(),

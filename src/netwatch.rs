@@ -62,6 +62,71 @@ pub struct NetWatch {
     pub debounce: Debounce,
     /// Readable events seen (debug line).
     pub events: u64,
+    /// Link changes only count for these interface indices (`None` = all).
+    links: Option<Vec<u32>>,
+    /// `Streams::links_gen` the filter was built for (0 = none yet).
+    pub links_gen: u64,
+}
+
+const RTM_NEWLINK: u16 = 16;
+const RTM_DELLINK: u16 = 17;
+/// `ifinfomsg.ifi_index` offset in a link message (nlmsghdr 16 + family/pad/type 4).
+const IFI_INDEX_OFF: usize = 20;
+
+/// Is this datagram's content a change gowl cares about? Link messages only for the
+/// interfaces in `links`; address and route messages always (a new LAN address on
+/// another interface may be the new path).
+pub fn relevant(buf: &[u8], links: Option<&[u32]>) -> bool {
+    let Some(links) = links else { return true };
+    let mut off = 0usize;
+    while off + 16 <= buf.len() {
+        let len = u32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
+        let ty = u16::from_ne_bytes([buf[off + 4], buf[off + 5]]);
+        if len < 16 || off + len > buf.len() {
+            return true; // malformed: don't risk missing a change
+        }
+        match ty {
+            RTM_NEWLINK | RTM_DELLINK => {
+                let i = off + IFI_INDEX_OFF;
+                if len < IFI_INDEX_OFF + 4 {
+                    return true;
+                }
+                let idx = u32::from_ne_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
+                if links.contains(&idx) {
+                    return true;
+                }
+            }
+            _ => return true,
+        }
+        off += (len + 3) & !3;
+    }
+    false
+}
+
+/// Classic BPF for the netlink socket: drop link messages (RTM_NEWLINK/DELLINK)
+/// for interfaces not in `links`, accept everything else. Dropped in the kernel, so
+/// e.g. an idle Wi-Fi's MAC randomisation never wakes gowl. Loads are big-endian
+/// while netlink is host-endian, hence the byte-swapped constants.
+pub fn link_filter(links: &[u32]) -> Vec<libc::sock_filter> {
+    const LD_H_ABS: u16 = 0x28;
+    const LD_W_ABS: u16 = 0x20;
+    const JEQ_K: u16 = 0x15;
+    const RET_K: u16 = 0x06;
+    let ins = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
+    let be16 = |v: u16| u32::from(u16::from_be_bytes(v.to_ne_bytes()));
+    let be32 = |v: u32| u32::from_be_bytes(v.to_ne_bytes());
+    let n = links.len().min(200);
+    let mut p = Vec::with_capacity(n + 6);
+    p.push(ins(LD_H_ABS, 0, 0, 4)); // 0: nlmsg_type
+    p.push(ins(JEQ_K, 1, 0, be16(RTM_NEWLINK))); // 1: → 3
+    p.push(ins(JEQ_K, 0, (n + 2) as u8, be16(RTM_DELLINK))); // 2: → 3, else accept
+    p.push(ins(LD_W_ABS, 0, 0, IFI_INDEX_OFF as u32)); // 3: ifi_index
+    for (i, &l) in links[..n].iter().enumerate() {
+        p.push(ins(JEQ_K, (n - i) as u8, 0, be32(l))); // → accept
+    }
+    p.push(ins(RET_K, 0, 0, 0)); // drop
+    p.push(ins(RET_K, 0, 0, 0xffff_ffff)); // accept
+    p
 }
 
 impl NetWatch {
@@ -99,6 +164,8 @@ impl NetWatch {
             fd,
             debounce: Debounce::default(),
             events: 0,
+            links: None,
+            links_gen: 0,
         })
     }
 
@@ -106,9 +173,54 @@ impl NetWatch {
         self.fd.as_raw_fd()
     }
 
-    /// The fd is readable: drain it and (re)start the debounce.
+    /// Only link changes of these interfaces count (`None` = all): an in-kernel
+    /// filter plus the same check here (D-056). Rebind / setup only.
+    pub fn set_links(&mut self, links: Option<&[u32]>) {
+        let r = match links {
+            Some(l) => {
+                let prog = link_filter(l);
+                let fp = libc::sock_fprog {
+                    len: prog.len() as u16,
+                    filter: prog.as_ptr().cast_mut(),
+                };
+                // SAFETY: SO_ATTACH_FILTER copies the program; `prog` outlives the call.
+                unsafe {
+                    libc::setsockopt(
+                        self.fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_ATTACH_FILTER,
+                        (&fp as *const libc::sock_fprog).cast(),
+                        mem::size_of::<libc::sock_fprog>() as libc::socklen_t,
+                    )
+                }
+            }
+            // SAFETY: plain setsockopt; ENOENT if no filter was attached (ignored).
+            None => unsafe {
+                libc::setsockopt(
+                    self.fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_DETACH_FILTER,
+                    std::ptr::null(),
+                    0,
+                );
+                0
+            },
+        };
+        if r != 0 {
+            debug!(
+                "netlink link filter not attached: {}",
+                io::Error::last_os_error()
+            );
+        }
+        debug!("netlink: link changes count for interfaces {links:?}");
+        self.links = links.map(<[u32]>::to_vec);
+    }
+
+    /// The fd is readable: drain it and (re)start the debounce if any message is a
+    /// change gowl cares about (see [`relevant`]).
     pub fn on_readable(&mut self, now: u64) {
         let mut buf = [0u8; 8192];
+        let mut hit = false;
         loop {
             // SAFETY: reading into a stack buffer of the stated length.
             let n = unsafe {
@@ -120,19 +232,26 @@ impl NetWatch {
                 )
             };
             if n > 0 {
+                hit |= relevant(&buf[..n as usize], self.links.as_deref());
                 continue;
             }
             if n < 0 {
                 match io::Error::last_os_error().raw_os_error() {
                     // Overrun: changes were lost, which still means "changed".
-                    Some(libc::ENOBUFS) | Some(libc::EINTR) => continue,
+                    Some(libc::ENOBUFS) => {
+                        hit = true;
+                        continue;
+                    }
+                    Some(libc::EINTR) => continue,
                     _ => break,
                 }
             }
             break;
         }
-        self.events += 1;
-        self.debounce.hit(now);
+        if hit {
+            self.events += 1;
+            self.debounce.hit(now);
+        }
     }
 }
 
@@ -284,6 +403,94 @@ impl Verify {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One rtnetlink message: nlmsghdr + 16-byte body (ifinfomsg / ifaddrmsg-ish).
+    fn nlmsg(ty: u16, index: u32) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(&32u32.to_ne_bytes()); // len
+        m.extend_from_slice(&ty.to_ne_bytes());
+        m.extend_from_slice(&0u16.to_ne_bytes()); // flags
+        m.extend_from_slice(&[0; 8]); // seq, pid
+        m.extend_from_slice(&[2, 0, 1, 0]); // family, pad, type
+        m.extend_from_slice(&index.to_ne_bytes());
+        m.extend_from_slice(&[0; 8]); // flags, change
+        m
+    }
+
+    #[test]
+    fn only_link_changes_of_bound_interfaces_count() {
+        const NEWADDR: u16 = 20;
+        const NEWROUTE: u16 = 24;
+        let bound = [2u32, 7];
+        assert!(relevant(&nlmsg(RTM_NEWLINK, 2), Some(&bound)));
+        assert!(relevant(&nlmsg(RTM_DELLINK, 7), Some(&bound)));
+        assert!(
+            !relevant(&nlmsg(RTM_NEWLINK, 3), Some(&bound)),
+            "idle Wi-Fi"
+        );
+        assert!(!relevant(&nlmsg(RTM_DELLINK, 3), Some(&bound)));
+        assert!(
+            relevant(&nlmsg(NEWADDR, 3), Some(&bound)),
+            "address: always"
+        );
+        assert!(relevant(&nlmsg(NEWROUTE, 3), Some(&bound)), "route: always");
+        assert!(relevant(&nlmsg(RTM_NEWLINK, 3), None), "no LAN: everything");
+        // Two messages in one datagram: one relevant is enough.
+        let mut two = nlmsg(RTM_NEWLINK, 3);
+        two.extend(nlmsg(RTM_NEWLINK, 7));
+        assert!(relevant(&two, Some(&bound)));
+        let _ = relevant(&[1, 2, 3], Some(&bound)); // short: no panic
+        assert!(relevant(&[0xff; 20], Some(&bound)), "malformed: counts");
+    }
+
+    /// The BPF program does in the kernel what `relevant` does here: run it on a
+    /// unix datagram socket (socket filters apply there too) with crafted messages.
+    #[test]
+    fn kernel_filter_drops_foreign_link_changes() {
+        let mut sv = [0; 2];
+        // SAFETY: socketpair fills two fds we then own.
+        let r = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+                sv.as_mut_ptr(),
+            )
+        };
+        assert_eq!(r, 0);
+        // SAFETY: fresh fds.
+        let (a, b) = unsafe { (OwnedFd::from_raw_fd(sv[0]), OwnedFd::from_raw_fd(sv[1])) };
+        let prog = link_filter(&[2, 7]);
+        let fp = libc::sock_fprog {
+            len: prog.len() as u16,
+            filter: prog.as_ptr().cast_mut(),
+        };
+        // SAFETY: valid program for the call.
+        let r = unsafe {
+            libc::setsockopt(
+                b.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ATTACH_FILTER,
+                (&fp as *const libc::sock_fprog).cast(),
+                mem::size_of::<libc::sock_fprog>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(r, 0, "{}", io::Error::last_os_error());
+        let pass = |m: Vec<u8>| -> bool {
+            // SAFETY: plain send/recv on our sockets and buffers.
+            unsafe {
+                libc::send(a.as_raw_fd(), m.as_ptr().cast(), m.len(), 0);
+                let mut buf = [0u8; 64];
+                libc::recv(b.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) > 0
+            }
+        };
+        assert!(pass(nlmsg(RTM_NEWLINK, 2)));
+        assert!(pass(nlmsg(RTM_NEWLINK, 7)));
+        assert!(!pass(nlmsg(RTM_NEWLINK, 3)), "foreign link change dropped");
+        assert!(!pass(nlmsg(RTM_DELLINK, 3)));
+        assert!(pass(nlmsg(20, 3)), "address change passes");
+        assert!(pass(nlmsg(24, 3)), "route change passes");
+    }
 
     #[test]
     fn debounce_waits_for_quiet_but_not_forever() {

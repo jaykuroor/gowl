@@ -329,8 +329,8 @@ fn line_loop(sess: &mut dyn Session, streams: &mut Streams, ctl: &mut Ctl) -> Re
     ];
     loop {
         let ka = streams.keepalive_due_ms().map(|ms| ms * MS);
-        ctl.timer
-            .arm(runtime::min_opt(ka, ctl.net_deadline(streams)))?;
+        let net_dl = ctl.net_deadline(streams);
+        ctl.timer.arm(runtime::min_opt(ka, net_dl))?;
         pfds[4].fd = streams.verify_fd();
         for p in &mut pfds {
             p.revents = 0;
