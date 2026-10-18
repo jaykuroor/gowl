@@ -243,8 +243,9 @@ pub fn synthetic_frame(h: usize, w: usize) -> Vec<u8> {
 
 /// Never reach the real desktop from a test: put a fake `notify-send` first on
 /// PATH (it appends its argv, fields separated by 0x1f, one line per call, to
-/// `dir/notify.log`) and drop the session bus address (XDG_RUNTIME_DIR points into
-/// the test dir too, so libdbus's fallback misses the real bus).
+/// `dir/notify.log`, and its inherited signal mask and fds to
+/// `dir/notify.proc.log`) and drop the session bus address (XDG_RUNTIME_DIR points
+/// into the test dir too, so libdbus's fallback misses the real bus).
 pub fn fake_desktop<'a>(
     cmd: &'a mut std::process::Command,
     dir: &std::path::Path,
@@ -257,7 +258,26 @@ pub fn fake_desktop<'a>(
         let tmp = bin.join("notify-send.tmp");
         std::fs::write(
             &tmp,
-            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\037' \"$a\"; done >> \"$(dirname \"$0\")/../notify.log\"\necho >> \"$(dirname \"$0\")/../notify.log\"\n",
+            concat!(
+                // Python, not sh: a shell blocks SIGCHLD around its own commands, which
+                // would hide what notify-send really inherited from gowl.
+                "#!/usr/bin/python3 -I\n",
+                "import os, sys\n",
+                "d = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), '..')\n",
+                "with open('/proc/self/status') as f:\n",
+                "    mask = [l.split(':')[1].strip() for l in f if l.startswith('SigBlk')][0]\n",
+                "fds = []\n",
+                "for n in sorted(os.listdir('/proc/self/fd'), key=int):\n",
+                "    try:\n",
+                "        fds.append(n + ' -> ' + os.readlink('/proc/self/fd/' + n))\n",
+                "    except OSError:\n",
+                "        pass  # the listing's own descriptor, closed by now\n",
+                "rec = 'SigBlk:\\t' + mask + '\\n' + ''.join(x + '\\n' for x in fds) + '---\\n'\n",
+                "with open(os.path.join(d, 'notify.proc.log'), 'a') as o:\n",
+                "    o.write(rec)\n",
+                "with open(os.path.join(d, 'notify.log'), 'a') as o:\n",
+                "    o.write(''.join(a + '\\x1f' for a in sys.argv[1:]) + '\\n')\n",
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -295,4 +315,28 @@ pub fn wait_notifications(dir: &std::path::Path, n: usize) -> Vec<Vec<String>> {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+/// Each recorded notify-send's inherited state: (SigBlk hex mask, [(fd, target)]),
+/// leaving out the shell's own descriptor for the script it runs.
+pub fn notify_procs(dir: &std::path::Path) -> Vec<(String, Vec<(u32, String)>)> {
+    let text = std::fs::read_to_string(dir.join("notify.proc.log")).unwrap_or_default();
+    text.split("---\n")
+        .filter(|b| !b.trim().is_empty())
+        .map(|b| {
+            let mut mask = String::new();
+            let mut fds = Vec::new();
+            for l in b.lines() {
+                if let Some(m) = l.strip_prefix("SigBlk:") {
+                    mask = m.trim().to_string();
+                } else if let Some((left, target)) = l.split_once(" -> ") {
+                    let fd = left.split_whitespace().last().unwrap().parse().unwrap();
+                    if !target.ends_with("/notify-send") {
+                        fds.push((fd, target.to_string()));
+                    }
+                }
+            }
+            (mask, fds)
+        })
+        .collect()
 }

@@ -10,8 +10,6 @@
 //! stop (razer OFF ×2). While the sound server is unreachable the stream is retried
 //! every second on the timerfd and the last frame is kept alive.
 
-use std::time::Instant;
-
 use super::bands::{Analyzer, AutoGain, SAMPLE_RATE};
 use super::fft::N;
 use super::pulse::{Capture, HOOK_ALL, Hook, Pulse, ReadError};
@@ -25,6 +23,15 @@ use crate::net::Ports;
 use crate::proto::MAX_SEGMENTS;
 use crate::runtime::{Ctl, Sig, Streams, min_opt, now_ns};
 use crate::state::{Mode, Problem, Writer};
+
+/// The clock the music loop renders, sends and keeps alive on: CLOCK_MONOTONIC in
+/// µs, the same clock as `now_ns()` (keepalive, fade, timerfd). Phase 5 rendered on
+/// `Instant` since loop start, so every sent frame looked ~keepalive old and was
+/// resent at once — every frame twice (review fix, D-064).
+#[inline]
+pub fn render_clock_us() -> u64 {
+    now_ns() / 1000
+}
 
 /// Legacy `max_update_hz` for Govee LAN devices.
 pub const DEVICE_CAP_HZ: u32 = 40;
@@ -45,6 +52,9 @@ const QUIET_REOPEN_NS: u64 = 30 * SEC;
 const QUIET_REOPEN_MAX_NS: u64 = 300 * SEC;
 /// Sound server unreachable: retry after 1 s, doubling to 30 s (D-054).
 const RETRY_MAX_NS: u64 = 30 * SEC;
+/// Sound server unreachable this long (e.g. the session ended under a
+/// toggle-started `gowl music`): give up and exit (D-064).
+pub const SERVER_GONE_EXIT_NS: u64 = 600 * SEC;
 
 /// What the idle bookkeeping wants done at a timer wakeup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -301,7 +311,13 @@ impl Music {
     /// Audio stopped (D-063): fade the last output to black over `fade_ms` with an
     /// ease-out, on timer steps (`fade_due`); `fade_ms = 0` = black now (D-054).
     pub fn fade_start(&mut self, now: u64) {
-        if self.settings.fade_ms == 0 {
+        let dark = self.voices.iter().enumerate().all(|(i, v)| {
+            v.smooth[..self.streams.segments(i)]
+                .iter()
+                .all(|c| *c == [0; 3])
+        });
+        if self.settings.fade_ms == 0 || dark {
+            // Nothing to fade (silence already rendered black): no 33 steps.
             self.blank(now / 1_000_000);
             return;
         }
@@ -495,10 +511,10 @@ fn run_loop(
     let mut failed = false; // the stream broke: razer ON again when it's back
     let mut samples = [0f32; N];
     let interval = music.settings.interval_us();
-    let start = Instant::now();
     let mut next_us = 0u64;
     let mut quiet = Quiet::new(now_ns());
     let mut retry_ns = SEC; // next back-off while the sound server is unreachable
+    let mut down_since: Option<u64> = None; // sound server unreachable since
     let verbose = crate::log::enabled(crate::log::DEBUG);
     let (mut windows, mut renders, mut sends, mut stat_at) = (0u32, 0u32, 0u32, 0u64);
 
@@ -511,7 +527,11 @@ fn run_loop(
         // missed keepalive — windows normally send the keepalive first, so it only
         // fires if the monitor stops delivering (sink suspended, device gone).
         let mut dl = ctl.net_deadline(&music.streams);
-        let ka = music.streams.keepalive_due_ms();
+        // Keepalives only while the light is in stream mode (not after server loss).
+        let ka = music
+            .streams
+            .keepalive_due_ms()
+            .filter(|_| music.streams.live);
         if !paused {
             dl = min_opt(dl, music.fade_due());
         }
@@ -529,6 +549,7 @@ fn run_loop(
             retry_at = None;
             match open_capture(pulse, &hook, SOURCE) {
                 Ok(st) => {
+                    down_since = None;
                     if warned {
                         warn!("audio capture is back");
                         warned = false;
@@ -560,8 +581,23 @@ fn run_loop(
                         warned = true;
                         status.set_problem(Problem::NoAudio, &music.streams);
                     }
+                    // The sound server is gone (logout, PipeWire restart): give the
+                    // light back now instead of keeping it on the last frame (D-064);
+                    // razer ON again when the stream reopens (`failed`).
+                    if music.streams.live {
+                        music.drop_fade();
+                        music.streams.off();
+                    }
                     failed = true;
-                    retry_at = Some(now_ns() + retry_ns);
+                    let now = now_ns();
+                    let since = *down_since.get_or_insert(now);
+                    if now - since >= SERVER_GONE_EXIT_NS {
+                        return Err(Error::Runtime(
+                            "the sound server has been unreachable for 10 minutes; music sync stopped"
+                                .into(),
+                        ));
+                    }
+                    retry_at = Some(now + retry_ns);
                     retry_ns = (retry_ns * 2).min(RETRY_MAX_NS);
                     continue;
                 }
@@ -599,7 +635,8 @@ fn run_loop(
                     debug!("audio is back: fade cancelled");
                     music.cancel_fade();
                 }
-                let now_us = start.elapsed().as_micros() as u64;
+                // One clock for everything (CLOCK_MONOTONIC): renders, keepalive, fade.
+                let now_us = render_clock_us();
                 if now_us < next_us {
                     continue;
                 }
@@ -696,7 +733,7 @@ fn run_loop(
                     QuietAction::None => {}
                 }
             }
-            if !paused {
+            if !paused && music.streams.live {
                 // Only frames that were actually rendered are kept alive.
                 music.streams.keepalive(now / MS);
             }

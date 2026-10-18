@@ -63,16 +63,64 @@ fn parse_pid(text: &str) -> Option<i32> {
     text.trim().parse().ok().filter(|&p| p > 0)
 }
 
-/// The pid of the live session holding `path`, if any: the file is locked and
-/// names a pid other than ours.
-pub fn running_at(path: &Path) -> Option<i32> {
-    let f = File::open(path).ok()?;
+/// Who holds the pidfile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Holder {
+    /// Nobody (no file, unlocked, or it is us).
+    Free,
+    /// Locked, but the pid isn't readable yet: a session is claiming it right now
+    /// (or wrote a pid that isn't a live gowl: the stale text of a crashed one,
+    /// about to be overwritten).
+    Starting,
+    /// A live gowl session.
+    Pid(i32),
+}
+
+/// Is `pid` a live process whose name is gowl's?
+fn is_gowl(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim_end() == "gowl")
+}
+
+/// Who holds `path` (see `Holder`).
+pub fn holder_at(path: &Path) -> Holder {
+    let Ok(f) = File::open(path) else {
+        return Holder::Free;
+    };
     if !is_locked(&f) {
-        return None;
+        return Holder::Free;
     }
-    let pid = parse_pid(&std::fs::read_to_string(path).ok()?)?;
+    let text = std::fs::read_to_string(path).unwrap_or_default();
     // SAFETY: getpid has no preconditions.
-    (pid != unsafe { libc::getpid() }).then_some(pid)
+    let me = unsafe { libc::getpid() };
+    match parse_pid(&text) {
+        Some(pid) if pid == me => Holder::Free,
+        Some(pid) if is_gowl(pid) => Holder::Pid(pid),
+        _ => Holder::Starting,
+    }
+}
+
+/// The pid of the live session holding `path`, if any: the file is locked and
+/// names a live gowl other than us.
+pub fn running_at(path: &Path) -> Option<i32> {
+    match holder_at(path) {
+        Holder::Pid(p) => Some(p),
+        _ => None,
+    }
+}
+
+/// A session is claiming the pidfile right now (no readable pid yet).
+pub fn starting() -> bool {
+    pidfile_path().is_some_and(|p| holder_at(&p) == Holder::Starting)
+}
+
+/// The error for "nothing to act on": "being started" when a claim is in flight
+/// (two toggles racing), else "not running".
+pub fn none_running() -> Error {
+    if starting() {
+        Error::Runtime("gowl is just starting (another toggle?); try again in a moment".into())
+    } else {
+        Error::Runtime("no gowl sync is running".into())
+    }
 }
 
 /// Held for the lifetime of a sync session: the locked file. Removed on drop.
@@ -129,9 +177,13 @@ impl Pidfile {
             // SAFETY: getpid has no preconditions.
             let pid = unsafe { libc::getpid() };
             let text = format!("{pid}\n");
-            file.set_len(0).map_err(|e| Error::Io("write pidfile", e))?;
+            // Write, then cut to length: the file is never empty once it existed (a
+            // reader sees a stale pid, which isn't a live gowl → "starting").
             std::os::unix::fs::FileExt::write_all_at(&file, text.as_bytes(), 0)
                 .map_err(|e| Error::Io("write pidfile", e))?;
+            file.set_len(text.len() as u64)
+                .map_err(|e| Error::Io("write pidfile", e))?;
+            set_panic_path(path);
             return Ok(Pidfile {
                 path: path.to_path_buf(),
                 file,
@@ -141,6 +193,24 @@ impl Pidfile {
             "cannot claim {} (another gowl starting?)",
             path.display()
         )))
+    }
+}
+
+static PANIC_PIDFILE: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+
+fn set_panic_path(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    if let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
+        let _ = PANIC_PIDFILE.set(c);
+    }
+}
+
+/// From the panic hook (`panic = "abort"` skips Drop): unlink the pidfile first, so
+/// a reader sees "not running" before the status file goes too.
+pub fn panic_unlink_pidfile() {
+    if let Some(p) = PANIC_PIDFILE.get() {
+        // SAFETY: valid C string.
+        unsafe { libc::unlink(p.as_ptr()) };
     }
 }
 
@@ -280,14 +350,10 @@ impl Session {
     }
 }
 
-fn not_running() -> Error {
-    Error::Runtime("no gowl sync is running".into())
-}
-
 /// `gowl pause` / `gowl resume`: SIGUSR1 / SIGUSR2 to the running sync, and a
 /// notification ("Screen sync paused"). Errors are notified by main.
 pub fn cmd_pause(resume: bool) -> Result<(), Error> {
-    let s = session().ok_or_else(not_running)?;
+    let s = session().ok_or_else(none_running)?;
     if s.info.mode == Some(Mode::Calibrate) {
         return Err(Error::Runtime(
             "calibration is running; pause and resume don't apply to it".into(),
@@ -306,7 +372,7 @@ pub fn cmd_pause(resume: bool) -> Result<(), Error> {
 /// `gowl stop`: SIGTERM, then wait up to 1 s for the exit (the shutdown contract
 /// promises 100 ms); "Screen sync off".
 pub fn cmd_stop() -> Result<(), Error> {
-    let s = session().ok_or_else(not_running)?;
+    let s = session().ok_or_else(none_running)?;
     if !s.stop(1000)? {
         return Err(Error::Runtime(
             "gowl got the stop signal but has not exited after 1 s".into(),
@@ -366,6 +432,31 @@ mod tests {
             drop(held);
             assert!(!p.exists());
         }
+    }
+
+    #[test]
+    fn a_locked_file_without_a_live_gowl_pid_is_being_claimed() {
+        let p = tmp("claim");
+        std::fs::write(&p, "").unwrap();
+        // Another open file description holds the lock: a claim in flight.
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&p)
+            .unwrap();
+        assert!(try_lock(&f).unwrap());
+        assert_eq!(holder_at(&p), Holder::Starting, "empty");
+        std::fs::write(&p, "1\n").unwrap(); // stale text: pid 1 is not gowl
+        assert_eq!(holder_at(&p), Holder::Starting, "not a gowl");
+        assert_eq!(running_at(&p), None);
+        // SAFETY: getpid has no preconditions.
+        let me = unsafe { libc::getpid() };
+        std::fs::write(&p, format!("{me}\n")).unwrap();
+        assert_eq!(holder_at(&p), Holder::Free, "our own pid never counts");
+        drop(f);
+        std::fs::write(&p, "").unwrap();
+        assert_eq!(holder_at(&p), Holder::Free, "unlocked");
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

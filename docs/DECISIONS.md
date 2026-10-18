@@ -795,6 +795,11 @@ so it would read as "not running" anyway; the state rename follows). **Evidence:
 A mode switch shows a transient `{"running":false}` between the two sessions (~0.1 s; honest, not hidden).
 **Rejected:** a socket/IPC server in the sync (a second fd and protocol in the hot loop), polling `gowl state`
 from bars (wakeups), D-Bus properties (rule 10).
+**Amended by D-064 (review):** the file moved to `$XDG_RUNTIME_DIR/gowl/state` (dir 0700) and watch watches
+only that directory (`IN_MOVED_TO | IN_DELETE` + self events) plus a **pidfd** on the running session instead
+of `IN_CLOSE_WRITE` on the pidfile — other programs' files in the runtime dir (the human's shell writes
+vault-* flags there) can no longer wake it. The pidfile stays at `$XDG_RUNTIME_DIR/gowl.pid` (older builds
+look there; moving it would let an old and a new gowl run at once).
 
 ## D-061 — Packaging files; niri and the shell don't have ~/.local/bin on PATH (2026-10-18, phase 6, desktop agent)
 `packaging/gowl.service` as specified (`Type=exec`, `%h/.local/bin/gowl screen`, PartOf/After/Requisite and
@@ -855,3 +860,46 @@ cascade seen once while developing, not a production issue.)
 89, 83, 78, … 7, 3 every 30 ms (gate-skipped steps near the end) → exact black **0.99 s** after the first step:
 22 datagrams. Cancel: tone again ~2.05 s after the first stopped → fade cut at level 31, then 70, 85, 91, 93,
 95 within 0.11 s (no jump), fading again after the second tone ended.
+
+## D-064 — Phase 6 review fixes: one music clock, lost sessions, races, notification hygiene (2026-10-18, phase 6 review, desktop agent)
+**Blocking — music sent every frame twice (rule 7), a Phase 5 bug.** The loop rendered on `Instant` since loop
+start (ms ≈ seconds since start) while keepalive, its deadline and the timerfd use CLOCK_MONOTONIC (ms since
+boot). After each send `keepalive_due_ms()` lay ~boot-uptime in the past, the ABSTIME timerfd fired at once
+and `keepalive()` resent the frame byte for byte (~60 µs later). My Phase 6 report had even noted the pairs
+as "existing pacing" — wrongly. **Fix:** one clock: `render_clock_us() = now_ns()/1000`, `Instant` gone from
+the music loop (calibrate and screen already use `now_ns()` throughout; `net.rs` uses `Instant` only inside
+one-shot scans). **Test** `music_idle::a_frame_just_sent_is_not_resent_by_the_keepalive` uses the loop's own
+clock functions: after each `tick`, `keepalive_due_ms() > now_ns()/MS` and `keepalive(now)` sends nothing;
+with the old clock it fails ("keepalive due 447680268 ms in the past"). **Live** (fake device, 2nd-client
+tone): identical datagrams < 100 ms apart 15 of 52 → **0** of 36, min gap 21.2 ms. **S3 (fake, 30 s):**
+0.306 % CPU, 50.2 wakeups/s, 6.10 MB, **39.30 datagrams/s** (BUDGETS row; the 2026-10-18 real-light S3 row is
+marked superseded — the human re-measures).
+**Lost session.** Music: when opening the stream fails (sound server unreachable — logout, PipeWire restart)
+the light gets razer OFF ×2 at once, no keepalives while down (`ka` and the timer path check `streams.live`),
+a running fade is dropped; razer ON again when the stream reopens. After **10 minutes** unreachable,
+`gowl music` exits (status 1): a toggle-started sync must not outlive the session forever, and 10 min covers
+a PipeWire restart or update. A read failure alone doesn't send OFF (an immediate reopen usually works; only a
+failed open counts). Test: in `toggle_resumes_switches_and_notifies` the music sync has no server — wire shows
+screen's OFF ×2, music's ON, then OFF ×2 at once. Screen: the Wayland connection closing (compositor gone)
+already ends `gowl screen` with razer OFF ×2 (exit 1); new test `compositor_gone_exits_with_razer_off` (mock
+`Ctl::Disconnect`). No timeout needed there.
+**Toggle race.** The pidfile is written then cut to length (`write_all_at` + `set_len`), never truncated to empty
+first; a locked pidfile whose text isn't a live gowl (empty, or a crashed session's stale pid not yet
+overwritten — checked via `/proc/PID/comm`) is `Holder::Starting`. toggle/pause/resume/stop then fail with
+"gowl is just starting (another toggle?); try again in a moment" (exit 1, notified) instead of exiting 0
+silently or signalling a dead pid. Unit test `a_locked_file_without_a_live_gowl_pid_is_being_claimed`.
+**Panic hook** unlinks the pidfile before the status file (normal-exit order).
+**`gowl state`** prints through the EPIPE-safe `emit` (no `println!` abort on a closed pipe).
+**Fade on black:** `fade_start` on an already-black output blanks at once (no 33 empty steps).
+**Gowl.qml:** the back-off resets only after a watcher stayed up ≥ 10 s, not on every line.
+**gowl.service:** `StartLimitIntervalSec=0`, `RestartSec=2`, `RestartSteps=6`, `RestartMaxDelaySec=60` (2 s
+stepping up to 60 s; systemd 259 here) — a login before the network or light is up keeps retrying instead of
+hitting the 5-starts limit. A failed **direct** `gowl screen|music` notifies a given failure once per 10 min
+(`$XDG_RUNTIME_DIR/gowl/failure`, cleared by a successful start); keys and control commands always answer.
+`systemd-analyze --user verify`: clean (with ExecStart at the build).
+**Notifications:** `<`, `>`, `&` escaped in summary and body.
+**Fake notify-send** is now a Python script (a shell blocks SIGCHLD around its own commands, which read as
+SigBlk 0x10000 and hid the real inherited mask) recording SigBlk and its open fds; the toggle test asserts
+for every notification (CLI and syncs): mask 0, fds exactly 0–2, all `/dev/null`.
+**README:** VPN claims now say exactly what was checked by hand (ProtonVPN) and what only the netns simulation
+covers (Tailscale-, WireGuard-, OpenVPN-style routing); binary size from the final build; status file path.

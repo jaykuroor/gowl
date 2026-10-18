@@ -47,9 +47,10 @@ gowl toggle [screen|music] [ARGS]    (D-059) that mode running → stop (wait �
                                      nothing running → run that mode (default screen) in the foreground with
                                      ARGS (niri `spawn`)
 gowl state                           print the status line (D-060); {"running":false} when idle; exit 0
-gowl watch                           print the status line now and on every change (inotify, 0 wakeups
-                                     between changes); exits on SIGTERM/SIGINT/SIGHUP or when stdout's
-                                     reader goes away
+gowl watch                           print the status line now and on every change (inotify on
+                                     $XDG_RUNTIME_DIR/gowl/ + a pidfd on the session, 0 wakeups between
+                                     changes); exits on SIGTERM/SIGINT/SIGHUP or when stdout's reader
+                                     goes away
 gowl --version | --help
 ```
 Exit codes: 0 ok, 1 runtime error (also: pause/resume/stop with nothing running, or a second
@@ -101,7 +102,7 @@ usage error). Spawned as `notify-send -a gowl -t 2500 -h string:x-canonical-priv
 Config `notify = on|off` (default on).
 
 ## Status file (D-060)
-`$XDG_RUNTIME_DIR/gowl.state`, one JSON line, atomic rename, written by screen/music/calibrate only on a
+`$XDG_RUNTIME_DIR/gowl/state` (directory mode 0700; the pidfile stays `$XDG_RUNTIME_DIR/gowl.pid`), one JSON line, atomic rename, written by screen/music/calibrate only on a
 change: start, pause, resume, output gone/back, sound server down/back, a device rebound / moved / unreachable
 / recovered (`Streams::health_gen`). Removed on exit (after the pidfile) and by the panic hook; a leftover is
 ignored unless the pidfile is locked by the pid it names. Schema:
@@ -109,6 +110,12 @@ ignored unless the pidfile is locked by the pid it names. Schema:
 "devices":[{"name":S,"ip":S,"iface":S,"ok":B}],"error":null|S}` or `{"running":false}`; a locked pidfile without
 a matching file (older gowl, starting up) reads as running with `mode` from `/proc/PID/cmdline` (`unknown` if
 none) and empty `devices`.
+
+## Lost session (D-064)
+Music: when the sound server can't be reached (logout, PipeWire restart) the light gets razer OFF ×2 at once
+and no keepalives; razer ON again when the stream reopens; after 10 minutes unreachable `gowl music` exits
+(status 1). Screen: the Wayland connection closing ends `gowl screen` with razer OFF ×2 (status 1).
+A failed direct `gowl screen|music` (the systemd unit's restarts) notifies the same failure once per 10 minutes.
 
 ## Shutdown contract
 On SIGINT/SIGTERM/SIGHUP/SIGQUIT or `stop` (or a panic, via a hook): send razer OFF to every streaming device (twice,

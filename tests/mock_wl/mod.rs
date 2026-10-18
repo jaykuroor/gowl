@@ -51,6 +51,8 @@ pub enum Ctl {
     /// Keep completing copies but with unchanged pixels (true) — like niri with an
     /// animation away from the edges — or back to new colors every frame (false).
     SameContent(bool),
+    /// Close the connection (the compositor exited: logout, crash).
+    Disconnect,
 }
 
 /// Serve one client until it disconnects. `served` counts completed frames.
@@ -253,6 +255,7 @@ pub fn serve_ctl(fd: OwnedFd, o: Opts, served: Arc<AtomicUsize>, ctl: Option<Rec
                             }
                             Ctl::FailBeforeCopy => fail_before_copy = true,
                             Ctl::SameContent(on) => frozen = on.then_some(k.saturating_sub(1)),
+                            Ctl::Disconnect => return,
                             Ctl::AddOutput { more_frames } => {
                                 out_global = next_global;
                                 next_global += 1;

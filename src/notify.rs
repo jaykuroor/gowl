@@ -32,9 +32,13 @@ pub fn send(enabled: bool, summary: &str, body: Option<&str>) {
         "-h",
         "string:x-canonical-private-synchronous:gowl",
         "--",
-        summary,
     ];
-    if let Some(b) = body {
+    // The body may be parsed as markup by the server: escape < > & (the summary is
+    // plain text by the spec, escaped too so no server can misread it).
+    let summary = escape(summary);
+    let body = body.map(escape);
+    args.push(&summary);
+    if let Some(b) = &body {
         args.push(b);
     }
     let argv: Vec<CString> = args
@@ -44,6 +48,20 @@ pub fn send(enabled: bool, summary: &str, body: Option<&str>) {
     let mut ptrs: Vec<*const c_char> = argv.iter().map(|a| a.as_ptr()).collect();
     ptrs.push(std::ptr::null());
     spawn_detached(&ptrs);
+}
+
+/// `<`, `>`, `&` as entities (notification body markup).
+fn escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => o.push_str("&amp;"),
+            '<' => o.push_str("&lt;"),
+            '>' => o.push_str("&gt;"),
+            c => o.push(c),
+        }
+    }
+    o
 }
 
 /// fork → fork → exec `argv` with stdio on /dev/null, signals unblocked and
@@ -81,5 +99,13 @@ fn spawn_detached(argv: &[*const c_char]) {
         while libc::waitpid(pid, &mut status, 0) < 0
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
         {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn markup_is_escaped() {
+        assert_eq!(super::escape("a <b> & c"), "a &lt;b&gt; &amp; c");
     }
 }

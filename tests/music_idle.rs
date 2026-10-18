@@ -10,11 +10,14 @@
 use std::net::{Ipv4Addr, UdpSocket};
 
 use gowl::audio::fft::N;
-use gowl::audio::run::{FADE_STEP_NS, Music, Quiet, QuietAction, Settings, fade_level_q16};
+use gowl::audio::run::{
+    FADE_STEP_NS, Music, Quiet, QuietAction, Settings, fade_level_q16, render_clock_us,
+};
 use gowl::config::Config;
 use gowl::devices::{Device, SegSource};
 use gowl::net::Ports;
 use gowl::runtime::Streams;
+use gowl::runtime::now_ns;
 
 const MS: u64 = 1_000_000;
 const SEGS: usize = 10;
@@ -336,4 +339,37 @@ fn quiet_restart_backs_off_and_resets_on_sound() {
     // Sound resets the back-off.
     q.heard(now, false);
     assert_eq!(q.restart_due(), now - now % (s / 2) + s / 2 + 30 * s);
+}
+
+/// Review fix (D-064): the loop renders on `render_clock_us()` and keeps alive /
+/// arms the timer on `now_ns()`. On one clock, a frame just sent is not due for a
+/// keepalive, so the timer wakeup after it resends nothing (Phase 5 sent every
+/// frame twice, ~60 µs apart).
+#[test]
+fn a_frame_just_sent_is_not_resent_by_the_keepalive() {
+    let mut r = Rig::new(1000);
+    r.drain(); // razer ON
+    let mut samples = [0f32; N];
+    for (i, s) in samples.iter_mut().enumerate() {
+        *s = 0.8 * (2.0 * std::f32::consts::PI * 80.0 * i as f32 / 48_000.0).sin();
+    }
+    let mut sent = 0;
+    for _ in 0..20 {
+        sent += r.music.tick(&samples, render_clock_us() / 1000);
+        let now = now_ns() / MS;
+        let due = r
+            .music
+            .streams
+            .keepalive_due_ms()
+            .expect("a frame was sent");
+        assert!(due > now, "keepalive due {} ms in the past", now - due);
+        r.music.streams.keepalive(now); // what the timer wakeup does
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let got = r.drain();
+    assert_eq!(got.len(), sent, "only the rendered frames went out");
+    assert!(sent >= 5);
+    for w in got.windows(2) {
+        assert_ne!(w[0], w[1], "the same datagram twice in a row");
+    }
 }

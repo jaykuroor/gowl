@@ -7,8 +7,9 @@ import Quickshell.Io
 //
 // Cost: one `gowl watch` process. It sleeps in poll() and prints one JSON line per state change (sync started,
 // paused, resumed, switched, a light unreachable or back, stopped); nothing here polls and no timer runs while
-// it is up. If it exits (gowl missing or replaced, logout) it is started again after 1 s, doubling to 30 s,
-// and the back-off resets with the next line. Commands go out with Quickshell.execDetached, so a sync started
+// it is up. If it exits (gowl missing or replaced, logout) it is started again after 1 s, doubling to 30 s;
+// the back-off resets only once a watcher has stayed up for 10 s (so a watcher that prints one line and dies
+// can't make it spin). Commands go out with Quickshell.execDetached, so a sync started
 // from the shell survives a shell reload, and gowl shows its own notification for each toggle/pause/stop.
 //
 // Use: put this file in a directory of singletons (e.g. services/) and read Gowl.running, Gowl.mode,
@@ -60,6 +61,7 @@ Singleton {
     property bool _local: false            // trying ~/.local/bin/gowl (gowl: "" only)
     property string _watchError: ""
     property int _backoff: 1000
+    property real _startedAt: 0            // ms; when the current watcher started
 
     function _apply(line) {
         let s
@@ -68,7 +70,6 @@ Singleton {
         state = s
         _seen = true
         _watchError = ""
-        _backoff = 1000
     }
 
     function _start() { if (root.enabled && !watcher.running) watcher.running = true }
@@ -85,7 +86,9 @@ Singleton {
         stdout: SplitParser { onRead: line => root._apply(line) }
         stderr: StdioCollector { id: watchErr }
         onRunningChanged: {
-            if (running || !root.enabled) return
+            if (running) { root._startedAt = Date.now(); return }
+            if (!root.enabled) return
+            if (root._startedAt > 0 && Date.now() - root._startedAt >= 10000) root._backoff = 1000
             if (root.state.running !== false) root.state = { running: false }
             root._watchError = watchErr.text.trim() || (root.gowl !== "" ? "can't run `" + root.gowl + " watch`"
                 : "gowl not found on PATH or in ~/.local/bin")

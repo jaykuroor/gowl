@@ -117,6 +117,11 @@ fn notify_failure(args: &[String], e: &Error) {
             (first.unwrap_or_default() + c.as_str(), None)
         }
     };
+    // A direct `gowl screen|music` (the systemd unit's restarts) tells each failure
+    // once; keys (toggle) and control commands always answer.
+    if matches!(cmd, "screen" | "music") && !gowl::state::failure_is_new(&summary) {
+        return;
+    }
     gowl::notify::send(config::load_quiet().notify, &summary, body.as_deref());
 }
 
@@ -240,6 +245,8 @@ fn cmd_toggle(rest: &[String]) -> Result<(), Error> {
     };
     let notify = config::load_quiet().notify;
     let announce = match gowl::control::session() {
+        // A claim in flight (another toggle won the race a moment ago): say so.
+        None if gowl::control::starting() => return Err(gowl::control::none_running()),
         None => format!("{} on", want.title()),
         // The other mode, if it is one; None = the same mode, or a gowl that
         // doesn't say which (toggle it).

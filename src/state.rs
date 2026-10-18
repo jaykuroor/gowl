@@ -1,6 +1,6 @@
 //! Status for bars and shells (quickshell, waybar, …), D-060.
 //!
-//! A running sync keeps `$XDG_RUNTIME_DIR/gowl.state` — one JSON line, replaced by
+//! A running sync keeps `$XDG_RUNTIME_DIR/gowl/state` — one JSON line, replaced by
 //! an atomic rename — and rewrites it only when something visible changes: start,
 //! pause, resume, a device rebound / unreachable / recovered, output or audio lost /
 //! back. Nothing is written while steady (rules 5/7): the loop compares one integer
@@ -9,8 +9,11 @@
 //! gone (`control::running_at`).
 //!
 //! `gowl state` prints the current line (`{"running":false}` when nothing runs);
-//! `gowl watch` prints it now and again on every change: inotify on the runtime
-//! dir, one blocking `poll()`, zero wakeups between changes.
+//! `gowl watch` prints it now and again on every change: inotify on
+//! `$XDG_RUNTIME_DIR/gowl/` (gowl's own directory, so other programs' files in the
+//! runtime dir never wake it) plus a pidfd on the running session, one blocking
+//! `poll()`, zero wakeups between changes. The pidfile stays at
+//! `$XDG_RUNTIME_DIR/gowl.pid` (older builds look there: one sync at a time).
 //!
 //! Schema (keys always present while running; `error` is null or a short text):
 //! `{"running":true,"pid":1234,"mode":"screen","paused":false,"fps":30,
@@ -32,7 +35,9 @@ use crate::control::{self, Pidfile};
 use crate::error::Error;
 use crate::runtime::{Sig, Signals, Streams};
 
-pub const FILE: &str = "gowl.state";
+/// Directory under `$XDG_RUNTIME_DIR` (mode 0700) and the file in it.
+pub const SUBDIR: &str = "gowl";
+pub const FILE: &str = "state";
 const PIDFILE: &str = "gowl.pid";
 pub const NOT_RUNNING: &str = "{\"running\":false}";
 
@@ -82,16 +87,65 @@ pub enum Problem {
     NoAudio,
 }
 
-/// `$XDG_RUNTIME_DIR/gowl.state`.
+/// `$XDG_RUNTIME_DIR/gowl/state`.
 pub fn path() -> Option<PathBuf> {
-    config::runtime_dir().map(|d| d.join(FILE))
+    config::runtime_dir().map(|d| d.join(SUBDIR).join(FILE))
+}
+
+/// Create `rt/gowl` (0700) if needed; returns it.
+fn ensure_dir(rt: &std::path::Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let d = rt.join(SUBDIR);
+    match std::fs::DirBuilder::new().mode(0o700).create(&d) {
+        Ok(()) => Ok(d),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(d),
+        Err(e) => Err(e),
+    }
+}
+
+/// A failed `gowl screen|music` started directly (the systemd unit restarting it
+/// every few seconds at login before the network is up) notifies once: the same
+/// failure within 10 minutes is not notified again, and a successful start forgets
+/// it. `$XDG_RUNTIME_DIR/gowl/failure` holds the last notified summary (D-064).
+const FAILURE: &str = "failure";
+const FAILURE_QUIET_SECS: u64 = 600;
+
+/// True if `summary` should be notified now (and records it).
+pub fn failure_is_new(summary: &str) -> bool {
+    let Some(rt) = config::runtime_dir() else {
+        return true;
+    };
+    let Ok(dir) = ensure_dir(&rt) else {
+        return true;
+    };
+    let p = dir.join(FAILURE);
+    let recent = std::fs::metadata(&p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age.as_secs() < FAILURE_QUIET_SECS);
+    if recent && std::fs::read_to_string(&p).is_ok_and(|s| s == summary) {
+        return false;
+    }
+    let _ = std::fs::write(&p, summary);
+    true
+}
+
+/// A sync started: the next failure is news again.
+pub fn clear_failure() {
+    if let Some(rt) = config::runtime_dir() {
+        let _ = std::fs::remove_file(rt.join(SUBDIR).join(FAILURE));
+    }
 }
 
 static PANIC_PATH: OnceLock<CString> = OnceLock::new();
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// From the panic hook (`panic = "abort"` skips Drop): remove the status file.
+/// From the panic hook (`panic = "abort"` skips Drop): remove the pidfile, then the
+/// status file (the same order as a normal exit, so `watch` never prints a
+/// half-gone session).
 pub fn panic_cleanup() {
+    control::panic_unlink_pidfile();
     if ACTIVE.load(Ordering::SeqCst)
         && let Some(p) = PANIC_PATH.get()
     {
@@ -131,6 +185,7 @@ impl Writer {
         extra: Vec<(&'static str, String)>,
         streams: &Streams,
     ) -> Writer {
+        clear_failure();
         Writer::start_in(path(), pidfile, mode, fps, extra, streams)
     }
 
@@ -144,7 +199,13 @@ impl Writer {
         streams: &Streams,
     ) -> Writer {
         let paths = path.and_then(|p| {
-            let tmp = p.with_extension("state.tmp");
+            if let Some(parent) = p.parent()
+                && let Some(rt) = parent.parent()
+                && let Err(e) = ensure_dir(rt)
+            {
+                debug!("cannot create {}: {e}", parent.display());
+            }
+            let tmp = p.with_file_name("state.tmp");
             Some((
                 CString::new(p.as_os_str().as_bytes()).ok()?,
                 CString::new(tmp.as_os_str().as_bytes()).ok()?,
@@ -415,7 +476,7 @@ pub fn cmdline_mode(pid: i32) -> Option<Mode> {
 
 /// The status file's line, if it belongs to `pid`.
 fn file_line_for(dir: &std::path::Path, pid: i32) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join(FILE)).ok()?;
+    let text = std::fs::read_to_string(dir.join(SUBDIR).join(FILE)).ok()?;
     let line = text.lines().next()?.trim().to_string();
     (field(&line, "pid")?.parse::<i32>().ok()? == pid).then_some(line)
 }
@@ -452,23 +513,23 @@ fn fallback_line(pid: i32) -> String {
     )
 }
 
-/// The current state line for `dir` (no newline).
-fn current_in(dir: &std::path::Path) -> String {
+/// The current state line for runtime dir `dir` (no newline), and the running pid.
+fn current_in(dir: &std::path::Path) -> (String, Option<i32>) {
     match session_in(dir) {
-        None => NOT_RUNNING.into(),
-        Some((_, Some(line))) => line,
-        Some((pid, None)) => fallback_line(pid),
+        None => (NOT_RUNNING.into(), None),
+        Some((pid, Some(line))) => (line, Some(pid)),
+        Some((pid, None)) => (fallback_line(pid), Some(pid)),
     }
 }
 
 /// The current state line (no newline): `{"running":false}` when nothing runs.
 pub fn current() -> String {
-    config::runtime_dir().map_or_else(|| NOT_RUNNING.into(), |d| current_in(&d))
+    config::runtime_dir().map_or_else(|| NOT_RUNNING.into(), |d| current_in(&d).0)
 }
 
-/// `gowl state`.
+/// `gowl state` (EPIPE-safe: `gowl state | head -c0` is fine).
 pub fn cmd_state() -> Result<(), Error> {
-    println!("{}", current());
+    emit(&current());
     Ok(())
 }
 
@@ -482,12 +543,25 @@ fn emit(line: &str) -> bool {
         .is_ok()
 }
 
+/// A pidfd on `pid` (readable once it exits), if the kernel has them.
+fn pidfd(pid: i32) -> Option<OwnedFd> {
+    // SAFETY: pidfd_open(pid, 0) returns a new fd or -1.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    // SAFETY: a fresh fd we own.
+    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as i32) })
+}
+
 /// `gowl watch`: the state line now and after every change, until SIGTERM/SIGINT/
 /// SIGHUP, the reader goes away (SIGPIPE/EPIPE or POLLERR on stdout) or the
 /// runtime dir does (logout).
+///
+/// Wakes for: a rename into or a delete in `$XDG_RUNTIME_DIR/gowl/` (only gowl
+/// writes there), and the exit of the running session (a pidfd — a SIGKILLed sync
+/// can't remove its files, so its exit is the change). Nothing else.
 pub fn cmd_watch() -> Result<(), Error> {
-    let dir = config::runtime_dir()
+    let rt = config::runtime_dir()
         .ok_or_else(|| Error::Runtime("XDG_RUNTIME_DIR is unset: nothing to watch".into()))?;
+    let dir = ensure_dir(&rt).map_err(|e| Error::Io("create the status directory", e))?;
     let sig = Signals::new()?;
     // SAFETY: plain syscall; the fd is owned below.
     let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
@@ -498,11 +572,8 @@ pub fn cmd_watch() -> Result<(), Error> {
     let ino = unsafe { OwnedFd::from_raw_fd(fd) };
     let cdir = CString::new(dir.as_os_str().as_bytes())
         .map_err(|_| Error::Runtime("bad XDG_RUNTIME_DIR".into()))?;
-    // Renames into place (state written), deletes (exit), and a closed writable fd
-    // on the pidfile (the holder died without cleaning up: its lock is gone).
     let mask = libc::IN_MOVED_TO
         | libc::IN_DELETE
-        | libc::IN_CLOSE_WRITE
         | libc::IN_DELETE_SELF
         | libc::IN_MOVE_SELF
         | libc::IN_ONLYDIR;
@@ -510,7 +581,8 @@ pub fn cmd_watch() -> Result<(), Error> {
     if unsafe { libc::inotify_add_watch(ino.as_raw_fd(), cdir.as_ptr(), mask) } < 0 {
         return Err(Error::Io("inotify_add_watch", io::Error::last_os_error()));
     }
-    let mut last = current_in(&dir);
+    let (mut last, pid) = current_in(&rt);
+    let mut proc = pid.and_then(pidfd);
     if !emit(&last) {
         return Ok(());
     }
@@ -532,8 +604,15 @@ pub fn cmd_watch() -> Result<(), Error> {
             events: 0,
             revents: 0,
         },
+        // The running session's pidfd (readable when it exits), or -1.
+        libc::pollfd {
+            fd: -1,
+            events: libc::POLLIN,
+            revents: 0,
+        },
     ];
     loop {
+        pfds[3].fd = proc.as_ref().map_or(-1, |f| f.as_raw_fd());
         for p in &mut pfds {
             p.revents = 0;
         }
@@ -557,45 +636,42 @@ pub fn cmd_watch() -> Result<(), Error> {
             debug!("watch: stdout closed");
             return Ok(());
         }
-        if pfds[0].revents == 0 {
-            continue;
-        }
-        let mut relevant = false;
+        let mut relevant = pfds[3].revents != 0;
         let mut gone = false;
-        loop {
-            // SAFETY: valid fd and buffer.
-            let n = unsafe {
-                libc::read(
-                    ino.as_raw_fd(),
-                    buf.as_mut_ptr().cast(),
-                    std::mem::size_of_val(&buf),
-                )
-            };
-            if n <= 0 {
-                break;
-            }
-            let bytes =
-                // SAFETY: the kernel wrote n bytes into buf.
-                unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), n as usize) };
-            let hdr = std::mem::size_of::<libc::inotify_event>();
-            let mut off = 0;
-            while off + hdr <= bytes.len() {
-                // SAFETY: a whole event header lies at off (kernel-aligned records).
-                let ev: libc::inotify_event =
-                    unsafe { std::ptr::read_unaligned(bytes[off..].as_ptr().cast()) };
-                let name_end = (off + hdr + ev.len as usize).min(bytes.len());
-                let name = &bytes[off + hdr..name_end];
-                let name = &name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())];
-                if ev.mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF | libc::IN_IGNORED) != 0 {
-                    gone = true;
+        if pfds[0].revents != 0 {
+            loop {
+                // SAFETY: valid fd and buffer.
+                let n = unsafe {
+                    libc::read(
+                        ino.as_raw_fd(),
+                        buf.as_mut_ptr().cast(),
+                        std::mem::size_of_val(&buf),
+                    )
+                };
+                if n <= 0 {
+                    break;
                 }
-                if ev.mask & libc::IN_Q_OVERFLOW != 0
-                    || name == FILE.as_bytes()
-                    || name == PIDFILE.as_bytes()
-                {
-                    relevant = true;
+                let bytes =
+                    // SAFETY: the kernel wrote n bytes into buf.
+                    unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), n as usize) };
+                let hdr = std::mem::size_of::<libc::inotify_event>();
+                let mut off = 0;
+                while off + hdr <= bytes.len() {
+                    // SAFETY: a whole event header lies at off (kernel-aligned records).
+                    let ev: libc::inotify_event =
+                        unsafe { std::ptr::read_unaligned(bytes[off..].as_ptr().cast()) };
+                    let name_end = (off + hdr + ev.len as usize).min(bytes.len());
+                    let name = &bytes[off + hdr..name_end];
+                    let name = &name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())];
+                    if ev.mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF | libc::IN_IGNORED) != 0
+                    {
+                        gone = true;
+                    }
+                    if ev.mask & libc::IN_Q_OVERFLOW != 0 || name == FILE.as_bytes() {
+                        relevant = true;
+                    }
+                    off = name_end;
                 }
-                off = name_end;
             }
         }
         debug!("watch: wakeup (relevant {relevant}, dir gone {gone})");
@@ -606,7 +682,9 @@ pub fn cmd_watch() -> Result<(), Error> {
             return Ok(());
         }
         if relevant {
-            let now = current_in(&dir);
+            let (now, pid) = current_in(&rt);
+            // Follow the session that runs now (none, the same, or a new one).
+            proc = pid.and_then(pidfd);
             if now != last {
                 if !emit(&now) {
                     return Ok(());
@@ -651,9 +729,10 @@ mod tests {
     fn stale_state_file_without_a_lock_reads_as_not_running() {
         let d = std::env::temp_dir().join(format!("gowl-state-stale-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join(FILE), "{\"running\":true,\"pid\":1}\n").unwrap();
+        ensure_dir(&d).unwrap();
+        std::fs::write(d.join(SUBDIR).join(FILE), "{\"running\":true,\"pid\":1}\n").unwrap();
         std::fs::write(d.join(PIDFILE), "1\n").unwrap(); // unlocked = stale
-        assert_eq!(current_in(&d), NOT_RUNNING);
+        assert_eq!(current_in(&d), (NOT_RUNNING.to_string(), None));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

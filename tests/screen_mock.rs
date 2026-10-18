@@ -529,7 +529,7 @@ fn toggle_resumes_switches_and_notifies() {
     assert_eq!(s.get("pid").u64(), u64::from(h.child.id()));
 
     // Steady streaming rewrites nothing (rules 5/7).
-    let st = h.tmp.join("gowl.state");
+    let st = h.tmp.join("gowl/state");
     let m0 = std::fs::metadata(&st).unwrap().modified().unwrap();
     h.collect(1.6);
     assert_eq!(std::fs::metadata(&st).unwrap().modified().unwrap(), m0);
@@ -561,10 +561,12 @@ fn toggle_resumes_switches_and_notifies() {
         .iter()
         .position(|k| **k == Kind::Off)
         .expect("razer OFF");
+    // Never two syncs: screen's OFF ×2 before music's ON. Then music finds no sound
+    // server and gives the light back at once (OFF ×2, no keepalives; D-064).
     assert_eq!(
         tail[i..],
-        [&Kind::Off, &Kind::Off, &Kind::On],
-        "never two syncs: OFF ×2 before music's ON; {:?}",
+        [&Kind::Off, &Kind::Off, &Kind::On, &Kind::Off, &Kind::Off],
+        "{:?}",
         h.log
     );
     let notes = h.notes(4);
@@ -581,10 +583,40 @@ fn toggle_resumes_switches_and_notifies() {
     assert!(wait_child(&mut music, 2000).success());
     assert_eq!(h.notes(5)[4], "Music sync off");
     assert!(!h.state().get("running").bool());
-    assert!(!h.tmp.join("gowl.state").exists());
+    assert!(!h.tmp.join("gowl/state").exists());
     assert!(!h.tmp.join("gowl.pid").exists());
     h.collect(3.8);
     h.tail_is_double_off();
+    // Every notify-send started (from the CLI and from the syncs, which block
+    // signals for their signalfd and hold sockets) got an empty signal mask and
+    // only stdin/stdout/stderr.
+    let procs = common::notify_procs(&h.tmp);
+    assert!(procs.len() >= 5, "{procs:?}");
+    for (mask, fds) in &procs {
+        assert_eq!(mask, "0000000000000000", "inherited a blocked signal");
+        let nums: Vec<u32> = fds.iter().map(|f| f.0).collect();
+        assert_eq!(nums, [0, 1, 2], "{fds:?}");
+        assert!(fds.iter().all(|f| f.1 == "/dev/null"), "{fds:?}");
+    }
+    let _ = std::fs::remove_dir_all(&h.tmp);
+}
+
+#[test]
+fn compositor_gone_exits_with_razer_off() {
+    // A toggle-started `gowl screen` whose session ends (niri exits): the Wayland
+    // connection closes → razer OFF ×2, exit, one notification, no files left.
+    let mut h = Harness::start_with("wl-gone", 17300, 1000, &["toggle", "screen", "--fps", "30"]);
+    h.collect(1.0);
+    assert!(h.frames(0.0, 1.0) >= 5, "{:?}", h.log);
+    h.ctl.send(mock_wl::Ctl::Disconnect).unwrap();
+    let st = wait_child(&mut h.child, 2000);
+    assert!(!st.success(), "exit {st:?}");
+    h.collect(h.now() + 0.2);
+    h.tail_is_double_off();
+    let notes = h.notes(2);
+    assert_eq!(notes[0], "Screen sync on");
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(!h.tmp.join("gowl.pid").exists() && !h.tmp.join("gowl/state").exists());
     let _ = std::fs::remove_dir_all(&h.tmp);
 }
 
@@ -610,7 +642,7 @@ fn failures_are_notified_and_notify_off_silences() {
         common::wait_notifications(&tmp, 2)[1][7],
         "Screen capture unavailable"
     );
-    assert!(!tmp.join("gowl.pid").exists() && !tmp.join("gowl.state").exists());
+    assert!(!tmp.join("gowl.pid").exists() && !tmp.join("gowl/state").exists());
     // Nothing running.
     assert_eq!(run(&["stop"], true), 1);
     assert_eq!(
@@ -670,6 +702,13 @@ fn watch_prints_each_change_once_and_sees_a_crash() {
     h.notes(2);
     h.collect(h.now() + 0.2);
     let c0 = ctx_switches(w.id());
+    // Other programs' files in the runtime dir (the human's shell writes vault-*
+    // flags there) don't wake it: it only watches $XDG_RUNTIME_DIR/gowl/.
+    for i in 0..20 {
+        let f = h.tmp.join(format!("vault-flag-{i}"));
+        std::fs::write(&f, "1").unwrap();
+        std::fs::rename(&f, h.tmp.join("vault-flag")).unwrap();
+    }
     h.collect(h.now() + 1.0);
     assert!(lines.try_recv().is_err(), "a line without a change");
     let woke = ctx_switches(w.id()) - c0;
@@ -682,7 +721,7 @@ fn watch_prints_each_change_once_and_sees_a_crash() {
         "{\"running\":false}"
     );
     assert!(
-        h.tmp.join("gowl.state").exists(),
+        h.tmp.join("gowl/state").exists(),
         "stale file left by the crash"
     );
     assert!(!h.state().get("running").bool());

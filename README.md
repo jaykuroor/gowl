@@ -33,7 +33,8 @@ LumiSync, and gowl's test vectors are generated from LumiSync's own code so the 
 - **Screen sync:** a Wayland compositor with `wlr-screencopy` — niri, sway, Hyprland, river, … (not GNOME or
   KDE). Tested on niri.
 - **Music sync:** PipeWire (with its PulseAudio server) or PulseAudio.
-- **VPNs:** keeps working with Tailscale, ProtonVPN, WireGuard or OpenVPN up (see [VPNs](#vpns)).
+- **VPNs:** built to keep working with a VPN up; checked by hand with ProtonVPN, and in a simulation for
+  Tailscale-, WireGuard- and OpenVPN-style routing (see [VPNs](#vpns)).
 
 ## Requirements
 
@@ -144,7 +145,7 @@ Environment: `GOWL_DEVICE`, `GOWL_CONFIG`, `GOWL_LOG=debug` (verbose, once-per-s
 
 ## Status for bars (quickshell, waybar, …)
 
-A running sync keeps one JSON line in `$XDG_RUNTIME_DIR/gowl.state` and rewrites it only when something changes:
+A running sync keeps one JSON line in `$XDG_RUNTIME_DIR/gowl/state` and rewrites it only when something changes:
 
 ```json
 {"running":true,"pid":4242,"mode":"screen","paused":false,"fps":30,"devices":[{"name":"desk","ip":"192.168.1.50","iface":"enp5s0","ok":true}],"error":null}
@@ -163,8 +164,9 @@ A running sync keeps one JSON line in `$XDG_RUNTIME_DIR/gowl.state` and rewrites
 | `error` | `null`, or why the light isn't following: `"screen output gone"`, `"sound server unreachable"`, `"desk: no LAN interface reaches it"`, `"desk: sending fails"` |
 
 - `gowl state` prints the current line (and notices a crashed sync's leftover file).
-- `gowl watch` prints it once, then again on every change, and otherwise sleeps — no polling, no wakeups. It
-  exits when its reader goes away. Use it from any bar that runs a command and reads lines.
+- `gowl watch` prints it once, then again on every change, and otherwise sleeps — no polling, no wakeups (it
+  watches only gowl's own directory, so other programs' files don't wake it). It exits when its reader goes
+  away. Use it from any bar that runs a command and reads lines.
 
 ### quickshell
 
@@ -230,8 +232,12 @@ so bind the full path. Running `gowl toggle screen` in a terminal shows what gow
 ## VPNs
 
 gowl binds every socket to the network interface that holds the light's subnet, so a VPN that captures all
-traffic can't pull the light's packets into the tunnel, and it rebinds by itself when networks change. On my
-machine, ProtonVPN and Tailscale going up or down during a running sync were seamless (no gap, no restart). gowl never changes routes,
+traffic can't pull the light's packets into the tunnel, and it rebinds by itself when networks change.
+Checked by hand: ProtonVPN connecting and disconnecting during a running sync on my machine was seamless (no
+gap, no restart). Not checked by hand: Tailscale, WireGuard and OpenVPN. Their typical routing (a full
+tunnel, Tailscale's overlapping LAN route and exit node, multicast pulled into the tunnel) is reproduced in a
+network-namespace simulation (`tools/netns_vpn_test.py`), where every packet stays on the LAN interface and a
+network change mid-sync is followed within about half a second. gowl never changes routes,
 firewall or VPN settings and **never bypasses a kill switch**: if a VPN kill switch blocks LAN traffic,
 gowl says so and you allow LAN access in the VPN app.
 
@@ -242,10 +248,13 @@ Measured on my machine (Fedora 44, 3440x1440 at 100 Hz, NVIDIA RTX 4060), real H
 | Scenario | gowl CPU (one core) | Wakeups/s | Memory (RSS) |
 |---|---|---|---|
 | Screen sync, fullscreen video, 30 fps | 0.37 % | 69.5 | 8.4 MB |
-| Music sync, music playing | 0.68 % | 48.8 | 6.1 MB |
+| Music sync, music playing | 0.68 %\* | 48.8\* | 6.1 MB |
 | Paused | 0 % | 0 | 3.1 MB |
 
-Binary: about 650 KB, depending only on the C library. While paused gowl does nothing at all; on a still
+\* Measured before a fix that stopped music mode from sending every frame twice; to be re-measured on the
+light. Against the test device after the fix: 0.31 %, 50 wakeups/s, 6.1 MB, 39 packets/s.
+
+Binary: about 680 KiB (693,920 bytes), depending only on the C library. While paused gowl does nothing at all; on a still
 screen it sends only the keepalive. The compositor's own cost of handing out screen captures is separate and
 depends on the GPU: niri spent a noticeable share of a core on this NVIDIA machine at 30 fps, which is why
 gowl drops to `idle_fps` while the screen edges don't change. Method and full numbers: `docs/BUDGETS.md`.

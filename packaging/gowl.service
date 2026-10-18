@@ -8,19 +8,25 @@
 # exit status 0, so systemd does not restart it (Restart=on-failure); it starts again at
 # the next login or with `systemctl --user start gowl`. A sync started by a toggle while
 # the service is stopped runs as an ordinary process of the compositor, not as this unit.
-# Crashes and errors (exit ≠ 0) are restarted after 2 s.
+# Errors and crashes (exit ≠ 0) are restarted: after 2 s, then stepping up to 60 s
+# (RestartSteps), with no start limit, so a login before the network or the light
+# is up keeps retrying instead of giving up after five quick failures. gowl
+# notifies a failure once, not on every retry.
 
 [Unit]
 Description=gowl — sync Govee lights to the screen
 PartOf=graphical-session.target
 After=graphical-session.target
 Requisite=graphical-session.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec
 ExecStart=%h/.local/bin/gowl screen
 Restart=on-failure
 RestartSec=2
+RestartSteps=6
+RestartMaxDelaySec=60
 Nice=5
 
 [Install]

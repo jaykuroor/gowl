@@ -13,7 +13,7 @@ src/
                  discovery, status query, Sender (per-device prealloc buffers)
   netwatch.rs    rtnetlink change listener in the poll set (debounce) + device-IP re-verify by MAC
   control.rs     pidfile ($XDG_RUNTIME_DIR/gowl.pid), `gowl pause|resume|stop`, running Session (pidfd)
-  state.rs       status file ($XDG_RUNTIME_DIR/gowl.state, written on change only), `gowl state|watch` (D-060)
+  state.rs       status file ($XDG_RUNTIME_DIR/gowl/state, written on change only), `gowl state|watch` (D-060, D-064)
   notify.rs      notify-send spawner (double fork, no D-Bus; D-059)
   doctor.rs      `gowl doctor` diagnostics
   color.rs       sRGB↔linear LUTs, zone mapping (port of led_mapping.py), saturation,

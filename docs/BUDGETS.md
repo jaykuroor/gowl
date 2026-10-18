@@ -135,8 +135,9 @@ is justified: the whole sampler is ≈ 0.07 % of a core at 30 fps. Kernel time s
 ## Results log (append; newest first)
 | Date | Commit | Scenario | CPU % | Wakeups/s | RSS MB | Pkts/s | niri Δ CPU % | Notes |
 |---|---|---|---|---|---|---|---|---|
+| 2026-10-18 | cad72e6+D-064 | S3 music after the D-064 clock fix (tone from a 2nd client, −50 dBFS 60 Hz, 30 s) | 0.306 | 50.2 | 6.10 | 39.30 | 49.67 abs (busy desktop) | fake, isolated runtime dir, keepalive_ms 5600; live duplicate check: 0 identical datagrams < 100 ms apart (was 15 of 52 frames in 6 s), min gap 21.2 ms. **Real-light S3 to be re-run by the human.** |
 | 2026-10-18 | 7f33e73 | **S1 screen, real light** (human: `measure.py screen 60`, fullscreen video) | 0.374 | 69.5 | 8.42 | — | 44.19 abs (no same-session S0; paused run below had niri 12.55 abs without capture) | real H6609 via the human's config; Shmem +53 MB in the window is system-wide (video player), not gowl; screen maps only ld/libc/libgcc_s/libm; binary 638 KB. Wakeups 69.5 vs 60 at 30 fps: ≈ +9/s on a changing video, not investigated further (gowl CPU stays 0.37 %) |
-| 2026-10-18 | 7f33e73 | **S3 music, real light** (human: `measure.py music 60`, music playing) | 0.675 | 48.8 | 6.13 | — | 14.83 abs | real light; ≈ 47 windows/s + sends; 15 libsndfile codec libs mapped via libpulsecommon (documented, unavoidable) |
+| 2026-10-18 | 7f33e73 | **S3 music, real light** (human: `measure.py music 60`, music playing) — *superseded: every sent frame was resent ~60 µs later by the keepalive (D-064); re-measure* | 0.675 | 48.8 | 6.13 | — | 14.83 abs | real light; ≈ 47 windows/s + sends; 15 libsndfile codec libs mapped via libpulsecommon (documented, unavoidable) |
 | 2026-10-18 | 7f33e73 | **S4 paused, real light** (human: `measure.py paused 30`) | 0.000 | 0.0 | 3.11 (HWM 8.16) | 0.00 | 12.55 abs | real light; capture memfd freed on pause (D-055): RSS 8.4 → 3.1 MB |
 | 2026-10-17 | f997638 | S1 screen 30 fps, 60 s (final) | 0.250 | 60.6 | 8.43 | 0.18 | 20.9 (48.08 vs S0 27.03/27.40) | fake; perf task-clock 0.32 %; binary 640,616 B |
 | 2026-10-17 | f997638 | S4 paused 30 s (final) | 0.000 | 0.0 | 8.41 | 0.00 | 0 (27.27 abs) | fake |
