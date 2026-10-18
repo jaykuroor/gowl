@@ -1,0 +1,27 @@
+# gowl screen sync as a systemd user service, started with the graphical session.
+# Installed by `make install` (Phase 7) to ~/.config/systemd/user/gowl.service.
+#
+#   systemctl --user enable --now gowl     # screen sync at every login
+#   systemctl --user disable --now gowl    # back to keys / quickshell only
+#
+# `gowl stop`, `gowl toggle screen` (stop) and a toggle to music end this service with
+# exit status 0, so systemd does not restart it (Restart=on-failure); it starts again at
+# the next login or with `systemctl --user start gowl`. A sync started by a toggle while
+# the service is stopped runs as an ordinary process of the compositor, not as this unit.
+# Crashes and errors (exit ≠ 0) are restarted after 2 s.
+
+[Unit]
+Description=gowl — sync Govee lights to the screen
+PartOf=graphical-session.target
+After=graphical-session.target
+Requisite=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/gowl screen
+Restart=on-failure
+RestartSec=2
+Nice=5
+
+[Install]
+WantedBy=graphical-session.target

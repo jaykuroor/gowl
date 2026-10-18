@@ -7,7 +7,9 @@
    per-segment colors ("razer" frames) to one or more devices.
 4. **Music sync**: capture the default sink's monitor, FFT into bass/mid/treble, render
    a reaction × palette, stream segment colors.
-5. **Runtime control** of a running sync: pause/resume, stop, toggle (niri keybind friendly).
+5. **Runtime control** of a running sync: pause/resume, stop, toggle/switch (niri keybind friendly), with
+   desktop notifications (`notify-send`, no D-Bus code) and a status file + `gowl state`/`gowl watch` for bars.
+   Contrib: a quickshell singleton + tile; packaging: systemd user unit, niri binds (installed in Phase 7).
 6. **Calibrate**: light segments one by one so the user can confirm count, order, direction;
    `--keepalive` finds the slowest keepalive the light tolerates.
 
@@ -39,8 +41,15 @@ gowl calibrate --keepalive [DEV]     hold a frame, repeat it every 0.5/1/2/3/5/8
                                      the longest interval it held (D-046)
 gowl pause | resume | stop           signal the running sync (pidfile); stop waits ≤ 1 s for the exit
 gowl doctor [DEV]                    network diagnostics: LAN iface, VPN hijack, firewall (docs/NETWORK.md)
-gowl toggle [screen|music] [ARGS]    running → stop it (wait ≤ 500 ms); not running → run that mode
-                                     (default screen) in the foreground with ARGS (niri `spawn`)
+gowl toggle [screen|music] [ARGS]    (D-059) that mode running → stop (wait ≤ 1 s); paused → resume;
+                                     the other mode running/paused → stop it (wait ≤ 2 s for its exit,
+                                     razer OFF ×2), then run this one; calibrate running → refuse (exit 1);
+                                     nothing running → run that mode (default screen) in the foreground with
+                                     ARGS (niri `spawn`)
+gowl state                           print the status line (D-060); {"running":false} when idle; exit 0
+gowl watch                           print the status line now and on every change (inotify, 0 wakeups
+                                     between changes); exits on SIGTERM/SIGINT/SIGHUP or when stdout's
+                                     reader goes away
 gowl --version | --help
 ```
 Exit codes: 0 ok, 1 runtime error (also: pause/resume/stop with nothing running, or a second
@@ -72,6 +81,7 @@ in the device section, global `keepalive_ms`).
 | Stream start/end | razer mode ON before first frame, OFF on exit/pause |
 | Segment count | user override → SKU table → 10 |
 | Audio bands | Hann, rfft, bass 20–250 / mid 250–4000 / treble 4000–16000 Hz, AutoGain (target 0.10, max boost 40, attack 0.15 s, release 1.0 s), music gain 1.7 |
+| Music idle (gowl, D-054/D-063) | 1.5–2.0 s after the last audio window, the last output fades to black over `music_fade_ms` (default 1000; ease-out (1 − p)², 30 ms timer steps through the normal gate, exact black last; 0 = instant black). A window arriving mid-fade cancels it at once and the EMA continues from the dimmed output. |
 
 Additions over legacy (allowed because they reduce cost or fix Wayland gaps):
 damage-aware zone recompute, pull-paced capture (no frames when screen static),
@@ -80,6 +90,25 @@ multi-device fan-out from one capture, VPN-proof interface-bound sockets with au
 and an idle capture rate (D-057): `idle_fps` (default 5; 0 or ≥ `fps` turns it off) once no zone has moved more
 than `threshold` for `idle_after_ms` (default 1000); the first frame that does brings back `fps` at once. The
 cost is up to one idle interval (200 ms at 5 fps) more delay on the first reaction after a calm spell.
+
+## Notifications (D-059)
+`toggle`, `pause`, `resume`, `stop` notify on success ("Screen sync on" — sent once setup worked —,
+"Switched from screen to music sync", "Music sync paused/resumed/off") and on failure (main's error path:
+"No light configured — run gowl setup", "Light unreachable: no LAN interface for it", "Screen capture
+unavailable", "No gowl sync is running", …). `screen`/`music` notify once if they exit on an error (not a
+usage error). Spawned as `notify-send -a gowl -t 2500 -h string:x-canonical-private-synchronous:gowl -- SUMMARY
+[BODY]` by a double fork (never waited for; missing notify-send = silent). The sync loop spawns nothing else.
+Config `notify = on|off` (default on).
+
+## Status file (D-060)
+`$XDG_RUNTIME_DIR/gowl.state`, one JSON line, atomic rename, written by screen/music/calibrate only on a
+change: start, pause, resume, output gone/back, sound server down/back, a device rebound / moved / unreachable
+/ recovered (`Streams::health_gen`). Removed on exit (after the pidfile) and by the panic hook; a leftover is
+ignored unless the pidfile is locked by the pid it names. Schema:
+`{"running":true,"pid":N,"mode":"screen|music|calibrate","paused":B,"fps":N,["reaction":S,"palette":S,]
+"devices":[{"name":S,"ip":S,"iface":S,"ok":B}],"error":null|S}` or `{"running":false}`; a locked pidfile without
+a matching file (older gowl, starting up) reads as running with `mode` from `/proc/PID/cmdline` (`unknown` if
+none) and empty `devices`.
 
 ## Shutdown contract
 On SIGINT/SIGTERM/SIGHUP/SIGQUIT or `stop` (or a panic, via a hook): send razer OFF to every streaming device (twice,

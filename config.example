@@ -23,6 +23,7 @@ music_fps = 60
 music_gain = 1.7
 music_brightness = 0.85
 music_smoothing = 0.6
+music_fade_ms = 1000     # when the music stops, dim to black over this long (ease-out); 0 = black at once
 
 # ---- network ----
 # gowl binds to the interface whose subnet contains the light, so VPNs (Tailscale,

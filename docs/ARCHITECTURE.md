@@ -12,7 +12,9 @@ src/
   net.rs         UDP sockets bound to the LAN interface (VPN-proof, see NETWORK.md),
                  discovery, status query, Sender (per-device prealloc buffers)
   netwatch.rs    rtnetlink change listener in the poll set (debounce) + device-IP re-verify by MAC
-  control.rs     pidfile ($XDG_RUNTIME_DIR/gowl.pid), `gowl pause|resume|stop`, toggle helper (pidfd)
+  control.rs     pidfile ($XDG_RUNTIME_DIR/gowl.pid), `gowl pause|resume|stop`, running Session (pidfd)
+  state.rs       status file ($XDG_RUNTIME_DIR/gowl.state, written on change only), `gowl state|watch` (D-060)
+  notify.rs      notify-send spawner (double fork, no D-Bus; D-059)
   doctor.rs      `gowl doctor` diagnostics
   color.rs       sRGB↔linear LUTs, zone mapping (port of led_mapping.py), saturation,
                  brightness, EMA smoother, resample, reverse/offset, delta check — all fixed-point

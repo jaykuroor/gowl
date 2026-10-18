@@ -732,3 +732,126 @@ reference (`recheck_lazy`). tests/smoothing_wire.rs `deferral_full_down_up_sweep
 70 × down/up 1–7 × smoothing 0.05/0.1/0.3 × threshold 3/5 × keepalive 500/1000 = 12,348 runs): 0
 diverging (7 of a 576-run subset diverge without the fix); the original 36-config script still
 identical, 5,654 timer wakeups saved (script end now 3 s after the last event).
+
+## D-059 — Toggle switches modes; notifications by spawning notify-send (2026-10-18, phase 6, desktop agent)
+**Toggle** (`gowl toggle [screen|music]`, Mod+M / Mod+Shift+M): that mode running → stop (≤ 1 s wait); that
+mode paused → resume; the other mode running or paused → SIGTERM it, wait ≤ 2 s for the *process exit* (pidfd,
+so its razer OFF ×2 is out and the pidfile is free), then run the requested mode in this process; calibrate
+running → refuse (it is interactive; exit 1, notified); nothing → start. The running mode and paused flag come
+from the status file (D-060); a gowl that writes none (older build, startup window) falls back to
+`/proc/PID/cmdline` and paused = false; an unreadable mode is treated as "same mode" (stop, the old behaviour).
+Alternatives: refuse when the other mode runs (the user sees nothing happen) — rejected by the spec.
+**Notifications** are `notify-send -a gowl -t 2500 -h string:x-canonical-private-synchronous:gowl -- SUMMARY
+[BODY]` (rule 10: no D-Bus code). Spawned by a **double fork** (fork → fork → exec, middle child exits at once
+and is reaped): never waits for notify-send, and a long-running sync never collects a zombie. Only
+async-signal-safe calls after fork (argv built before), the grandchild resets the signal mask (signalfd
+blocks INT/TERM/…) and SIGPIPE, stdio on /dev/null, setsid; missing notify-send → exec fails silently. Rejected:
+`Command::spawn` + drop (zombie for the whole session), SIGCHLD = SIG_IGN / SA_NOCLDWAIT (process-wide, libpulse
+waits for children).
+Who notifies: toggle/pause/resume/stop on success; main's error path for toggle/pause/resume/stop and for
+screen/music errors except usage errors typed into a terminal (so a keybind-started sync that dies — no light,
+no LAN interface, no capture, compositor gone — is never silent). The "on"/"switched" notification is sent by
+the starting process *after setup worked* (pidfile, sockets, capture/libpulse, razer ON, first status line):
+sending it before setup could race the error notification (two notify-send processes, order not guaranteed).
+The loop itself spawns nothing. `notify = on|off` (default on); `config::load_quiet` re-reads it without
+repeating config warnings. The NoDevice text is the spec's "No light configured — run gowl setup" although
+`gowl setup` arrives in Phase 7 (body carries the real error).
+**Toggle vs the systemd unit (spec: "your call"):** toggle never calls systemctl. `gowl stop`/toggle end the
+unit's process with status 0, so `Restart=on-failure` leaves it stopped until the next login or
+`systemctl --user start gowl`; a toggle-started sync is a plain child of the compositor. Reason: preferring
+the unit needs a second (music) or templated unit, a blocking `systemctl` call per key press and a D-Bus-backed
+tool in the key path, for a mode switch the plain path already does safely. Documented in packaging/gowl.service
+and the README. **Revisit-if** the human wants the music mode supervised by systemd too.
+**Tests:** tests/screen_mock.rs `toggle_resumes_switches_and_notifies` (toggle start → "Screen sync on";
+pause; toggle on paused → resume; toggle music → screen exits 0, wire shows OFF, OFF, then music's ON (never two
+syncs) → "Switched from screen to music sync"; toggle music → "Music sync off", no files left),
+`failures_are_notified_and_notify_off_silences` (no light → exit 3 + "No light configured — run gowl setup";
+no compositor → exit 4 + "Screen capture unavailable"; stop with nothing → "No gowl sync is running"; usage
+error from `gowl screen` not notified; `notify = off` silent).
+
+## D-060 — Status file `$XDG_RUNTIME_DIR/gowl.state`, `gowl state`, `gowl watch` (2026-10-18, phase 6, desktop agent)
+**Schema** (one line): `{"running":true,"pid":N,"mode":"screen|music|calibrate","paused":B,"fps":N,
+["reaction":S,"palette":S,]"devices":[{"name":S,"ip":S,"iface":S,"ok":B}],"error":null|S}` or
+`{"running":false}`. `error` priority: session problem ("screen output gone", "sound server unreachable"),
+else the first device problem ("ALIAS: no LAN interface reaches it" / "ALIAS: sending fails"). Calibrate writes
+mode `calibrate` so bars see it and toggle refuses to switch away from it.
+**Write on change only:** start (after razer ON), pause, resume, output lost/back, sound server down/back, and
+`Streams::health_gen()` (links_gen + per-device failing flips + IP moves) changing — one integer compare per loop
+turn, nothing written while steady (test: mtime unchanged over 0.6 s of streaming; unit test: 7 writes for 7
+changes, 0 for sends/keepalives/no-op reselects). Composed into a 4 KiB preallocated buffer; `tmp` + rename.
+**Exit order:** the `Writer` owns the pidfile and drops it first, then unlinks the state file only if its
+inode is still ours (a newer session may have replaced it). A reader in between sees the pidfile gone →
+`{"running":false}` at once, never a half-gone session. Panic hook unlinks it too (`panic = "abort"`).
+**Stale files:** a line counts only while the pidfile is locked (OFD lock, D-048) by the pid it names; a locked
+pidfile without a matching line (older gowl, setup window) reads as running with mode from `/proc/PID/cmdline`.
+**watch:** inotify on the runtime dir (`IN_MOVED_TO | IN_DELETE | IN_CLOSE_WRITE | IN_DELETE_SELF |
+IN_MOVE_SELF`), names filtered to `gowl.state`/`gowl.pid`, line printed only if it differs from the last.
+`IN_CLOSE_WRITE` on the pidfile catches a SIGKILLed sync (its writable fd closes; the lock is gone) — test
+`watch_prints_each_change_once_and_sees_a_crash`. stdout is in the poll set with events 0, so a vanished reader
+(POLLERR on the pipe) ends watch without waiting for a change; EPIPE (Rust ignores SIGPIPE) likewise;
+SIGTERM/INT/HUP via signalfd → exit 0. Not watched: `IN_CREATE` (the pidfile is created before it is locked,
+so it would read as "not running" anyway; the state rename follows). **Evidence:** watch on the human's real
+`/run/user/1000` for 60 s: **0 wakeups** (GOWL_LOG=debug logs each); test: ≤ 1 context switch over 1 s steady.
+A mode switch shows a transient `{"running":false}` between the two sessions (~0.1 s; honest, not hidden).
+**Rejected:** a socket/IPC server in the sync (a second fd and protocol in the hot loop), polling `gowl state`
+from bars (wakeups), D-Bus properties (rule 10).
+
+## D-061 — Packaging files; niri and the shell don't have ~/.local/bin on PATH (2026-10-18, phase 6, desktop agent)
+`packaging/gowl.service` as specified (`Type=exec`, `%h/.local/bin/gowl screen`, PartOf/After/Requisite and
+WantedBy `graphical-session.target`, `Restart=on-failure`, `RestartSec=2`, `Nice=5`; no Documentation URL —
+gowl has none yet). `systemd-analyze --user verify`: only complaint is the not-yet-installed binary; clean with
+ExecStart pointed at the build. `packaging/niri-binds.kdl`: the spec's two binds (+ `hotkey-overlay-title`).
+`niri validate -c` on a temp config that only includes it: valid; a misspelt copy fails (negative control); a
+temp config that includes the human's own config.kdl (read-only) plus the snippet: valid, and neither
+Mod+M nor Mod+Shift+M appears in config.kdl or vault/binds.kdl.
+**Finding:** niri's environment, the systemd user manager's and the human's `qs` process all have
+`PATH=/usr/local/bin:/usr/bin` — **no `~/.local/bin`**. A bare `spawn "gowl"` will not find a binary installed
+to `~/.local/bin`. The snippet keeps the spec's `"gowl"` as a template; **Phase 7's installer must substitute
+the absolute path** (or install where that PATH reaches, or set `environment.d`, which touches user config —
+the human's call). `Gowl.qml` copes by itself: with `gowl: ""` it alternates between `gowl` on PATH and
+`$HOME/.local/bin/gowl` until one answers (validated: "fallback" scenario below).
+
+## D-062 — Tests never reach the real desktop; how the QML was validated (2026-10-18, phase 6, desktop agent)
+**Incident:** the first `cargo test` run of this phase spawned the binary with the developer's
+`DBUS_SESSION_BUS_ADDRESS` and PATH, so the existing CLI tests (toggle, pause/resume/stop, second instance)
+executed the **real** `notify-send`: roughly seven notifications ("Screen sync on/paused/resumed/off", "No gowl
+sync is running", "Gowl is already running …") may have popped on the human's desktop early on
+2026-10-18 (one test run, shortly before 01:26). Fixed at once: `tests/common::fake_desktop` puts a recording fake `notify-send` first on PATH and
+removes `DBUS_SESSION_BUS_ADDRESS` (XDG_RUNTIME_DIR is the test dir, so libdbus's fallback misses the real bus)
+for **every** test that runs the binary (calibrate_cli, fake_device, multi_device, music_cli, net_e2e,
+screen_mock). The netns test ran with `env -u DBUS_SESSION_BUS_ADDRESS` (it only runs one-shots + calibrate).
+**QML validation:** a temporary config (scratchpad) with only `services/Gowl.qml`, `services/GowlTile.qml` and a
+`shell.qml` holding a logger, the README snippets (IpcHandler, a Text binding) and a timer script; the tile is
+created with no parent and no window. Run under `env -i` with `QT_QPA_PLATFORM=offscreen` (no window can reach
+the desktop), isolated XDG_RUNTIME_DIR/CONFIG/CACHE/STATE/DATA and HOME, no session bus, fake notify-send; the
+real gowl binary captured the real niri output (absolute WAYLAND_DISPLAY) and streamed to tools/fake_govee.py on
+127.0.0.1:14503; music used the real PipeWire monitor (read-only). Scenarios: **full** (gowl on PATH): toggle
+screen → state line with device "fake"/"lo", pause, toggle → resume, toggle music → switch, toggle music →
+off, color → the fake device logged colorwc ff8800; the tile's status text followed each step; 5 notifications
+recorded in order. **fallback** (gowl only in `$HOME/.local/bin`): same sequence passes after one failed
+PATH attempt. **missing**: "gowl not found on PATH or in ~/.local/bin", restarts after 1, 2, 4 s. No gowl or
+quickshell process left behind after any run.
+
+## D-063 — Music: gradual fade to black when audio stops (2026-10-18, phase 6, desktop agent; human request)
+Replaces D-054's single black frame (the "1.5–2.0 s after the last window" detection stays). **Decision.**
+`music_fade_ms` (default 1000, 0–10000; 0 = the old instant black): the last output (per device, after
+brightness) is snapshotted and scaled by an ease-out level (1 − p)² in Q16 (`fade_level_q16`, integer µs math,
+fits u64 for ≤ 10 s) on timer steps every 30 ms (≈ 33 Hz, under the 40 Hz cap), pushed through the normal
+delta gate; the last step sends **exact** black (`Streams::push_exact`: threshold 0, so the light doesn't stay
+on a sub-threshold glow), resets the smoothers and ends the fade (no more deadlines). Cost: ≈ 33 timer wakeups
+in that second, then quiet; no allocation (snapshot buffer preallocated per voice). A window arriving
+mid-fade cancels it at once; `Smoother::scale(level)` makes the EMA continue from the dimmed output instead of
+jumping back to the pre-fade frame. Pause drops a running fade (razer OFF; smoothing restarts from black); a
+rebind mid-fade is covered by the next step (gate reset by razer ON).
+**Tests:** tests/music_idle.rs `abrupt_stop_fades_monotonically_to_black` (fade starts 1.5–2.1 s after the
+last window; every channel non-increasing frame to frame; ≥ 10 steps, first step ≥ 70 % of the last loud
+level; last frame exact black within 2.1 s + fade + one step; then nothing due until the 30 s restart),
+`audio_returning_mid_fade_cancels_it`, `fade_zero_is_the_old_instant_black`,
+`ease_out_level_is_monotone_and_ends_at_zero`. (A failing assertion in one of these tests runs the panic hook,
+which sends razer OFF through the process-wide emergency table to the *other* tests' receivers — a confusing
+cascade seen once while developing, not a production issue.)
+**Live** (PipeWire 1.6.9, isolated runtime dir, fake device, a second libpulse client playing an inaudible
+−50 dBFS 60 Hz tone for 3 s, then stopping): last loud frame (red 95) → first fade step **1.80 s** later, then
+89, 83, 78, … 7, 3 every 30 ms (gate-skipped steps near the end) → exact black **0.99 s** after the first step:
+22 datagrams. Cancel: tone again ~2.05 s after the first stopped → fade cut at level 31, then 70, 85, 91, 93,
+95 within 0.11 s (no jump), fading again after the second tone ended.

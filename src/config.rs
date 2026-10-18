@@ -43,6 +43,8 @@ pub struct Config {
     pub music_gain: f64,
     pub music_brightness: f64,
     pub music_smoothing: f64,
+    /// Fade to black this long once audio stops (D-063); 0 = instant black (D-054).
+    pub music_fade_ms: u32,
     pub lan_if: Option<String>,
     /// Desktop notifications from the CLI (`notify-send`, D-059); `notify = off` silences them.
     pub notify: bool,
@@ -69,6 +71,7 @@ impl Default for Config {
             music_gain: 1.7,
             music_brightness: 0.85,
             music_smoothing: 0.6,
+            music_fade_ms: 1000,
             lan_if: None,
             notify: true,
             devices: Vec::new(),
@@ -235,6 +238,7 @@ fn global_key(c: &mut Config, k: &str, v: &str) -> Result<(), String> {
         "music_gain" => c.music_gain = float_in(v, 0.0, 100.0)?,
         "music_brightness" => c.music_brightness = float_in(v, 0.0, 1.0)?,
         "music_smoothing" => c.music_smoothing = float_in(v, 0.0, 1.0)?,
+        "music_fade_ms" => c.music_fade_ms = int_in(v, 0, 10_000)?,
         "lan_if" => c.lan_if = Some(v.to_string()),
         "notify" => c.notify = boolean(v)?,
         _ => return Err("unknown key (ignored)".into()),

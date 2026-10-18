@@ -1,0 +1,11 @@
+// gowl keys for niri. Include this file from your niri config (Phase 7's `make install`
+// copies it to ~/.config/niri/gowl.kdl and tells you the line to add):
+//     include "gowl.kdl"
+// Mod+M        screen sync on / off (paused → resume; music running → switch to screen)
+// Mod+Shift+M  music sync on / off  (paused → resume; screen running → switch to music)
+// Each press shows a short notification. `gowl` must be on niri's PATH
+// (~/.local/bin is on it on Fedora); otherwise put the full path in place of "gowl".
+binds {
+    Mod+M repeat=false hotkey-overlay-title="gowl: screen sync on/off" { spawn "gowl" "toggle" "screen"; }
+    Mod+Shift+M repeat=false hotkey-overlay-title="gowl: music sync on/off" { spawn "gowl" "toggle" "music"; }
+}

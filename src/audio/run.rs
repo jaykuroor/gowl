@@ -148,6 +148,8 @@ pub struct Settings {
     pub threshold: u8,
     pub keepalive_ms: u64,
     pub fps: u32,
+    /// Fade to black over this long once audio stops (0 = instant black).
+    pub fade_ms: u32,
 }
 
 impl Settings {
@@ -161,6 +163,7 @@ impl Settings {
             threshold: c.threshold,
             keepalive_ms: u64::from(c.keepalive_ms),
             fps: c.music_fps.clamp(1, 240),
+            fade_ms: c.music_fade_ms.min(10_000),
         })
     }
 
@@ -199,7 +202,31 @@ fn parse_palette(s: &str) -> Result<Palette, Error> {
 struct Voice {
     renderer: Renderer,
     smoother: Smoother,
+    /// Last output (after brightness): what the light shows.
     smooth: [Rgb; MAX_SEGMENTS],
+    /// The output when a fade started (D-063).
+    from: [Rgb; MAX_SEGMENTS],
+}
+
+/// Fade timer steps: 30 ms ≈ 33 Hz, under the 40 Hz device cap.
+pub const FADE_STEP_NS: u64 = 30_000_000;
+
+/// A running fade to black (D-063): times in ns, level in Q16.
+#[derive(Clone, Copy, Debug)]
+struct Fade {
+    start: u64,
+    next: u64,
+    level_q16: u32,
+}
+
+/// Ease-out level (1 − p)² in Q16 for `elapsed` of `dur` (µs, dur ≤ 10 s, so the
+/// square fits u64): fast at first, gently into black.
+pub fn fade_level_q16(elapsed_us: u64, dur_us: u64) -> u32 {
+    if dur_us == 0 || elapsed_us >= dur_us {
+        return 0;
+    }
+    let r = dur_us - elapsed_us;
+    ((r * r * 65536) / (dur_us * dur_us)) as u32
 }
 
 /// Everything between "1024 samples" and "datagram sent". No allocation per tick.
@@ -213,6 +240,7 @@ pub struct Music {
     voices: Vec<Voice>,
     /// Last bands after AutoGain (debug output).
     pub last_bands: [f64; 3],
+    fade: Option<Fade>,
 }
 
 impl Music {
@@ -224,6 +252,7 @@ impl Music {
                     renderer: Renderer::new(n, settings.fps),
                     smoother: Smoother::new(settings.smoothing, n),
                     smooth: [[0; 3]; MAX_SEGMENTS],
+                    from: [[0; 3]; MAX_SEGMENTS],
                 }
             })
             .collect();
@@ -235,6 +264,7 @@ impl Music {
             streams,
             voices,
             last_bands: [0.0; 3],
+            fade: None,
         }
     }
 
@@ -258,12 +288,84 @@ impl Music {
     /// Black on every device (what silence renders to); smoothing restarts from
     /// black, like the light. The gate skips devices already showing black.
     pub fn blank(&mut self, now_ms: u64) {
+        self.fade = None;
         let black = [[0u8; 3]; MAX_SEGMENTS];
         for (i, v) in self.voices.iter_mut().enumerate() {
             let n = self.streams.segments(i);
             v.smoother.reset(n);
             v.smooth[..n].fill([0; 3]);
-            self.streams.push(i, &black[..n], now_ms);
+            self.streams.push_exact(i, &black[..n], now_ms);
+        }
+    }
+
+    /// Audio stopped (D-063): fade the last output to black over `fade_ms` with an
+    /// ease-out, on timer steps (`fade_due`); `fade_ms = 0` = black now (D-054).
+    pub fn fade_start(&mut self, now: u64) {
+        if self.settings.fade_ms == 0 {
+            self.blank(now / 1_000_000);
+            return;
+        }
+        for v in &mut self.voices {
+            v.from = v.smooth;
+        }
+        self.fade = Some(Fade {
+            start: now,
+            next: now + FADE_STEP_NS,
+            level_q16: 65536,
+        });
+    }
+
+    pub fn fading(&self) -> bool {
+        self.fade.is_some()
+    }
+
+    /// Next fade step (ns), while fading.
+    pub fn fade_due(&self) -> Option<u64> {
+        self.fade.map(|f| f.next)
+    }
+
+    /// One fade step at `now`: the start output × level, through the normal gate;
+    /// the last step sends exact black and ends the fade (true).
+    pub fn fade_step(&mut self, now: u64) -> bool {
+        let Some(f) = self.fade.as_mut() else {
+            return true;
+        };
+        let el_us = now.saturating_sub(f.start) / 1000;
+        let dur_us = u64::from(self.settings.fade_ms) * 1000;
+        let level = fade_level_q16(el_us, dur_us);
+        if level == 0 {
+            self.blank(now / 1_000_000);
+            return true;
+        }
+        f.level_q16 = level;
+        f.next = now + FADE_STEP_NS;
+        for (i, v) in self.voices.iter_mut().enumerate() {
+            let n = self.streams.segments(i);
+            v.smooth[..n].copy_from_slice(&v.from[..n]);
+            color::scale(&mut v.smooth[..n], level);
+            self.streams.push(i, &v.smooth[..n], now / 1_000_000);
+        }
+        false
+    }
+
+    /// Audio is back mid-fade: stop fading at once; the smoother carries on from
+    /// the dimmed output instead of jumping back to the old one.
+    pub fn cancel_fade(&mut self) {
+        if let Some(f) = self.fade.take() {
+            for v in &mut self.voices {
+                v.smoother.scale(f.level_q16);
+            }
+        }
+    }
+
+    /// Paused mid-fade: forget it (razer is OFF; smoothing restarts from black).
+    pub fn drop_fade(&mut self) {
+        if self.fade.take().is_some() {
+            for (i, v) in self.voices.iter_mut().enumerate() {
+                let n = self.streams.segments(i);
+                v.smoother.reset(n);
+                v.smooth[..n].fill([0; 3]);
+            }
         }
     }
 }
@@ -410,6 +512,9 @@ fn run_loop(
         // fires if the monitor stops delivering (sink suspended, device gone).
         let mut dl = ctl.net_deadline(&music.streams);
         let ka = music.streams.keepalive_due_ms();
+        if !paused {
+            dl = min_opt(dl, music.fade_due());
+        }
         if stream.is_some() {
             let grace = music.streams.keepalive_ms() / 4;
             dl = min_opt(dl, ka.map(|t| (t + grace) * MS));
@@ -490,6 +595,10 @@ fn run_loop(
                 // A full window.
                 windows += 1;
                 quiet.heard(now_ns(), samples.iter().all(|&v| v == 0.0));
+                if music.fading() {
+                    debug!("audio is back: fade cancelled");
+                    music.cancel_fade();
+                }
                 let now_us = start.elapsed().as_micros() as u64;
                 if now_us < next_us {
                     continue;
@@ -534,6 +643,7 @@ fn run_loop(
                         debug!("paused: stream closed, razer off");
                         paused = true;
                         stream = None;
+                        music.drop_fade();
                         music.streams.off();
                         status.set_paused(true, &music.streams);
                     }
@@ -562,6 +672,9 @@ fn run_loop(
         if ev[H_TIMER] != 0 {
             ctl.timer.drain();
             rebound |= ctl.service_net(&mut music.streams, now);
+            if !paused && music.fade_due().is_some_and(|t| t <= now) && music.fade_step(now) {
+                debug!("faded to black");
+            }
             if !paused && let Some(st) = stream.as_mut() {
                 match quiet.on_timer(now) {
                     QuietAction::Restart => {
@@ -577,8 +690,8 @@ fn run_loop(
                         }
                     }
                     QuietAction::Blank => {
-                        debug!("no audio for 1.5 s: black until something plays");
-                        music.blank(now / MS);
+                        debug!("no audio for 1.5 s: fading to black until something plays");
+                        music.fade_start(now);
                     }
                     QuietAction::None => {}
                 }
@@ -588,7 +701,8 @@ fn run_loop(
                 music.streams.keepalive(now / MS);
             }
         }
-        if rebound && !paused && stream.is_some() && quiet.blanked() {
+        // (Mid-fade, the next fade step sends to it.)
+        if rebound && !paused && stream.is_some() && quiet.blanked() && !music.fading() {
             music.blank(now / MS);
         }
         status.sync(&music.streams);

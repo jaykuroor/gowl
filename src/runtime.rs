@@ -273,6 +273,12 @@ impl Stream {
         if !self.gate.needs_send(&self.seg[..n], now_ms) {
             return Sent::Skipped;
         }
+        self.send_now(now_ms)
+    }
+
+    /// Send the current segments unconditionally.
+    fn send_now(&mut self, now_ms: u64) -> Sent {
+        let n = self.n();
         let r = self.sender.send_colors(&self.sock, &self.seg[..n]);
         let ok = r.is_ok();
         self.note(r, "frame");
@@ -466,6 +472,19 @@ impl Streams {
         let n = s.n();
         color::reorder(&colors[..n], s.reverse, s.offset, &mut s.seg[..n]);
         let r = s.maybe_send(now_ms);
+        self.after_send(r, now_ms)
+    }
+
+    /// Like `push`, but any difference from the last frame sent goes out (threshold 0),
+    /// so the end of a fade lands exactly on its target (D-063).
+    pub fn push_exact(&mut self, i: usize, colors: &[Rgb], now_ms: u64) -> bool {
+        let s = &mut self.devs[i];
+        let n = s.n();
+        color::reorder(&colors[..n], s.reverse, s.offset, &mut s.seg[..n]);
+        let r = match s.gate.last_sent() {
+            Some(l) if l == &s.seg[..n] => s.maybe_send(now_ms),
+            _ => s.send_now(now_ms),
+        };
         self.after_send(r, now_ms)
     }
 

@@ -506,6 +506,16 @@ impl Smoother {
         self.state.resize(count, [0u16; 3]);
     }
 
+    /// Scale the state by `k_q16` (≤ 1.0): the EMA continues from a dimmed output, as
+    /// if it had been showing that (a fade interrupted by new audio, D-063).
+    pub fn scale(&mut self, k_q16: u32) {
+        for s in &mut self.state {
+            for c in s.iter_mut() {
+                *c = ((u64::from(*c) * u64::from(k_q16.min(65536))) >> 16) as u16;
+            }
+        }
+    }
+
     /// True once another `update` with the same `target` would change nothing (the
     /// EMA reached its fixed point), so a sync loop can stop stepping.
     pub fn settled(&self, target: &[Rgb]) -> bool {
