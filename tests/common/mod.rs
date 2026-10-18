@@ -240,3 +240,59 @@ pub fn synthetic_frame(h: usize, w: usize) -> Vec<u8> {
     }
     f
 }
+
+/// Never reach the real desktop from a test: put a fake `notify-send` first on
+/// PATH (it appends its argv, fields separated by 0x1f, one line per call, to
+/// `dir/notify.log`) and drop the session bus address (XDG_RUNTIME_DIR points into
+/// the test dir too, so libdbus's fallback misses the real bus).
+pub fn fake_desktop<'a>(
+    cmd: &'a mut std::process::Command,
+    dir: &std::path::Path,
+) -> &'a mut std::process::Command {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("fakebin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = bin.join("notify-send");
+    if !script.exists() {
+        let tmp = bin.join("notify-send.tmp");
+        std::fs::write(
+            &tmp,
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\037' \"$a\"; done >> \"$(dirname \"$0\")/../notify.log\"\necho >> \"$(dirname \"$0\")/../notify.log\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&tmp, &script).unwrap();
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut p = std::ffi::OsString::from(bin.as_os_str());
+    p.push(":");
+    p.push(path);
+    cmd.env("PATH", p).env_remove("DBUS_SESSION_BUS_ADDRESS")
+}
+
+/// Notifications the fake `notify-send` recorded in `dir` (each = its argv).
+pub fn notifications(dir: &std::path::Path) -> Vec<Vec<String>> {
+    std::fs::read_to_string(dir.join("notify.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            l.split('\u{1f}')
+                .filter(|a| !a.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .collect()
+}
+
+/// Wait up to 2 s for at least `n` recorded notifications (they are spawned, not
+/// waited for), then return them all.
+pub fn wait_notifications(dir: &std::path::Path, n: usize) -> Vec<Vec<String>> {
+    let t = std::time::Instant::now();
+    loop {
+        let v = notifications(dir);
+        if v.len() >= n || t.elapsed() > std::time::Duration::from_secs(2) {
+            return v;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}

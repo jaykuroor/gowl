@@ -1,12 +1,14 @@
 //! `gowl music` argument handling (no audio server or device needed: usage errors
 //! are reported before libpulse is loaded or anything is sent).
 
+mod common;
+
 use std::process::Command;
 
 fn music(args: &[&str]) -> (i32, String) {
     let tmp = std::env::temp_dir().join(format!("gowl-music-cli-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_gowl"))
+    let out = common::fake_desktop(&mut Command::new(env!("CARGO_BIN_EXE_gowl")), &tmp)
         .arg("music")
         .args(args)
         .env("XDG_CONFIG_HOME", &tmp)

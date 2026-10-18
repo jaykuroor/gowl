@@ -3,6 +3,8 @@
 //! from the queried IP; scan parses, dedupes and never trusts a payload address
 //! outside the interface's subnet. Nothing leaves loopback (unicast probes only).
 
+mod common;
+
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::Duration;
 
@@ -131,18 +133,21 @@ fn device_port_override_is_used_by_one_shots() {
         format!("[device lamp]\nip = 127.0.0.4\nport = {port}\n"),
     )
     .unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_gowl"))
-        .args(["color", "ff0000", "lamp"])
-        .env("GOWL_CONFIG", &cfg)
-        .env("GOWL_PORT_BASE", "17000")
-        .env("XDG_STATE_HOME", &tmp)
-        .env("XDG_CACHE_HOME", &tmp)
-        .env("XDG_RUNTIME_DIR", &tmp)
-        .env("HOME", &tmp)
-        .env_remove("GOWL_DEVICE")
-        .env_remove("GOWL_LOG")
-        .output()
-        .unwrap();
+    let out = common::fake_desktop(
+        &mut std::process::Command::new(env!("CARGO_BIN_EXE_gowl")),
+        &tmp,
+    )
+    .args(["color", "ff0000", "lamp"])
+    .env("GOWL_CONFIG", &cfg)
+    .env("GOWL_PORT_BASE", "17000")
+    .env("XDG_STATE_HOME", &tmp)
+    .env("XDG_CACHE_HOME", &tmp)
+    .env("XDG_RUNTIME_DIR", &tmp)
+    .env("HOME", &tmp)
+    .env_remove("GOWL_DEVICE")
+    .env_remove("GOWL_LOG")
+    .output()
+    .unwrap();
     assert!(
         out.status.success(),
         "{}",

@@ -86,7 +86,7 @@ impl Fake {
 }
 
 fn gowl(tmp: &std::path::Path, args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_gowl"))
+    let out = common::fake_desktop(&mut Command::new(env!("CARGO_BIN_EXE_gowl")), tmp)
         .args(args)
         .env("GOWL_DEVICE", "127.0.0.1")
         .env("GOWL_PORT_BASE", BASE.to_string())

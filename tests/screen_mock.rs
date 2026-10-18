@@ -7,6 +7,7 @@
 //! SIGTERM = razer OFF ×2. Runtime control through the CLI: one instance per
 //! pidfile, `gowl pause|resume|stop`, `gowl toggle` (start and stop).
 
+mod common;
 mod mock_wl;
 
 use std::net::UdpSocket;
@@ -36,6 +37,7 @@ enum Kind {
 
 fn gowl_cmd(tmp: &std::path::Path, wl: &std::path::Path, base: u16) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_gowl"));
+    common::fake_desktop(&mut c, tmp);
     c.env("WAYLAND_DISPLAY", wl)
         .env("GOWL_DEVICE", "127.0.0.1")
         .env("GOWL_PORT_BASE", base.to_string())
@@ -436,4 +438,274 @@ fn s2_static_screen_wakeups() {
     println!("S2 (mock, static): {rate:.2} context switches/s, {ka} keepalives in 10 s");
     assert!(rate <= 3.0, "{rate:.2}/s over the S2 budget");
     assert!((15..=25).contains(&ka), "{ka} keepalives in 10 s at 500 ms");
+}
+
+// ------------------------------------------------------------------ Phase 6: toggle,
+// notifications, status file (D-059, D-060). Notifications go to the fake
+// notify-send of tests/common (never the real desktop).
+
+impl Harness {
+    /// A gowl command with this harness's environment; music gets a sound server
+    /// that doesn't exist (it keeps running and retrying, which is all a switch needs).
+    fn cmd(&self, args: &[&str]) -> Command {
+        let mut c = gowl_cmd(&self.tmp, &self.tmp.join("wayland-mock"), self.base);
+        c.args(args)
+            .env(
+                "PULSE_SERVER",
+                format!("unix:{}", self.tmp.join("no-pulse").display()),
+            )
+            .env("PULSE_COOKIE", self.tmp.join("no-cookie"));
+        c
+    }
+
+    /// `gowl state`, parsed.
+    fn state(&self) -> common::Json {
+        let out = self.cmd(&["state"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(0));
+        common::parse(String::from_utf8(out.stdout).unwrap().trim())
+    }
+
+    /// Summaries (the argument after `--`) of the recorded notifications, after
+    /// waiting for at least `n`.
+    fn notes(&self, n: usize) -> Vec<String> {
+        common::wait_notifications(&self.tmp, n)
+            .iter()
+            .map(|argv| {
+                // notify-send -a gowl -t 2500 -h string:x-canonical-private-synchronous:gowl -- SUMMARY [BODY]
+                assert_eq!(
+                    argv[..7],
+                    [
+                        "-a",
+                        "gowl",
+                        "-t",
+                        "2500",
+                        "-h",
+                        "string:x-canonical-private-synchronous:gowl",
+                        "--"
+                    ],
+                    "{argv:?}"
+                );
+                argv[7].clone()
+            })
+            .collect()
+    }
+}
+
+fn wait_child(c: &mut Child, ms: u64) -> std::process::ExitStatus {
+    let t = Instant::now();
+    loop {
+        if let Some(s) = c.try_wait().unwrap() {
+            return s;
+        }
+        assert!(
+            t.elapsed() < Duration::from_millis(ms),
+            "child still running"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn toggle_resumes_switches_and_notifies() {
+    let mut h = Harness::start_with(
+        "toggle-switch",
+        16800,
+        1000,
+        &["toggle", "screen", "--fps", "30"],
+    );
+    // Started by toggle: "Screen sync on" once setup worked, and the status file.
+    h.collect(1.0);
+    assert_eq!(h.notes(1), ["Screen sync on"]);
+    let s = h.state();
+    assert!(s.get("running").bool());
+    assert_eq!(s.get("mode").str(), "screen");
+    assert!(!s.get("paused").bool());
+    assert_eq!(s.get("fps").u64(), 30);
+    let d = &s.get("devices").arr()[0];
+    assert_eq!(d.get("ip").str(), "127.0.0.1");
+    assert_eq!(d.get("name").str(), "127.0.0.1");
+    assert!(d.get("ok").bool());
+    assert!(s.get("error").is_null());
+    assert_eq!(s.get("pid").u64(), u64::from(h.child.id()));
+
+    // Steady streaming rewrites nothing (rules 5/7).
+    let st = h.tmp.join("gowl.state");
+    let m0 = std::fs::metadata(&st).unwrap().modified().unwrap();
+    h.collect(1.6);
+    assert_eq!(std::fs::metadata(&st).unwrap().modified().unwrap(), m0);
+
+    // pause → notification + paused; toggle on the paused mode resumes it.
+    assert_eq!(h.cli(&["pause"]).0, 0);
+    assert_eq!(h.notes(2)[1], "Screen sync paused");
+    assert!(h.state().get("paused").bool());
+    h.collect(2.0);
+    let (code, err) = h.cli(&["toggle", "screen"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(h.notes(3)[2], "Screen sync resumed");
+    assert!(!h.state().get("paused").bool());
+    h.collect(2.5);
+    let resumed = h.kinds(2.0, 2.5);
+    assert_eq!(resumed.first(), Some(&&Kind::On), "{:?}", h.log);
+
+    // The other mode: screen stops (razer OFF ×2, exit 0), then music starts.
+    let mut music = h
+        .cmd(&["toggle", "music"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let st = wait_child(&mut h.child, 2000);
+    assert!(st.success(), "screen exit {st:?}");
+    h.collect(3.3);
+    let tail = h.kinds(2.5, 3.3);
+    let i = tail
+        .iter()
+        .position(|k| **k == Kind::Off)
+        .expect("razer OFF");
+    assert_eq!(
+        tail[i..],
+        [&Kind::Off, &Kind::Off, &Kind::On],
+        "never two syncs: OFF ×2 before music's ON; {:?}",
+        h.log
+    );
+    let notes = h.notes(4);
+    assert_eq!(notes[3], "Switched from screen to music sync", "{notes:?}");
+    let s = h.state();
+    assert_eq!(s.get("mode").str(), "music");
+    assert_eq!(s.get("pid").u64(), u64::from(music.id()));
+    assert_eq!(s.get("reaction").str(), "flow");
+    assert_eq!(s.get("error").str(), "sound server unreachable");
+
+    // Same mode again: stop. Nothing runs afterwards; the files are gone.
+    let (code, err) = h.cli(&["toggle", "music"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(wait_child(&mut music, 2000).success());
+    assert_eq!(h.notes(5)[4], "Music sync off");
+    assert!(!h.state().get("running").bool());
+    assert!(!h.tmp.join("gowl.state").exists());
+    assert!(!h.tmp.join("gowl.pid").exists());
+    h.collect(3.8);
+    h.tail_is_double_off();
+    let _ = std::fs::remove_dir_all(&h.tmp);
+}
+
+#[test]
+fn failures_are_notified_and_notify_off_silences() {
+    let tmp = std::env::temp_dir().join(format!("gowl-notify-err-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let run = |args: &[&str], dev: bool| {
+        let mut c = gowl_cmd(&tmp, &tmp.join("no-wayland"), 16900);
+        if !dev {
+            c.env_remove("GOWL_DEVICE");
+        }
+        c.args(args).output().unwrap().status.code().unwrap()
+    };
+    // No light at all: a keybind toggle must not fail silently.
+    assert_eq!(run(&["toggle", "screen"], false), 3);
+    let n = common::wait_notifications(&tmp, 1);
+    assert_eq!(n[0][7], "No light configured — run gowl setup", "{n:?}");
+    // No compositor: capture unavailable.
+    assert_eq!(run(&["toggle"], true), 4);
+    assert_eq!(
+        common::wait_notifications(&tmp, 2)[1][7],
+        "Screen capture unavailable"
+    );
+    assert!(!tmp.join("gowl.pid").exists() && !tmp.join("gowl.state").exists());
+    // Nothing running.
+    assert_eq!(run(&["stop"], true), 1);
+    assert_eq!(
+        common::wait_notifications(&tmp, 3)[2][7],
+        "No gowl sync is running"
+    );
+    // A usage error typed into a terminal isn't a notification.
+    assert_eq!(run(&["screen", "--bogus"], true), 2);
+    // notify = off: silent.
+    std::fs::create_dir_all(tmp.join("gowl")).unwrap();
+    std::fs::write(tmp.join("gowl/config"), "notify = off\n").unwrap();
+    assert_eq!(run(&["pause"], true), 1);
+    std::thread::sleep(Duration::from_millis(300));
+    let all = common::notifications(&tmp);
+    assert_eq!(all.len(), 3, "{all:?}");
+    // `gowl state` with nothing running.
+    let out = gowl_cmd(&tmp, &tmp, 16900).arg("state").output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "{\"running\":false}\n"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn watch_prints_each_change_once_and_sees_a_crash() {
+    use std::io::{BufRead, BufReader};
+    let mut h = Harness::start("watch", 17100, 1000);
+    h.collect(0.8);
+    let mut w = h.cmd(&["watch"]).stdout(Stdio::piped()).spawn().unwrap();
+    let (tx, lines) = channel::<String>();
+    let out = w.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for l in BufReader::new(out).lines() {
+            let Ok(l) = l else { break };
+            if tx.send(l).is_err() {
+                break;
+            }
+        }
+    });
+    let next = || {
+        common::parse(
+            &lines
+                .recv_timeout(Duration::from_secs(2))
+                .expect("a state line"),
+        )
+    };
+    let first = next();
+    assert_eq!(first.get("mode").str(), "screen");
+    assert!(!first.get("paused").bool());
+    h.cli(&["pause"]);
+    assert!(next().get("paused").bool());
+    h.cli(&["resume"]);
+    assert!(!next().get("paused").bool());
+    // Steady: no lines, and watch sleeps (no wakeups) meanwhile. (The fake
+    // notify-send logs into this runtime dir: let both of its writes land first.)
+    h.notes(2);
+    h.collect(h.now() + 0.2);
+    let c0 = ctx_switches(w.id());
+    h.collect(h.now() + 1.0);
+    assert!(lines.try_recv().is_err(), "a line without a change");
+    let woke = ctx_switches(w.id()) - c0;
+    assert!(woke <= 1, "watch woke {woke}× while nothing changed");
+    // A crash (SIGKILL: no cleanup, state file left behind) still reads as stopped.
+    h.signal(libc::SIGKILL);
+    wait_child(&mut h.child, 2000);
+    assert_eq!(
+        lines.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "{\"running\":false}"
+    );
+    assert!(
+        h.tmp.join("gowl.state").exists(),
+        "stale file left by the crash"
+    );
+    assert!(!h.state().get("running").bool());
+    // SIGTERM ends watch cleanly.
+    // SAFETY: plain kill(2) on our child.
+    unsafe { libc::kill(w.id() as i32, libc::SIGTERM) };
+    assert!(wait_child(&mut w, 1000).success());
+    let _ = std::fs::remove_dir_all(&h.tmp);
+}
+
+#[test]
+fn watch_exits_when_its_reader_goes_away() {
+    let tmp = std::env::temp_dir().join(format!("gowl-watch-pipe-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let mut w = gowl_cmd(&tmp, &tmp, 17200)
+        .arg("watch")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = [0u8; 18];
+    std::io::Read::read_exact(w.stdout.as_mut().unwrap(), &mut first).unwrap();
+    assert_eq!(&first, b"{\"running\":false}\n");
+    drop(w.stdout.take()); // the reader (a bar) goes away; no change needed to notice
+    assert!(wait_child(&mut w, 1000).success());
+    let _ = std::fs::remove_dir_all(&tmp);
 }

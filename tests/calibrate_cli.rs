@@ -3,6 +3,8 @@
 //! "n" ends the walk, "y" saves keepalive_ms = 70 % of the longest hold into the
 //! config without touching anything else, razer OFF ×2 at the end.
 
+mod common;
+
 use std::io::Write;
 use std::net::UdpSocket;
 use std::process::{Command, Stdio};
@@ -48,7 +50,7 @@ fn keepalive_walk_steps_slower_and_saves_70_percent() {
     let rx = UdpSocket::bind(("127.0.0.1", BASE + 3)).unwrap();
     rx.set_read_timeout(Some(Duration::from_millis(20)))
         .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gowl"))
+    let mut child = common::fake_desktop(&mut Command::new(env!("CARGO_BIN_EXE_gowl")), &tmp)
         .args(["calibrate", "--keepalive"])
         .env("GOWL_DEVICE", "127.0.0.1")
         .env("GOWL_PORT_BASE", BASE.to_string())

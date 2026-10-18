@@ -44,6 +44,8 @@ pub struct Config {
     pub music_brightness: f64,
     pub music_smoothing: f64,
     pub lan_if: Option<String>,
+    /// Desktop notifications from the CLI (`notify-send`, D-059); `notify = off` silences them.
+    pub notify: bool,
     pub devices: Vec<DeviceCfg>,
 }
 
@@ -68,6 +70,7 @@ impl Default for Config {
             music_brightness: 0.85,
             music_smoothing: 0.6,
             lan_if: None,
+            notify: true,
             devices: Vec::new(),
         }
     }
@@ -119,6 +122,14 @@ pub fn load() -> Config {
             Config::default()
         }
     }
+}
+
+/// Like `load`, without printing warnings (the CLI's notification switch, read
+/// again after a command already loaded and warned).
+pub fn load_quiet() -> Config {
+    config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map_or_else(Config::default, |t| parse(&t, &mut |_, _| {}))
 }
 
 fn num<T: std::str::FromStr>(v: &str) -> Result<T, String> {
@@ -225,6 +236,7 @@ fn global_key(c: &mut Config, k: &str, v: &str) -> Result<(), String> {
         "music_brightness" => c.music_brightness = float_in(v, 0.0, 1.0)?,
         "music_smoothing" => c.music_smoothing = float_in(v, 0.0, 1.0)?,
         "lan_if" => c.lan_if = Some(v.to_string()),
+        "notify" => c.notify = boolean(v)?,
         _ => return Err("unknown key (ignored)".into()),
     }
     Ok(())

@@ -31,13 +31,17 @@ usage:
   gowl calibrate --keepalive [DEV]     find the slowest keepalive the light tolerates; saves keepalive_ms=
   gowl pause | resume                  pause the running sync (lights back to normal) / resume it
   gowl stop                            stop the running sync (lights back to normal)
-  gowl toggle [screen|music] [ARGS]    running → stop it; else run that mode (default screen) with ARGS
+  gowl toggle [screen|music] [ARGS]    that mode running → stop; paused → resume; the other mode
+                                       running → switch to this one; nothing running → start it
+  gowl state                           print the sync's state as one JSON line
+  gowl watch                           print the state line now and on every change (for bars)
   gowl --version | --help
 
 DEV = alias | IP | MAC | index from `gowl list`; default: $GOWL_DEVICE, config device=,
 or the only cached device; screen and music take several. One sync at a time
 ($XDG_RUNTIME_DIR/gowl.pid). Config: $XDG_CONFIG_HOME/gowl/config. GOWL_LOG=debug for verbose.
-niri keybind: binds { Mod+Shift+L { spawn \"gowl\" \"toggle\"; } }
+toggle/pause/resume/stop show a desktop notification (notify-send; config notify = off to silence).
+niri keys: Mod+M { spawn \"gowl\" \"toggle\" \"screen\"; }  Mod+Shift+M { spawn \"gowl\" \"toggle\" \"music\"; }
 exit: 0 ok, 1 runtime error (or nothing running), 2 usage, 3 no device, 4 capture unavailable,
 5 no LAN interface";
 
@@ -74,10 +78,46 @@ fn main() {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("gowl: {e}");
+            notify_failure(&args, &e);
             e.exit_code()
         }
     };
     std::process::exit(code);
+}
+
+/// A failed toggle/pause/resume/stop, or a sync that couldn't start or died, shows
+/// one notification (D-059), so a keybind is never silent. A usage error typed
+/// into `gowl screen|music` in a terminal is not notified (the terminal shows it).
+fn notify_failure(args: &[String], e: &Error) {
+    let cmd = args.first().map_or("", String::as_str);
+    let wanted = match cmd {
+        "toggle" | "pause" | "resume" | "stop" => true,
+        "screen" | "music" => !matches!(e, Error::Usage(_)),
+        _ => false,
+    };
+    if !wanted {
+        return;
+    }
+    let text = e.to_string();
+    let (summary, body) = match e {
+        Error::NoDevice(_) => (
+            "No light configured — run gowl setup".to_string(),
+            Some(text),
+        ),
+        Error::NoLanIf(_) => (
+            "Light unreachable: no LAN interface for it".into(),
+            Some(text),
+        ),
+        Error::Capture(_) => ("Screen capture unavailable".into(), Some(text)),
+        Error::Usage(_) => ("gowl: bad command".into(), Some(text)),
+        Error::Io(..) => ("gowl stopped on an error".into(), Some(text)),
+        Error::Runtime(m) => {
+            let mut c = m.chars();
+            let first = c.next().map(|f| f.to_uppercase().collect::<String>());
+            (first.unwrap_or_default() + c.as_str(), None)
+        }
+    };
+    gowl::notify::send(config::load_quiet().notify, &summary, body.as_deref());
 }
 
 fn usage(msg: impl Into<String>) -> Error {
@@ -157,8 +197,8 @@ fn run(args: &[String]) -> Result<(), Error> {
             println!("{}", gowl::capture::list_outputs()?);
             Ok(())
         }
-        "screen" => cmd_screen(rest),
-        "music" => gowl::audio::cmd_music(rest),
+        "screen" => cmd_screen(rest, None),
+        "music" => gowl::audio::cmd_music(rest, None),
         "calibrate" => gowl::calibrate::cmd_calibrate(rest),
         "pause" | "resume" => {
             positionals(cmd, rest, 0)?;
@@ -169,26 +209,74 @@ fn run(args: &[String]) -> Result<(), Error> {
             gowl::control::cmd_stop()
         }
         "toggle" => cmd_toggle(rest),
+        "state" => {
+            positionals(cmd, rest, 0)?;
+            gowl::state::cmd_state()
+        }
+        "watch" => {
+            positionals(cmd, rest, 0)?;
+            gowl::state::cmd_watch()
+        }
         other => Err(usage(format!("unknown command {other:?}"))),
     }
 }
 
-/// `gowl toggle [screen|music] [ARGS...]`: a running sync is stopped (SIGTERM, wait
-/// ≤ 500 ms); otherwise the mode runs in the foreground, which is what niri's
-/// `spawn` keeps alive.
+/// `gowl toggle [screen|music] [ARGS...]` (D-059), what Mod+M / Mod+Shift+M run:
+/// - that mode running → stop it ("Screen sync off"); paused → resume it;
+/// - the other mode running or paused → stop it (wait for the exit: its razer OFF
+///   goes out), then run this one ("Switched from screen to music sync");
+/// - calibration running → refuse (it is interactive);
+/// - nothing running → run this mode in the foreground ("Screen sync on"), which
+///   is what niri's `spawn` keeps alive.
+///
+/// The "on"/"switched" notification goes out once setup worked (light, LAN
+/// interface, capture); a setup error is notified instead (main).
 fn cmd_toggle(rest: &[String]) -> Result<(), Error> {
-    let (mode, args) = match rest.first().map(String::as_str) {
-        Some(m @ ("screen" | "music")) => (m, &rest[1..]),
-        _ => ("screen", rest),
+    use gowl::state::Mode;
+    let (want, args) = match rest.first().map(String::as_str) {
+        Some("music") => (Mode::Music, &rest[1..]),
+        Some("screen") => (Mode::Screen, &rest[1..]),
+        _ => (Mode::Screen, rest),
     };
-    match gowl::control::stop_running(500)? {
-        Some(true) => Ok(()),
-        Some(false) => {
-            warn!("the running gowl got the stop signal but has not exited within 500 ms");
-            Ok(())
-        }
-        None if mode == "music" => gowl::audio::cmd_music(args),
-        None => cmd_screen(args),
+    let notify = config::load_quiet().notify;
+    let announce = match gowl::control::session() {
+        None => format!("{} on", want.title()),
+        // The other mode, if it is one; None = the same mode, or a gowl that
+        // doesn't say which (toggle it).
+        Some(s) => match s.info.mode.filter(|&m| m != want) {
+            Some(Mode::Calibrate) => {
+                return Err(Error::Runtime(
+                    "calibration is running; finish it (or `gowl stop`) first".into(),
+                ));
+            }
+            None => {
+                if s.info.paused {
+                    s.pause(true)?;
+                    gowl::notify::send(notify, &format!("{} resumed", s.title()), None);
+                } else if s.stop(1000)? {
+                    gowl::notify::send(notify, &format!("{} off", s.title()), None);
+                } else {
+                    return Err(Error::Runtime(format!(
+                        "{} got the stop signal but has not exited after 1 s",
+                        s.title()
+                    )));
+                }
+                return Ok(());
+            }
+            Some(other) => {
+                if !s.stop(2000)? {
+                    return Err(Error::Runtime(format!(
+                        "can't switch: {} has not stopped after 2 s",
+                        other.title().to_lowercase()
+                    )));
+                }
+                format!("Switched from {} to {} sync", other.name(), want.name())
+            }
+        },
+    };
+    match want {
+        Mode::Music => gowl::audio::cmd_music(args, Some(&announce)),
+        _ => cmd_screen(args, Some(&announce)),
     }
 }
 
@@ -473,8 +561,9 @@ fn cmd_scan(rest: &[String]) -> Result<(), Error> {
     Ok(())
 }
 
-/// `gowl screen [--output NAME] [--fps N] [--depth D] [DEV...]`.
-fn cmd_screen(rest: &[String]) -> Result<(), Error> {
+/// `gowl screen [--output NAME] [--fps N] [--depth D] [DEV...]`. `announce`: the
+/// notification to show once setup worked (toggle).
+fn cmd_screen(rest: &[String], announce: Option<&str>) -> Result<(), Error> {
     let c = ctx();
     let mut output = c.cfg.output.clone();
     let mut fps = c.cfg.fps;
@@ -522,7 +611,7 @@ fn cmd_screen(rest: &[String]) -> Result<(), Error> {
     }
     // Signals blocked before anything streams; then claim the pidfile.
     let mut ctl = gowl::runtime::Ctl::new()?;
-    let _pidfile = gowl::control::Pidfile::acquire()?;
+    let pidfile = gowl::control::Pidfile::acquire()?;
     let streams = gowl::runtime::Streams::open(
         &devices,
         c.cfg.lan_if.as_deref(),
@@ -540,5 +629,16 @@ fn cmd_screen(rest: &[String]) -> Result<(), Error> {
         fps,
         gowl::runtime::DEVICE_MAX_HZ
     );
-    gowl::runtime::run_screen(cap.as_mut(), &mut pipe, &mut ctl)
+    pipe.streams.razer(true);
+    let mut st = gowl::state::Writer::start(
+        pidfile,
+        gowl::state::Mode::Screen,
+        fps,
+        Vec::new(),
+        &pipe.streams,
+    );
+    if let Some(a) = announce {
+        gowl::notify::send(c.cfg.notify, a, None);
+    }
+    gowl::runtime::run_screen(cap.as_mut(), &mut pipe, &mut ctl, &mut st)
 }

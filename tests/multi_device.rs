@@ -138,7 +138,7 @@ fn screen_fans_out_to_two_fake_devices() {
             mock_wl::serve(OwnedFd::from(stream), opts, s2);
         }
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gowl"))
+    let mut child = common::fake_desktop(&mut Command::new(env!("CARGO_BIN_EXE_gowl")), &tmp)
         // `127.0.0.2` is desk again: streamed to once.
         .args(["screen", "--fps", "30", "desk", "shelf", "127.0.0.2"])
         .env("WAYLAND_DISPLAY", &sock_path)

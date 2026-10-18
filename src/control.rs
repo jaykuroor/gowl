@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 
 use crate::config;
 use crate::error::Error;
+use crate::notify;
+use crate::state::{self, Mode};
 
 /// `$XDG_RUNTIME_DIR/gowl.pid`.
 pub fn pidfile_path() -> Option<PathBuf> {
@@ -224,17 +226,57 @@ impl Proc {
     }
 }
 
-/// The running sync, as a signalable handle, if there is one.
-fn running() -> Option<Proc> {
+/// The running session: a signalable handle plus what it is doing (mode and
+/// paused, from its status file or, for a gowl that writes none, its command line).
+pub struct Session {
+    proc: Proc,
+    pub info: state::Info,
+}
+
+/// The running session, if there is one.
+pub fn session() -> Option<Session> {
     let path = pidfile_path()?;
-    let pid = running_at(&path)?;
-    let p = Proc::open(pid);
+    let info = state::info()?;
+    let p = Proc::open(info.pid);
     // Re-check after the pidfd pins the process: still the holder of the lock?
-    if running_at(&path) == Some(pid) {
-        Some(p)
+    if running_at(&path) == Some(info.pid) {
+        Some(Session { proc: p, info })
     } else {
-        debug!("pidfile {} changed hands (pid {pid})", path.display());
+        debug!(
+            "pidfile {} changed hands (pid {})",
+            path.display(),
+            info.pid
+        );
         None
+    }
+}
+
+impl Session {
+    /// "Screen sync", "Music sync", "Calibration" or "gowl sync" (mode unknown).
+    pub fn title(&self) -> &'static str {
+        self.info.mode.map_or("gowl sync", Mode::title)
+    }
+
+    /// SIGUSR1 (pause) / SIGUSR2 (resume).
+    pub fn pause(&self, resume: bool) -> Result<(), Error> {
+        let sig = if resume { libc::SIGUSR2 } else { libc::SIGUSR1 };
+        self.proc.signal(sig).map_err(|e| Error::Io("signal", e))
+    }
+
+    /// SIGTERM, then wait up to `ms` for the exit. True if it exited.
+    pub fn stop(&self, ms: i32) -> Result<bool, Error> {
+        match self.proc.signal(libc::SIGTERM) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(true),
+            Err(e) => return Err(Error::Io("signal", e)),
+        }
+        let exited = self.proc.wait_exit(ms);
+        debug!(
+            "pid {} {}",
+            self.proc.pid,
+            if exited { "exited" } else { "still running" }
+        );
+        Ok(exited)
     }
 }
 
@@ -242,43 +284,40 @@ fn not_running() -> Error {
     Error::Runtime("no gowl sync is running".into())
 }
 
-/// `gowl pause` / `gowl resume`: SIGUSR1 / SIGUSR2 to the running sync.
+/// `gowl pause` / `gowl resume`: SIGUSR1 / SIGUSR2 to the running sync, and a
+/// notification ("Screen sync paused"). Errors are notified by main.
 pub fn cmd_pause(resume: bool) -> Result<(), Error> {
-    let p = running().ok_or_else(not_running)?;
-    let sig = if resume { libc::SIGUSR2 } else { libc::SIGUSR1 };
-    p.signal(sig).map_err(|e| Error::Io("signal", e))
+    let s = session().ok_or_else(not_running)?;
+    if s.info.mode == Some(Mode::Calibrate) {
+        return Err(Error::Runtime(
+            "calibration is running; pause and resume don't apply to it".into(),
+        ));
+    }
+    s.pause(resume)?;
+    let what = if resume { "resumed" } else { "paused" };
+    notify::send(
+        config::load_quiet().notify,
+        &format!("{} {what}", s.title()),
+        None,
+    );
+    Ok(())
 }
 
 /// `gowl stop`: SIGTERM, then wait up to 1 s for the exit (the shutdown contract
-/// promises 100 ms).
+/// promises 100 ms); "Screen sync off".
 pub fn cmd_stop() -> Result<(), Error> {
-    if stop_running(1000)?.ok_or_else(not_running)? {
-        Ok(())
-    } else {
-        Err(Error::Runtime(
+    let s = session().ok_or_else(not_running)?;
+    if !s.stop(1000)? {
+        return Err(Error::Runtime(
             "gowl got the stop signal but has not exited after 1 s".into(),
-        ))
+        ));
     }
-}
-
-/// Stop the running sync if there is one: `None` = nothing was running,
-/// `Some(exited_within_ms)` otherwise.
-pub fn stop_running(ms: i32) -> Result<Option<bool>, Error> {
-    let Some(p) = running() else {
-        return Ok(None);
-    };
-    match p.signal(libc::SIGTERM) {
-        Ok(()) => {}
-        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(Some(true)),
-        Err(e) => return Err(Error::Io("signal", e)),
-    }
-    let exited = p.wait_exit(ms);
-    debug!(
-        "pid {} {}",
-        p.pid,
-        if exited { "exited" } else { "still running" }
+    notify::send(
+        config::load_quiet().notify,
+        &format!("{} off", s.title()),
+        None,
     );
-    Ok(Some(exited))
+    Ok(())
 }
 
 #[cfg(test)]

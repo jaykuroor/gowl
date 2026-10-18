@@ -26,6 +26,7 @@ use crate::error::Error;
 use crate::net::Ports;
 use crate::proto::MAX_SEGMENTS;
 use crate::runtime::{self, Ctl, Sig, Streams};
+use crate::state::{Mode, Writer};
 
 const RED: Rgb = [255, 0, 0];
 const DIM: Rgb = [24, 24, 24];
@@ -243,7 +244,7 @@ pub fn cmd_calibrate(rest: &[String]) -> Result<(), Error> {
     let dev = devices::resolve(spec, &cfg, &cache)?;
     let ports = Ports::from_env();
     let mut ctl = Ctl::new()?;
-    let _pidfile = Pidfile::acquire()?;
+    let pidfile = Pidfile::acquire()?;
     let open = |n: usize, keepalive: u32| -> Result<Streams, Error> {
         // Raw segment order while calibrating: no layout, reverse or offset.
         let d = Device {
@@ -256,7 +257,7 @@ pub fn cmd_calibrate(rest: &[String]) -> Result<(), Error> {
         Streams::open(&[d], cfg.lan_if.as_deref(), ports, 0, keepalive, false)
     };
     if keepalive_mode {
-        return tune_keepalive(&dev, &cfg, &open, &mut ctl);
+        return tune_keepalive(&dev, &cfg, &open, &mut ctl, pidfile);
     }
     let keepalive = if cfg.keepalive_ms == 0 {
         500
@@ -277,9 +278,12 @@ pub fn cmd_calibrate(rest: &[String]) -> Result<(), Error> {
         walk.walk.n()
     );
     streams.razer(true);
+    // Bars see "calibrate" (and toggle refuses to switch away from it).
+    let st = Writer::start(pidfile, Mode::Calibrate, 0, Vec::new(), &streams);
     walk.show(&mut streams);
     let r = line_loop(&mut walk, &mut streams, &mut ctl);
     streams.shutdown();
+    drop(st);
     match r? {
         true => {
             let layout = walk.walk.layout();
@@ -635,6 +639,7 @@ fn tune_keepalive(
     cfg: &Config,
     open: &dyn Fn(usize, u32) -> Result<Streams, Error>,
     ctl: &mut Ctl,
+    pidfile: Option<Pidfile>,
 ) -> Result<(), Error> {
     let n = usize::from(dev.segments).clamp(1, MAX_SEGMENTS);
     let mut sess = TuneSession {
@@ -648,9 +653,11 @@ fn tune_keepalive(
         cfg.keepalive_ms
     );
     streams.razer(true);
+    let st = Writer::start(pidfile, Mode::Calibrate, 0, Vec::new(), &streams);
     sess.show(&mut streams);
     let r = line_loop(&mut sess, &mut streams, ctl);
     streams.shutdown();
+    drop(st);
     if !r? {
         println!("not saved");
         return Ok(());

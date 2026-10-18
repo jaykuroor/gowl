@@ -24,6 +24,7 @@ use crate::error::Error;
 use crate::net::{self, Iface, Ports, Sender};
 use crate::netwatch::{NetWatch, Pending, Verify};
 use crate::proto::MAX_SEGMENTS;
+use crate::state::{Problem, Writer};
 
 /// Heap allocations seen by the `count-alloc` global allocator (main.rs); stays 0
 /// without that feature. Printed in the once-per-second debug line.
@@ -204,6 +205,8 @@ const RESELECT_BACKOFF: [u64; 3] = [250 * MS, 1000 * MS, 5000 * MS];
 /// One device being streamed to.
 pub struct Stream {
     pub label: String,
+    /// Config alias, if any (the status file names the device by it, else by IP).
+    alias: Option<String>,
     sock: UdpSocket,
     sender: Sender,
     gate: SendGate,
@@ -222,6 +225,8 @@ pub struct Stream {
     net_down: bool,
     /// Re-selection found no LAN interface for this device (logged once).
     no_lan: bool,
+    /// Times `failing` flipped (status file change detection, D-060).
+    flips: u64,
 }
 
 /// What one send attempt did.
@@ -237,8 +242,29 @@ impl Stream {
         self.sender.segments()
     }
 
-    fn ip(&self) -> Ipv4Addr {
+    pub fn ip(&self) -> Ipv4Addr {
         *self.sender.dst.ip()
+    }
+
+    /// Alias, if the device has one.
+    pub fn alias(&self) -> Option<&str> {
+        self.alias.as_deref()
+    }
+
+    /// The LAN interface the socket is bound to; None while no LAN reaches it.
+    pub fn iface_name(&self) -> Option<&str> {
+        (!self.no_lan).then_some(self.iface.name.as_str())
+    }
+
+    /// Why this device isn't being reached, if it isn't.
+    pub fn problem(&self) -> Option<&'static str> {
+        if self.no_lan {
+            Some("no LAN interface reaches it")
+        } else if self.failing {
+            Some("sending fails")
+        } else {
+            None
+        }
     }
 
     /// Send the current segments if the gate says so (delta or keepalive).
@@ -263,6 +289,7 @@ impl Stream {
                 if self.failing {
                     warn!("{}: sending works again", self.label);
                     self.failing = false;
+                    self.flips += 1;
                 }
             }
             Err(e) => {
@@ -277,6 +304,7 @@ impl Stream {
                         warn!("{}: {what} send failed: {e}", self.label);
                     }
                     self.failing = true;
+                    self.flips += 1;
                 }
             }
         }
@@ -310,6 +338,8 @@ pub struct Streams {
     /// Bumped whenever a device's bound interface (or "no LAN") changes, so `Ctl`
     /// re-filters link notifications for the new set (D-056).
     pub links_gen: u64,
+    /// Devices that moved to a new IP (status file change detection).
+    moves: u64,
 }
 
 impl Streams {
@@ -337,6 +367,7 @@ impl Streams {
             let layout = d.layout.clone().filter(|l| use_layout && l.len() == n);
             devs.push(Stream {
                 label: d.label(),
+                alias: d.alias.clone(),
                 sock,
                 sender: Sender::new(SocketAddrV4::new(d.ip, d.control_port(ports)), n),
                 gate: SendGate::new(threshold, u64::from(keepalive_ms)),
@@ -355,6 +386,7 @@ impl Streams {
                 mac: d.mac.clone(),
                 net_down: false,
                 no_lan: false,
+                flips: 0,
             });
         }
         emergency::install();
@@ -372,7 +404,15 @@ impl Streams {
             backoff: 0,
             verify: None,
             links_gen: 1,
+            moves: 0,
         })
+    }
+
+    /// Changes whenever something the status file shows about the devices changes
+    /// (interface, IP, reachable or not); a few integer adds, called once per loop
+    /// turn so the file is rewritten only on a change (D-060).
+    pub fn health_gen(&self) -> u64 {
+        self.links_gen + self.moves + self.devs.iter().map(|s| s.flips).sum::<u64>()
     }
 
     /// Segment count of device `i`.
@@ -613,6 +653,7 @@ impl Streams {
         if v.done() {
             self.verify = None;
         }
+        self.moves += moved.len() as u64;
         for m in &moved {
             let live = self.live;
             let s = &mut self.devs[m.dev];
@@ -719,6 +760,7 @@ mod emergency {
             let prev = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |info| {
                 send_off();
+                crate::state::panic_cleanup();
                 prev(info);
             }));
         });
@@ -1061,16 +1103,27 @@ impl Pipeline {
 const BACKOFF_FIRST: u64 = 100 * MS;
 const BACKOFF_NEXT: u64 = 1000 * MS;
 
-/// `gowl screen`: run until a stop signal. Sends razer ON first and the shutdown
-/// sequence (razer OFF ×2) on every exit path.
-pub fn run_screen(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Result<(), Error> {
-    pipe.streams.razer(true);
-    let r = screen_loop(cap, pipe, ctl);
+/// `gowl screen`: run until a stop signal, after razer ON (sent by the caller,
+/// before the first status line). Sends the shutdown sequence (razer OFF ×2) on
+/// every exit path. `st` gets every visible state change (pause, output gone,
+/// device rebound or unreachable).
+pub fn run_screen(
+    cap: &mut dyn Capture,
+    pipe: &mut Pipeline,
+    ctl: &mut Ctl,
+    status: &mut Writer,
+) -> Result<(), Error> {
+    let r = screen_loop(cap, pipe, ctl, status);
     pipe.streams.shutdown();
     r
 }
 
-fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Result<(), Error> {
+fn screen_loop(
+    cap: &mut dyn Capture,
+    pipe: &mut Pipeline,
+    ctl: &mut Ctl,
+    status: &mut Writer,
+) -> Result<(), Error> {
     let mut next_capture = Some(now_ns());
     let mut last_request = 0u64;
     let mut fails = 0u32;
@@ -1148,6 +1201,7 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
                             pipe.pause(now);
                         }
                         pipe.streams.off();
+                        status.set_paused(true, &pipe.streams);
                     }
                     Sig::Resume if paused => {
                         debug!("resumed");
@@ -1157,6 +1211,7 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
                             pipe.resume(now);
                             next_capture = Some(now);
                         }
+                        status.set_paused(false, &pipe.streams);
                     }
                     _ => {}
                 }
@@ -1182,6 +1237,7 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
                         pipe.pause(now);
                         pipe.streams.off();
                     }
+                    status.set_problem(Problem::OutputGone, &pipe.streams);
                 }
                 if st.found {
                     if waiting {
@@ -1194,6 +1250,7 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
                             pipe.streams.razer(true);
                             pipe.resume(now);
                         }
+                        status.set_problem(Problem::None, &pipe.streams);
                     }
                     if !paused {
                         next_capture = Some(now);
@@ -1276,6 +1333,8 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
                 pipe.resend(now);
             }
         }
+        // Rebound / moved / unreachable / recovered: one integer compare when not.
+        status.sync(&pipe.streams);
 
         if now >= report_at && crate::log::enabled(crate::log::DEBUG) {
             let allocs = ALLOCS.load(Ordering::Relaxed);
@@ -1371,6 +1430,64 @@ mod tests {
         assert!(s.devs[0].no_lan);
         assert!(s.reselect_with(&ifaces, 0));
         assert!(!s.devs[0].no_lan);
+    }
+
+    #[test]
+    fn status_line_follows_rebinds_and_failures_and_is_written_only_on_change() {
+        use crate::state::{Mode, Problem, Writer};
+        let (mut s, _rx, ifaces) = setup();
+        let mut w = Writer::start_in(None, None, Mode::Screen, 30, Vec::new(), &s);
+        assert_eq!(w.writes(), 1);
+        let l = w.line(&s);
+        assert!(
+            l.contains(r#""mode":"screen","paused":false,"fps":30"#),
+            "{l}"
+        );
+        assert!(
+            l.contains(r#""name":"127.0.0.1","ip":"127.0.0.1","iface":"lo","ok":true"#),
+            "{l}"
+        );
+        assert!(l.ends_with(r#""error":null}"#), "{l}");
+        // Steady: sends and keepalives change nothing visible.
+        s.razer(true);
+        s.push(0, &[[9, 9, 9]; 4], 1);
+        s.keepalive(10_000);
+        w.sync(&s);
+        assert!(!s.reselect_with(&ifaces, 0));
+        w.sync(&s);
+        assert_eq!(w.writes(), 1, "nothing changed");
+        // No LAN interface → not ok + error; back → ok again.
+        s.reselect_with(&[], 0);
+        w.sync(&s);
+        assert_eq!(w.writes(), 2);
+        let l = w.line(&s);
+        assert!(l.contains(r#""iface":"","ok":false"#), "{l}");
+        assert!(
+            l.contains(r#""error":"127.0.0.1: no LAN interface reaches it""#),
+            "{l}"
+        );
+        s.reselect_with(&ifaces, 0);
+        w.sync(&s);
+        assert_eq!(w.writes(), 3);
+        assert!(w.line(&s).contains(r#""ok":true"#));
+        // Sending fails / works again.
+        s.devs[0].note(Err(io::Error::from_raw_os_error(libc::EPERM)), "frame");
+        w.sync(&s);
+        assert!(w.line(&s).contains(r#""error":"127.0.0.1: sending fails""#));
+        s.devs[0].note(Ok(()), "frame");
+        w.sync(&s);
+        assert_eq!(w.writes(), 5);
+        // Pause and session problems: once each, idempotent.
+        w.set_paused(true, &s);
+        w.set_paused(true, &s);
+        w.set_problem(Problem::OutputGone, &s);
+        w.set_problem(Problem::OutputGone, &s);
+        assert_eq!(w.writes(), 7);
+        let l = w.line(&s);
+        assert!(
+            l.contains(r#""paused":true"#) && l.contains(r#""error":"screen output gone""#),
+            "{l}"
+        );
     }
 
     #[test]

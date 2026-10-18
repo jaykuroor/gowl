@@ -16,7 +16,9 @@ pub mod doctor;
 pub mod error;
 pub mod net;
 pub mod netwatch;
+pub mod notify;
 pub mod proto;
 pub mod runtime;
+pub mod state;
 
 pub use error::Error;

@@ -29,6 +29,9 @@ music_smoothing = 0.6
 # ProtonVPN, WireGuard, OpenVPN) can't reroute it. Only set this to force a choice.
 # lan_if = wlp3s0
 
+# ---- desktop ----
+notify = on              # notifications for toggle/pause/resume/stop and failed syncs (notify-send); off = silent
+
 # ---- devices ----
 [device desk]
 mac = AA:BB:CC:DD:EE:FF:00:11

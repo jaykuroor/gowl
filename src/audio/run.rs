@@ -24,6 +24,7 @@ use crate::devices;
 use crate::net::Ports;
 use crate::proto::MAX_SEGMENTS;
 use crate::runtime::{Ctl, Sig, Streams, min_opt, now_ns};
+use crate::state::{Mode, Problem, Writer};
 
 /// Legacy `max_update_hz` for Govee LAN devices.
 pub const DEVICE_CAP_HZ: u32 = 40;
@@ -269,8 +270,9 @@ impl Music {
 
 // ------------------------------------------------------------------ command
 
-/// `gowl music [--reaction R] [--palette P] [--fps N] [DEV...]`
-pub fn cmd_music(args: &[String]) -> Result<(), Error> {
+/// `gowl music [--reaction R] [--palette P] [--fps N] [DEV...]`. `announce`: the
+/// notification to show once setup worked (toggle).
+pub fn cmd_music(args: &[String], announce: Option<&str>) -> Result<(), Error> {
     let cfg = config::load();
     let mut s = Settings::from_config(&cfg)?;
     let mut specs: Vec<&str> = Vec::new();
@@ -303,7 +305,7 @@ pub fn cmd_music(args: &[String]) -> Result<(), Error> {
     let devs = devices::resolve_many(&specs, &cfg, &cache)?;
     // Signals blocked before anything streams; then claim the pidfile.
     let mut ctl = Ctl::new()?;
-    let _pidfile = Pidfile::acquire()?;
+    let pidfile = Pidfile::acquire()?;
     let streams = Streams::open(
         &devs,
         cfg.lan_if.as_deref(),
@@ -332,10 +334,19 @@ pub fn cmd_music(args: &[String]) -> Result<(), Error> {
     );
 
     let pulse = Pulse::load()?;
+    let hz = 1_000_000 / s.interval_us();
+    let extra = vec![
+        ("reaction", s.reaction.name().to_string()),
+        ("palette", s.palette.name().to_string()),
+    ];
     let mut music = Music::new(s, streams);
     // From the first razer ON on, every exit path below runs the OFF rounds.
     music.streams.razer(true);
-    let r = run_loop(&pulse, &mut music, &mut ctl);
+    let mut status = Writer::start(pidfile, Mode::Music, hz as u32, extra, &music.streams);
+    if let Some(a) = announce {
+        crate::notify::send(cfg.notify, a, None);
+    }
+    let r = run_loop(&pulse, &mut music, &mut ctl, &mut status);
     music.streams.shutdown();
     r
 }
@@ -365,7 +376,12 @@ pub fn open_capture<'a>(
 /// The music loop. States: streaming (blocked in the mainloop's poll, which also
 /// watches our fds), stream down (retry every second, keepalive the last frame) and
 /// paused (stream closed, razer OFF, timer disarmed: zero wakeups).
-fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error> {
+fn run_loop(
+    pulse: &Pulse,
+    music: &mut Music,
+    ctl: &mut Ctl,
+    status: &mut Writer,
+) -> Result<(), Error> {
     let hook = Hook::default();
     hook.set_fd(H_SIG, ctl.sig.fd());
     hook.set_fd(H_TIMER, ctl.timer.fd());
@@ -411,6 +427,7 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
                     if warned {
                         warn!("audio capture is back");
                         warned = false;
+                        status.set_problem(Problem::None, &music.streams);
                     }
                     if failed {
                         // The light may have left stream mode during the outage.
@@ -436,6 +453,7 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
                             SOURCE.to_string_lossy()
                         );
                         warned = true;
+                        status.set_problem(Problem::NoAudio, &music.streams);
                     }
                     failed = true;
                     retry_at = Some(now_ns() + retry_ns);
@@ -484,6 +502,7 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
                 };
                 renders += 1;
                 sends += music.tick(&samples, now_us / 1000) as u32;
+                status.sync(&music.streams);
                 if verbose && now_us / 1000 >= stat_at + 1000 {
                     let b = music.last_bands;
                     debug!(
@@ -516,6 +535,7 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
                         paused = true;
                         stream = None;
                         music.streams.off();
+                        status.set_paused(true, &music.streams);
                     }
                     Sig::Resume if paused => {
                         debug!("resumed");
@@ -523,6 +543,7 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
                         music.streams.razer(true);
                         failed = false; // razer ON just went out
                         retry_at = Some(now);
+                        status.set_paused(false, &music.streams);
                     }
                     _ => {}
                 }
@@ -570,6 +591,7 @@ fn run_loop(pulse: &Pulse, music: &mut Music, ctl: &mut Ctl) -> Result<(), Error
         if rebound && !paused && stream.is_some() && quiet.blanked() {
             music.blank(now / MS);
         }
+        status.sync(&music.streams);
     }
 }
 
