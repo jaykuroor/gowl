@@ -48,6 +48,9 @@ pub enum Ctl {
     /// Send `failed` for the next frame right after its `buffer_done`, before the
     /// client copies (the gap D-051 widens to up to one frame interval).
     FailBeforeCopy,
+    /// Keep completing copies but with unchanged pixels (true) — like niri with an
+    /// animation away from the edges — or back to new colors every frame (false).
+    SameContent(bool),
 }
 
 /// Serve one client until it disconnects. `served` counts completed frames.
@@ -69,6 +72,7 @@ pub fn serve_ctl(fd: OwnedFd, o: Opts, served: Arc<AtomicUsize>, ctl: Option<Rec
     let stride = o.width * 4 + 64; // padded, to exercise stride handling
     let mut k = 0usize;
     let mut fail_before_copy = false;
+    let mut frozen: Option<usize> = None;
     loop {
         loop {
             let ev = match c.next_event() {
@@ -190,7 +194,7 @@ pub fn serve_ctl(fd: OwnedFd, o: Opts, served: Arc<AtomicUsize>, ctl: Option<Rec
                         let p = &pools[pi];
                         // SAFETY: the pool mapping is live and len bytes long.
                         let mem = unsafe { std::slice::from_raw_parts_mut(p.ptr, p.len) };
-                        let [r, g, b] = color_of(k);
+                        let [r, g, b] = color_of(frozen.unwrap_or(k));
                         for y in 0..o.height as usize {
                             let row = &mut mem[y * s as usize..][..o.width as usize * 4];
                             for px in row.as_chunks_mut::<4>().0 {
@@ -248,6 +252,7 @@ pub fn serve_ctl(fd: OwnedFd, o: Opts, served: Arc<AtomicUsize>, ctl: Option<Rec
                                 out_global = 0;
                             }
                             Ctl::FailBeforeCopy => fail_before_copy = true,
+                            Ctl::SameContent(on) => frozen = on.then_some(k.saturating_sub(1)),
                             Ctl::AddOutput { more_frames } => {
                                 out_global = next_global;
                                 next_global += 1;

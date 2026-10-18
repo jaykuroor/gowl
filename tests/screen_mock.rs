@@ -262,6 +262,46 @@ fn failed_while_held_backs_off_and_recovers() {
     h.tail_is_double_off();
 }
 
+/// D-057: copies keep completing but the edges don't change (niri redraws for an
+/// animation elsewhere) → after `idle_after_ms` (1 s) capture drops to `idle_fps`
+/// (5); the first changed frame brings back the configured 30 fps.
+#[test]
+fn idle_capture_rate_drops_and_recovers() {
+    let mut h = Harness::start("screen-idle", 16600, usize::MAX);
+    let served = |h: &Harness| h.served.load(Ordering::SeqCst);
+    h.collect(1.0);
+    let a = served(&h);
+    h.collect(2.0);
+    let busy = served(&h) - a;
+    h.ctl.send(mock_wl::Ctl::SameContent(true)).unwrap();
+    h.collect(3.5); // 1 s to notice, then idle
+    let b = served(&h);
+    h.collect(5.5);
+    let idle = served(&h) - b;
+    h.ctl.send(mock_wl::Ctl::SameContent(false)).unwrap();
+    let t = h.now();
+    let c = served(&h);
+    // the first changed frame comes within one idle interval (200 ms), then 30 fps
+    h.collect(t + 0.3);
+    let first = served(&h) - c;
+    let d = served(&h);
+    h.collect(t + 1.3);
+    let back = served(&h) - d;
+    let (_, err) = h.stop();
+    println!(
+        "busy {busy}/s, idle {}/s, after the change {first} in 0.3 s, then {back}/s",
+        idle / 2
+    );
+    assert!((27..=33).contains(&busy), "busy {busy}/s; {err}");
+    assert!(
+        (8..=12).contains(&idle),
+        "idle {idle} in 2 s (5 fps); {err}"
+    );
+    assert!(first >= 2, "rate did not come back within 0.3 s ({first})");
+    assert!((27..=33).contains(&back), "after the change {back}/s");
+    h.tail_is_double_off();
+}
+
 #[test]
 fn output_unplug_and_replug() {
     let mut h = Harness::start("screen-hotplug", 16100, 10);

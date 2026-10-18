@@ -33,6 +33,10 @@ pub struct Config {
     pub smoothing: f64,
     pub threshold: u8,
     pub keepalive_ms: u32,
+    /// Capture rate while the edge colors stay put (D-057); 0 or ≥ fps = off.
+    pub idle_fps: u32,
+    /// How long without a change above `threshold` before `idle_fps` applies.
+    pub idle_after_ms: u32,
     pub reaction: String,
     pub palette: String,
     pub music_fps: u32,
@@ -55,6 +59,8 @@ impl Default for Config {
             smoothing: 0.55,
             threshold: 3,
             keepalive_ms: 500,
+            idle_fps: 5,
+            idle_after_ms: 1000,
             reaction: "flow".into(),
             palette: "rgb".into(),
             music_fps: 60,
@@ -210,6 +216,8 @@ fn global_key(c: &mut Config, k: &str, v: &str) -> Result<(), String> {
         "smoothing" => c.smoothing = float_in(v, 0.0, 1.0)?,
         "threshold" => c.threshold = int_in(v, 0, 255)?,
         "keepalive_ms" => c.keepalive_ms = int_in(v, 0, 60_000)?,
+        "idle_fps" => c.idle_fps = int_in(v, 0, 40)?,
+        "idle_after_ms" => c.idle_after_ms = int_in(v, 0, 600_000)?,
         "reaction" => c.reaction = v.to_string(),
         "palette" => c.palette = v.to_string(),
         "music_fps" => c.music_fps = int_in(v, 1, 240)?,

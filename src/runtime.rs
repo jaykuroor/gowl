@@ -409,6 +409,16 @@ impl Streams {
         }
     }
 
+    /// Would pushing `colors` (zone order) to device `i` send a delta frame? (Gate
+    /// semantics, keepalive ignored; true if nothing was sent since razer ON.)
+    pub fn would_send(&self, i: usize, colors: &[Rgb]) -> bool {
+        let s = &self.devs[i];
+        let n = s.n();
+        let mut seg = [[0u8; 3]; MAX_SEGMENTS];
+        color::reorder(&colors[..n], s.reverse, s.offset, &mut seg[..n]);
+        color::colors_changed(s.gate.last_sent(), &seg[..n], s.gate.threshold)
+    }
+
     /// New colors (zone order, `colors.len() == segments`) for device `i`.
     /// Returns true if a datagram went out.
     pub fn push(&mut self, i: usize, colors: &[Rgb], now_ms: u64) -> bool {
@@ -803,6 +813,8 @@ struct Group {
     out: Vec<Rgb>,
     settled: bool,
     devs: Vec<usize>,
+    /// Target at the last change above the threshold (D-057 idle detection).
+    anchor: Vec<Rgb>,
 }
 
 /// frame → zones → saturation → brightness → EMA → per device reorder → gate → send.
@@ -816,6 +828,19 @@ pub struct Pipeline {
     step_at: Option<u64>,
     /// Frames processed, for the debug line.
     pub frames: u64,
+    /// D-058: the remaining smoothing steps can't put anything on the wire (every
+    /// device's target is within the threshold of what it last sent), so `step_at`
+    /// is not armed; the steps run late, at the next frame / timer / resend
+    /// (`catch_up`), with the same results. `lazy_ok = false` restores timer steps
+    /// (tests compare both).
+    lazy: bool,
+    pub lazy_ok: bool,
+    /// D-057: capture interval while nothing changed for `idle_after_ns`.
+    idle_interval_ns: Option<u64>,
+    idle_after_ns: u64,
+    threshold: u8,
+    /// Last frame whose target moved more than the threshold from the anchor.
+    last_change: u64,
 }
 
 impl Pipeline {
@@ -839,10 +864,13 @@ impl Pipeline {
                     out: vec![[0; 3]; n],
                     settled: false,
                     devs: vec![i],
+                    anchor: vec![[0; 3]; n],
                 }),
             }
         }
         let hz = u64::from(fps.clamp(1, DEVICE_MAX_HZ));
+        let idle_interval_ns = (cfg.idle_fps > 0 && u64::from(cfg.idle_fps) < hz)
+            .then(|| 1_000_000_000 / u64::from(cfg.idle_fps));
         Pipeline {
             groups,
             streams,
@@ -852,11 +880,65 @@ impl Pipeline {
             last_step: None,
             step_at: None,
             frames: 0,
+            lazy: false,
+            lazy_ok: true,
+            idle_interval_ns,
+            idle_after_ns: u64::from(cfg.idle_after_ms) * MS,
+            threshold: cfg.threshold,
+            last_change: 0,
         }
+    }
+
+    /// Time between capture requests now: `idle_fps` once nothing has changed
+    /// above the threshold for `idle_after_ms`, else the configured fps (D-057).
+    pub fn capture_interval(&self, now: u64) -> u64 {
+        match self.idle_interval_ns {
+            Some(idle) if now.saturating_sub(self.last_change) >= self.idle_after_ns => idle,
+            _ => self.interval_ns,
+        }
+    }
+
+    /// Run smoothing steps that were deferred while they couldn't send (D-058),
+    /// at their scheduled times, up to `now`.
+    pub fn catch_up(&mut self, now: u64) {
+        while self.lazy {
+            match self.step_at {
+                Some(t) if t <= now => self.step(t, false),
+                _ => break,
+            }
+        }
+    }
+
+    /// Paused / output gone: apply the steps due before now (the old timer would
+    /// have); nothing steps while paused.
+    pub fn pause(&mut self, now: u64) {
+        self.catch_up(now);
+    }
+
+    /// After a pause: razer ON went out; resend the current colors first, and let
+    /// an overdue step happen right after (as the old timer did on resume).
+    pub fn resume(&mut self, now: u64) {
+        if self.step_at.is_some_and(|t| t < now) {
+            self.step_at = Some(now);
+        }
+        self.push_out(now);
+    }
+
+    /// Every unsettled group's target is within the threshold of what each of its
+    /// devices last sent. The EMA output moves monotonically from the current output
+    /// (itself within the threshold of the last sent frame, by the gate) toward the
+    /// target, so no later step can exceed the threshold either.
+    fn wire_quiet(&self) -> bool {
+        self.groups.iter().filter(|g| !g.settled).all(|g| {
+            g.devs
+                .iter()
+                .all(|&i| !self.streams.would_send(i, &g.target))
+        })
     }
 
     /// A captured frame: re-sample dirty zones, then step now or at the next slot.
     pub fn on_frame(&mut self, f: &Frame<'_>, now: u64) {
+        self.catch_up(now);
         self.frames += 1;
         if self.frames <= 5 {
             debug!(
@@ -876,6 +958,11 @@ impl Pipeline {
                 color::saturate(&mut g.target, self.sat_q16);
                 color::scale(&mut g.target, self.bri_q16);
                 g.settled = false;
+                self.lazy = false; // new target: re-checked after the next step
+                if color::colors_changed(Some(&g.anchor), &g.target, self.threshold) {
+                    g.anchor.copy_from_slice(&g.target);
+                    self.last_change = now;
+                }
             }
         }
         if self.groups.iter().all(|g| g.settled) {
@@ -916,10 +1003,12 @@ impl Pipeline {
         } else {
             Some(now + self.interval_ns + if from_frame { self.interval_ns / 2 } else { 0 })
         };
+        self.lazy = self.lazy_ok && self.step_at.is_some() && self.wire_quiet();
     }
 
     /// Timer expired: smoothing step and/or keepalive if due.
     pub fn on_timer(&mut self, now: u64) {
+        self.catch_up(now);
         if self.step_at.is_some_and(|t| t <= now) {
             self.step(now, false);
         }
@@ -932,8 +1021,14 @@ impl Pipeline {
         }
     }
 
-    /// After razer ON (resume, output back, rebind): resend the current colors now.
+    /// After razer ON while live (rebind, moved device): steps due so far first,
+    /// then resend the current colors.
     pub fn resend(&mut self, now: u64) {
+        self.catch_up(now);
+        self.push_out(now);
+    }
+
+    fn push_out(&mut self, now: u64) {
         for g in &self.groups {
             for &i in &g.devs {
                 self.streams.push(i, &g.out, now / MS);
@@ -944,7 +1039,7 @@ impl Pipeline {
     /// Next step or keepalive deadline (ns).
     pub fn deadline(&self) -> Option<u64> {
         min_opt(
-            self.step_at,
+            self.step_at.filter(|_| !self.lazy),
             self.streams.keepalive_due_ms().map(|t| t * MS),
         )
     }
@@ -965,7 +1060,6 @@ pub fn run_screen(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> 
 }
 
 fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Result<(), Error> {
-    let interval = pipe.interval_ns;
     let mut next_capture = Some(now_ns());
     let mut last_request = 0u64;
     let mut fails = 0u32;
@@ -1039,6 +1133,9 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
                         // Frees the 19.8 MB capture memfd too (niri's share of it).
                         cap.release()?;
                         next_capture = None;
+                        if !waiting {
+                            pipe.pause(now);
+                        }
                         pipe.streams.off();
                     }
                     Sig::Resume if paused => {
@@ -1046,7 +1143,7 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
                         paused = false;
                         if !waiting {
                             pipe.streams.razer(true);
-                            pipe.resend(now);
+                            pipe.resume(now);
                             next_capture = Some(now);
                         }
                     }
@@ -1071,6 +1168,7 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
                     next_capture = None;
                     cap.release()?;
                     if !paused {
+                        pipe.pause(now);
                         pipe.streams.off();
                     }
                 }
@@ -1083,7 +1181,7 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
                         waiting = false;
                         if !paused {
                             pipe.streams.razer(true);
-                            pipe.resend(now);
+                            pipe.resume(now);
                         }
                     }
                     if !paused {
@@ -1110,7 +1208,7 @@ fn screen_loop(cap: &mut dyn Capture, pipe: &mut Pipeline, ctl: &mut Ctl) -> Res
                         fails = 0;
                     }
                     let live = !paused && !waiting;
-                    let at = last_request + interval;
+                    let at = last_request + pipe.capture_interval(now);
                     // D-051: negotiate the next frame now, so its offers arrive while
                     // this one is sampled; the copy waits for the slot (timer).
                     if live

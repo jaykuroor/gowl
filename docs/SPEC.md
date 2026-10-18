@@ -75,13 +75,17 @@ in the device section, global `keepalive_ms`).
 
 Additions over legacy (allowed because they reduce cost or fix Wayland gaps):
 damage-aware zone recompute, pull-paced capture (no frames when screen static),
-per-device `reverse`/`offset` or a calibrated `layout` (D-040), multi-device fan-out from one capture, VPN-proof
-interface-bound sockets with automatic rebind on network changes.
+per-device `reverse`/`offset` or a calibrated `layout` (D-040), per-device control `port` (D-049),
+multi-device fan-out from one capture, VPN-proof interface-bound sockets with automatic rebind on network changes,
+and an idle capture rate (D-057): `idle_fps` (default 5; 0 or ≥ `fps` turns it off) once no zone has moved more
+than `threshold` for `idle_after_ms` (default 1000); the first frame that does brings back `fps` at once. The
+cost is up to one idle interval (200 ms at 5 fps) more delay on the first reaction after a calm spell.
 
 ## Shutdown contract
 On SIGINT/SIGTERM/SIGHUP/SIGQUIT or `stop` (or a panic, via a hook): send razer OFF to every streaming device (twice,
 10 ms apart — UDP), remove pidfile, exit 0 within 100 ms. On `pause`: razer OFF, stop
-capture requests (zero wakeups except signalfd), keep Wayland connection. Pause and
+capture requests (zero wakeups except signalfd), keep Wayland connection, free the capture buffer
+(reallocated on resume; also while the output is gone, D-055). Pause and
 output-lost send razer OFF twice too. Music mode on
 `pause` closes the monitor stream (zero wakeups) and reopens it on `resume`. Both are
 idempotent. A network change while paused rebinds silently; razer ON waits for `resume`.
